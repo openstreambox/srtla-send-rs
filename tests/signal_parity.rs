@@ -256,3 +256,146 @@ fn sigint_exits_cleanly_and_promptly() {
         "SIGINT must exit promptly (< {PROMPT_EXIT:?}); took {elapsed:?}"
     );
 }
+
+/// Real-process regression: telemetry must acknowledge withdrawal, and a later
+/// re-add must bootstrap registration rather than retaining old probe indices.
+#[cfg(target_os = "linux")]
+#[test]
+fn required_mapping_can_withdraw_every_link_and_readd_after_degraded_reads() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use srtla_send::bind_map::IpsFile;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("map");
+    let stats = dir.path().join("stats");
+    let publish = |content: &str, generation: u64, link_id: &str, bad_sha: bool| {
+        let sha = IpsFile::from_bytes(content.as_bytes())
+            .unwrap()
+            .sha256()
+            .to_owned();
+        let rows = if content.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{"link_id":link_id,"ip":"127.0.0.1","iface":"lo"}])
+        };
+        let doc = serde_json::json!({
+            "schema_version":1,"generation":generation,
+            "ips_file_sha256":if bad_sha { "0".repeat(64) } else { sha },
+            "links":rows
+        });
+        for (path, data) in [(&ips, content.to_owned()), (&map, doc.to_string())] {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, data).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(tmp, path).unwrap();
+        }
+    };
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    publish("127.0.0.1\n", 1, "path-a", false);
+    let mut proc = SenderProc::spawn(&[
+        &free_udp_port().to_string(),
+        "127.0.0.1",
+        &receiver.local_addr().unwrap().port().to_string(),
+        ips.to_str().unwrap(),
+        "--bind-map",
+        map.to_str().unwrap(),
+        "--require-bind-map",
+        "--stats-file",
+        stats.to_str().unwrap(),
+        "--stats-file-interval",
+        "100",
+    ]);
+    let observe = |count: usize, state: &str, reason: Option<&str>, after: u64| {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            if let Ok(bytes) = std::fs::read(&stats)
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && v["last_updated_ms"].as_u64().unwrap() > after
+                && v["connections"].as_array().unwrap().len() == count
+                && v["bind_map_status"]["state"] == state
+                && reason.is_none_or(|r| v["bind_map_status"]["reason"] == r)
+            {
+                assert_eq!(
+                    v["disposition"]["state"],
+                    if state == "active" {
+                        "mapped"
+                    } else {
+                        "retained_last_valid"
+                    }
+                );
+                return v["last_updated_ms"].as_u64().unwrap();
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("no fresh {count}-link {state} snapshot: {}", proc.logs());
+    };
+    let reload = || {
+        let outcomes = |logs: &str| {
+            logs.matches("bind-map active (").count()
+                + logs.matches("bind-map degraded:").count()
+                + logs.matches("bind-map read failed:").count()
+        };
+        let before = outcomes(&proc.logs());
+        proc.signal("HUP");
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while outcomes(&proc.logs()) == before {
+            assert!(
+                Instant::now() < deadline,
+                "reload did not finish: {}",
+                proc.logs()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let mut stamp = observe(1, "active", None, 0);
+    let mut packet = [0u8; 2048];
+    receiver
+        .recv(&mut packet)
+        .expect("initial registration probe");
+
+    // Empty IPs with a missing/malformed sidecar must not withdraw.
+    std::fs::write(&ips, "").unwrap();
+    std::fs::remove_file(&map).unwrap();
+    reload();
+    stamp = observe(1, "degraded", Some("missing_file"), stamp);
+    std::fs::write(&map, "{").unwrap();
+    reload();
+    stamp = observe(1, "degraded", Some("malformed"), stamp);
+    publish("", 2, "path-a", true);
+    reload();
+    stamp = observe(1, "degraded", Some("retry_exhausted"), stamp);
+    publish("", 0, "path-a", false);
+    reload();
+    stamp = observe(1, "degraded", Some("malformed"), stamp);
+    // Same hash and generation with changed identity is stale (ADR-003 §3).
+    publish("127.0.0.1\n", 1, "path-b", false);
+    reload();
+    stamp = observe(1, "degraded", Some("malformed"), stamp);
+
+    publish("", 2, "path-a", false);
+    reload();
+    stamp = observe(0, "active", None, stamp);
+    proc.signal("0"); // Empty is not process exit.
+    // Even an unreadable reload after withdrawal must retain the valid EMPTY pool.
+    std::fs::remove_file(&ips).unwrap();
+    reload();
+    stamp = observe(0, "degraded", Some("unreadable"), stamp);
+
+    // Drain old probes so the next packet proves re-add registration.
+    receiver.set_nonblocking(true).unwrap();
+    while receiver.recv(&mut packet).is_ok() {}
+    receiver.set_nonblocking(false).unwrap();
+    publish("127.0.0.1\n", 3, "path-a", false);
+    reload();
+    observe(1, "active", None, stamp);
+    receiver
+        .recv(&mut packet)
+        .expect("fresh registration probe after re-add");
+    proc.signal("TERM");
+    assert_eq!(proc.wait_exit(KILL_WINDOW), Some(0));
+}

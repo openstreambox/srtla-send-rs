@@ -510,3 +510,8 @@ For device-isolated uplinks, probe `capabilities.bind_map_required == true` and
 pass `--require-bind-map --bind-map <path>`. Degraded startup waits with no
 uplinks; degraded reload retains the last mapped pool. See
 [ADR-003 §9](docs/adr/ADR-003-bind-map-contract.md#9-required-binding-opt-in-extension).
+
+Consumers needing explicit final-link withdrawal must also require
+`capabilities.bind_map_required_empty_reload == true`. In required mode a
+valid empty mapping removes all uplinks, reports fresh empty connections,
+and stays alive for re-add on SIGHUP (ADR-003 §9.3).

@@ -118,6 +118,18 @@ impl LinkSource {
         }
     }
 
+    /// Only a validated empty mapping in required mode authorizes withdrawal.
+    /// A degraded read (including an unreadable IP file) always retains.
+    #[must_use]
+    pub fn accepts_empty_reload(&self) -> bool {
+        self.require_bind_map
+            && self.report.bind_map_status.state == BindMapStatus::Active.state_str()
+            && self
+                .last_valid
+                .as_ref()
+                .is_some_and(|pool| pool.rows.is_empty())
+    }
+
     /// The arguments a spawned reload read needs.
     #[must_use]
     pub fn read_args(&self) -> Option<(String, String, Option<MappedPool>)> {

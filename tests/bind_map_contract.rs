@@ -430,3 +430,36 @@ async fn required_binding_refuses_wildcard_sources() {
         assert_eq!(resolution.status.reason().unwrap().as_str(), "malformed");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn only_required_mode_authorizes_a_valid_empty_reload() {
+    use srtla_send::sender::{LinkSource, SenderPaths};
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("map");
+    publish(&ips, "");
+    publish(&map, &sidecar_for("", 1));
+    for required in [false, true] {
+        let mut source = LinkSource::new(&SenderPaths {
+            ips_file: ips.to_str().unwrap(),
+            bind_map: Some(map.to_str().unwrap()),
+        });
+        if required {
+            source.require_bind_map().unwrap();
+        }
+        assert!(!source.accepts_empty_reload(), "no validated pair yet");
+        assert!(source.startup().await.unwrap().is_empty());
+        assert_eq!(source.accepts_empty_reload(), required);
+        let (ips, map, prior) = source.read_args().unwrap();
+        let err = srtla_send::bind_map::BindMapError::MissingFile { path: map.clone() };
+        assert!(source.adopt(Err(err)).is_empty());
+        assert!(
+            !source.accepts_empty_reload(),
+            "degraded is never withdrawal"
+        );
+        let pair = srtla_send::sender::read_bind_map(ips, map, prior).await;
+        assert!(source.adopt(pair).is_empty());
+        assert_eq!(source.accepts_empty_reload(), required);
+    }
+}

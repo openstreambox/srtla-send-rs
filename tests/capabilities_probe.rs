@@ -76,6 +76,7 @@ fn probe_carries_the_frozen_document_shape() {
         [
             "bind_map",
             "bind_map_required",
+            "bind_map_required_empty_reload",
             "conn_timeout_ms",
             "control_socket_jsonrpc",
             "dry_run",
@@ -155,4 +156,12 @@ fn required_binding_flag_requires_a_sidecar() {
     let out = run(&["5000", "127.0.0.1", "5001", "ips.txt", "--require-bind-map"]);
     assert_eq!(out.status.code(), Some(USAGE_ERROR_CODE));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--bind-map"));
+}
+
+#[test]
+fn required_empty_reload_capability_is_platform_honest() {
+    assert_eq!(
+        probe_document()["capabilities"]["bind_map_required_empty_reload"],
+        cfg!(target_os = "linux")
+    );
 }

@@ -529,3 +529,26 @@ valid replacement, then observe fresh producer evidence of socket removal.
 Before the first valid pair, every degraded reload remains empty and refused.
 `--dry-run` continues to reject unusable pairs with nonzero exit; it does not
 open sockets or prove runtime bind permissions.
+
+### 9.3 Explicit empty-map withdrawal
+
+`capabilities.bind_map_required_empty_reload == true` advertises the additional
+required-mode empty-reload contract. Consumers needing final-link withdrawal
+MUST require this literal capability as well as `bind_map_required == true`.
+Earlier builds advertising only `bind_map_required` cannot acknowledge a final
+withdrawal. Both capabilities are Linux-only and use the existing probe/runtime
+capability document; they advertise support, not the enabled invocation mode.
+
+With `--require-bind-map`, a coherent, valid empty mapping (empty accepted IP
+list, matching SHA-256, valid generation, `links: []`) explicitly removes ALL
+uplink connections, sockets and packet readers. Fresh telemetry acknowledges
+the applied state with `connections: []`, `active` / `mapped`. The listener
+stays alive. Registration state is reset so a later coherent nonempty mapping
+and SIGHUP can create new sockets and bootstrap a fresh handshake.
+
+An empty list alone is never withdrawal authority. Missing/unreadable files,
+malformed sidecars, SHA mismatch or invalid/stale generations remain degraded
+and retain the last valid pool, including an already-empty pool. Existing
+generation rules (§3) still apply: counters can restart; changing the SHA with
+the same generation is not by itself a rejection. Without required mode,
+empty reloads keep their existing refusal/retention behavior.

@@ -451,6 +451,11 @@ pub async fn run_sender_with_config(
                                 &binder,
                             ).await;
                             info!("connection changes applied successfully");
+                            if require_bind_map && connections.is_empty() {
+                                // Forget index-scoped registration state so a later
+                                // re-add starts a fresh handshake, including probes.
+                                reg.reset_for_rehome();
+                            }
                             sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
                             // Bootstrap registration when a reload populated an
                             // empty pool. `start_probing` self-guards (no-op once
@@ -560,11 +565,8 @@ pub async fn run_sender_with_config(
         Some(read) = bind_map_rx.recv() => {
             let new_links = link_source.adopt(read);
             shared_stats.set_bind_map(link_source.report().clone());
-            if new_links.is_empty() {
-                // Every degraded arm that still has something to run returns a
-                // non-empty set, so an empty one means the ips file itself was
-                // unusable. Tearing down a live bond for that would be worse
-                // than ignoring the reload.
+            if new_links.is_empty() && !link_source.accepts_empty_reload() {
+                // Empty legacy/degraded reads cannot withdraw a running bond.
                 warn!("bind-map reload produced no usable uplinks; keeping current connections");
             } else {
                 pending_changes = Some(PendingConnectionChanges {
