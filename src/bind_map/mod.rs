@@ -31,7 +31,9 @@ pub use parser::{
     BIND_MAP_SCHEMA_VERSION, BindMapDoc, BindMapRow, IfaceName, IpsFile, LinkId, MappedPool,
     parse_sidecar,
 };
-pub use report::{BindMapReport, BindMapStatusRecord, CollisionRecord, DispositionRecord};
+pub use report::{
+    BindMapIdentity, BindMapReport, BindMapStatusRecord, CollisionRecord, DispositionRecord,
+};
 pub use resolve::{
     EffectiveLink, Resolution, ResolvePhase, resolve, resolve_absent, resolve_required,
     validate_required_pool,

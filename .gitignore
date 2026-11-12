@@ -31,3 +31,6 @@ moblin/
 __pycache__/
 # Local .deb staging produced by ci/build-deb.sh
 /dist/
+
+# Deterministic sidecar-read scheduling barrier used by Linux process tests.
+!tests/support/bind_map_read_gate.c

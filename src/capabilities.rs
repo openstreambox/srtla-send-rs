@@ -29,7 +29,7 @@ use serde::Serialize;
 pub const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 
 /// Required-binding behavioral contract, ADR-003 §9.4; independent of schemas.
-pub const BIND_MAP_CONTRACT_VERSION: u32 = 1;
+pub const BIND_MAP_CONTRACT_VERSION: u32 = 2;
 
 /// Scheduling modes this build accepts for `--mode` and for the JSON-RPC
 /// `set_mode` method. Mirrors `srtla_core::mode::SchedulingMode`.
@@ -194,17 +194,17 @@ mod tests {
 #[cfg(test)]
 mod bind_map_contract_tests {
     #[test]
-    fn revision_one_means_unicast_and_joined_apply_on_linux_only() {
+    fn revision_two_means_identified_ordered_apply_on_linux_only() {
         let document = super::capability_document();
-        assert_eq!(super::BIND_MAP_CONTRACT_VERSION, 1);
+        assert_eq!(super::BIND_MAP_CONTRACT_VERSION, 2);
         assert_eq!(
             document.capabilities.bind_map_contract,
-            if cfg!(target_os = "linux") { 1 } else { 0 }
+            if cfg!(target_os = "linux") { 2 } else { 0 }
         );
         let json: serde_json::Value = serde_json::from_str(&super::capability_json()).unwrap();
         assert_eq!(
             json["capabilities"]["bind_map_contract"].as_u64(),
-            Some(if cfg!(target_os = "linux") { 1 } else { 0 })
+            Some(if cfg!(target_os = "linux") { 2 } else { 0 })
         );
     }
 }

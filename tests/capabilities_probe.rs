@@ -172,6 +172,6 @@ fn probe_advertises_the_verified_required_binding_contract_revision() {
     let v = probe_document();
     assert_eq!(
         v["capabilities"]["bind_map_contract"].as_u64(),
-        Some(if cfg!(target_os = "linux") { 1 } else { 0 })
+        Some(if cfg!(target_os = "linux") { 2 } else { 0 })
     );
 }

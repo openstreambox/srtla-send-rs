@@ -516,7 +516,6 @@ Consumers needing explicit final-link withdrawal must also require
 valid empty mapping removes all uplinks, reports fresh empty connections,
 and stays alive for re-add on SIGHUP (ADR-003 §9.3).
 
-
 Required sources must be assigned unicast addresses on the selected device;
 broadcast/multicast sources are refused, including mapped representations.
 During required reload application, `pending_apply` is not a withdrawal receipt.
@@ -524,5 +523,11 @@ Empty `active` / `mapped` is published only after owned uplink sockets close.
 See ADR-003 §9.4.
 
 To rely on assigned-unicast sources and completed teardown acknowledgements,
-also require integer `capabilities.bind_map_contract >= 1`. Earlier binaries
+also require integer `capabilities.bind_map_contract >= 2`. Earlier binaries
 may advertise both required-binding booleans without these guarantees.
+
+For causal publication/withdrawal receipts require `bind_map_contract >= 2`.
+Match `bind_map_applied.generation` and `ips_file_sha256` to the exact latest
+publication within the supervised producer lifetime; timestamps and pending
+identities do not acknowledge application. Required generations cannot regress.
+See ADR-003 §9.5 and the `telemetry-rev2-*.json` producer fixtures.

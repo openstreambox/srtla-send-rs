@@ -102,6 +102,12 @@ pub fn resolve(
 
 /// Validate the concrete-source contract shared by runtime and dry-run.
 pub fn validate_required_pool(pool: MappedPool) -> Result<MappedPool, BindMapError> {
+    if pool.generation > 9_007_199_254_740_991 {
+        return Err(BindMapError::InvalidHeader {
+            field: "generation",
+            detail: "required binding needs a positive safe-integer generation".into(),
+        });
+    }
     for (index, row) in pool.rows.iter().enumerate() {
         crate::net::source::validate_source(row.ip, row.iface.as_str()).map_err(|err| {
             BindMapError::InvalidRow {

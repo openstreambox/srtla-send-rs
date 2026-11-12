@@ -80,11 +80,31 @@ impl Default for DispositionRecord {
     }
 }
 
-/// The pair of typed fields telemetry publishes at the top level of a snapshot.
+/// Exact writer publication identity; not inferred from telemetry wall time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BindMapIdentity {
+    pub generation: u64,
+    pub ips_file_sha256: String,
+}
+
+impl From<&super::MappedPool> for BindMapIdentity {
+    fn from(pool: &super::MappedPool) -> Self {
+        Self {
+            generation: pool.generation,
+            ips_file_sha256: pool.ips_file_sha256.clone(),
+        }
+    }
+}
+
+/// Typed bind-map state and publication identities in one telemetry snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct BindMapReport {
     pub bind_map_status: BindMapStatusRecord,
     pub disposition: DispositionRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_map_applied: Option<BindMapIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_map_pending: Option<BindMapIdentity>,
 }
 
 impl BindMapReport {
@@ -100,6 +120,8 @@ impl BindMapReport {
                 state: disposition.as_str(),
                 collisions: excluded.iter().map(CollisionRecord::from).collect(),
             },
+            bind_map_applied: None,
+            bind_map_pending: None,
         }
     }
 

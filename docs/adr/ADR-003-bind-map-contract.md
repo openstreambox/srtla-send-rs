@@ -556,13 +556,13 @@ generation rules (§3) still apply: counters can restart; changing the SHA with
 the same generation is not by itself a rejection. Without required mode,
 empty reloads keep their existing refusal/retention behavior.
 
-
 ### 9.4 Unicast sources and completed withdrawal receipts
 
-**Probe `capabilities.bind_map_contract` as an integer >= 1**, in addition to
+**Probe `capabilities.bind_map_contract` as an integer >= 2**, in addition to
 both `bind_map_required == true` and `bind_map_required_empty_reload == true`,
-before relying on this section. Revision `1` advertises the complete required
-binding contract: fail-closed startup, canonical assigned unicast sources,
+before relying on the repaired receipt contract. Revision `2` adds identified,
+ordered application (§9.5) to the required binding contract: fail-closed startup,
+canonical assigned unicast sources,
 checked local binding, pending state, joined teardown and atomic applied
 acknowledgement. It is advertised by the CLI and runtime capability document
 only on Linux; other platforms emit `0`. Absent, zero, non-integer or failed
@@ -571,7 +571,7 @@ them or downgrade a required-binding spawn.
 
 Earlier builds advertised the two booleans while accepting non-unicast sources
 and acknowledging empty reloads before teardown completed. The booleans alone
-therefore do not establish §9.4. This new numeric revision starts at `1`;
+therefore do not establish §9.4. This new numeric revision started at `1`;
 future revisions increase monotonically and retain earlier guarantees, allowing
 a consumer to require its minimum revision rather than accumulate booleans.
 The number describes supported behavior, not whether required mode is enabled.
@@ -602,3 +602,48 @@ snapshot published together under one lock. Fresh empty `active` / `mapped`
 therefore acknowledges that owned uplink sockets are closed. The local listener
 remains alive. Startup publishes its mapped report with its actual connection
 snapshot, avoiding an initial active/empty report while uplink sockets exist.
+
+### 9.5 Revision 2: identified, ordered application
+
+Consumers needing causal withdrawal evidence MUST require integer
+`capabilities.bind_map_contract >= 2`, both strict booleans, and the exact
+supervised producer lifetime. Revision 1's wall-clock timestamp and two
+booleans cannot establish which map was applied.
+
+Required-mode file and runtime snapshots add two optional identity objects:
+`bind_map_applied` and `bind_map_pending`. Each has exactly
+`{generation, ips_file_sha256}`. The SHA is the validated sidecar digest of
+the EXACT IP-file bytes, without reformatting or added LF; an empty file is
+zero bytes. The applied identity is published for the first valid startup
+map, including an empty first map, and for every completed valid reload.
+It shares the connections/report snapshot lock and is committed only after
+joined application. Missing identities are omitted, never null.
+
+`pending_apply` begins when request ingress is accepted, before file I/O.
+Before the candidate is known, `bind_map_pending` is absent. After validation
+it names the queued target; `bind_map_applied` still names the previously
+applied map. Pending is intent, never acknowledgement. On completion, pending
+is omitted and applied names the completed target. A stale captured snapshot
+may be serialized with a fresh wall-clock time: that does NOT update its
+applied identity and cannot acknowledge a different publication.
+
+In required mode, generations are positive safe integers (at most
+9007199254740991) and monotonically nondecreasing per sender lifetime.
+A changed pool requires a STRICT increase; the same generation is allowed only
+for an identical pool. This overrides §3's writer-reset tolerance for required
+mode. Restarting a writer counter requires a new supervised sender lifetime
+or continuing above the live accepted watermark. Default mode keeps §3.
+
+Each ingress request supersedes earlier reads and queued applies. Results
+carry their ingress epoch; obsolete results are discarded even if they finish
+after a newer empty acknowledgement. A same-generation no-op cannot clear a
+newer pending request. Request ingress and final applied publication share a
+gate, checked again after joined socket work: a superseded apply cannot publish
+a completed receipt. A canceled candidate's generation remains an acceptance
+watermark, but degraded reads retain the actually applied pool, never an
+accepted-but-unapplied candidate.
+
+The consumer requires a valid applied object with safe-integer generation and
+64 lowercase hex SHA exactly matching its latest local publication, and no
+pending acknowledgement. Fresh `last_updated_ms` alone is NEVER causal proof.
+All schema versions remain 1; this is an additive revision-2 contract.

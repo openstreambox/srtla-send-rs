@@ -311,9 +311,8 @@ pub struct StatsSnapshot {
     /// (`disposition`). Flattened so both appear at the top level of `get_stats`
     /// and of the telemetry document under their own names.
     ///
-    /// Composed by [`SharedStats::get`] from its own lock rather than rebuilt in
-    /// [`SharedStats::update`]: the snapshot is rebuilt on every ~1 s
-    /// housekeeping tick while this changes only on a reload.
+    /// Applied identity and connections share one snapshot lock; request
+    /// ingress fences final applied publication through a separate gate.
     #[serde(flatten)]
     pub bind_map: crate::bind_map::BindMapReport,
 }
@@ -396,6 +395,7 @@ impl SessionBytes {
 pub struct SharedStats {
     inner: Arc<RwLock<StatsSnapshot>>,
     session_bytes: Arc<Mutex<SessionBytes>>,
+    reload_request: Arc<Mutex<u64>>,
 }
 
 impl SharedStats {
@@ -403,7 +403,60 @@ impl SharedStats {
         Self {
             inner: Arc::new(RwLock::new(StatsSnapshot::default())),
             session_bytes: Arc::new(Mutex::new(SessionBytes::default())),
+            reload_request: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Linearize request ingress with final applied publication.
+    pub fn begin_reload_request(&self) -> u64 {
+        let mut request = self
+            .reload_request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *request = request
+            .checked_add(1)
+            .expect("reload request space exhausted");
+        if let Ok(mut snapshot) = self.inner.write() {
+            snapshot.bind_map.disposition.state =
+                crate::bind_map::BindMapDisposition::PendingApply.as_str();
+            snapshot.bind_map.bind_map_pending = None;
+        }
+        *request
+    }
+
+    pub fn current_reload_request(&self) -> u64 {
+        *self
+            .reload_request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Accept a read only while its request still owns the ingress fence.
+    pub fn with_reload_request<T>(&self, request: u64, accept: impl FnOnce() -> T) -> Option<T> {
+        let current = self
+            .reload_request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *current != request {
+            return None;
+        }
+        Some(accept())
+    }
+
+    pub fn set_bind_map_if_current(
+        &self,
+        report: crate::bind_map::BindMapReport,
+        request: u64,
+    ) -> bool {
+        let current = self
+            .reload_request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *current != request {
+            return false;
+        }
+        self.set_bind_map(report);
+        true
     }
 
     /// Record the sender's current ADR-003 operating mode.
@@ -459,6 +512,36 @@ impl SharedStats {
         identities: Option<&HashMap<u64, LinkIdentity>>,
         report: Option<&crate::bind_map::BindMapReport>,
     ) {
+        self.update_for_reload(
+            connections,
+            config,
+            classification,
+            link_cc,
+            identities,
+            report,
+            None,
+        );
+    }
+
+    /// Only the newest ingress request may publish a joined applied receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_for_reload(
+        &self,
+        connections: &[SrtlaConnection],
+        config: &ConfigSnapshot,
+        classification: Option<&ClassificationResult>,
+        link_cc: Option<&HashMap<u64, LinkCcSnapshot>>,
+        identities: Option<&HashMap<u64, LinkIdentity>>,
+        report: Option<&crate::bind_map::BindMapReport>,
+        request: Option<u64>,
+    ) -> bool {
+        let current = self
+            .reload_request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if request.is_some_and(|request| request != *current) {
+            return false;
+        }
         let current_time_ms = now_ms();
         let quality_enabled = config.quality_enabled && !config.mode.is_classic();
 
@@ -600,6 +683,9 @@ impl SharedStats {
         if let Ok(mut guard) = self.inner.write() {
             snapshot.bind_map = report.cloned().unwrap_or_else(|| guard.bind_map.clone());
             *guard = snapshot;
+            true
+        } else {
+            false
         }
     }
 

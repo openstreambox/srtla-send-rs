@@ -379,3 +379,84 @@ fn pending_apply_is_not_an_empty_withdrawal_acknowledgement() {
     assert_eq!(doc["disposition"]["state"], "pending_apply");
     assert_ne!(doc["disposition"]["state"], "mapped");
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn revision_two_publication_identity_fixture_matrix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use srtla_send::bind_map::IpsFile;
+    use srtla_send::sender::{LinkSource, SenderPaths, read_bind_map};
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("map");
+    let publish = |content: &str, generation: u64| {
+        let links = if content.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{"link_id":"path-a","ip":content,"iface":"lo"}])
+        };
+        std::fs::write(&ips, content).unwrap();
+        std::fs::write(&map,serde_json::json!({"schema_version":1,"generation":generation,
+            "ips_file_sha256":IpsFile::from_bytes(content.as_bytes()).unwrap().sha256(),"links":links}).to_string()).unwrap();
+        std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    for empty_start in [false, true] {
+        let content = if empty_start { "" } else { "127.0.0.1" };
+        publish(content, 1);
+        let mut source = LinkSource::new(&SenderPaths {
+            ips_file: ips.to_str().unwrap(),
+            bind_map: Some(map.to_str().unwrap()),
+        });
+        source.require_bind_map().unwrap();
+        source.startup().await.unwrap();
+        source.finish_apply();
+        let conns = if empty_start {
+            vec![]
+        } else {
+            vec![conn(0, Some("path-a"), Some("lo"))]
+        };
+        let startup = document(&conns, source.report());
+        assert_fixture(
+            if empty_start {
+                "telemetry-rev2-startup-empty-applied"
+            } else {
+                "telemetry-rev2-startup-applied"
+            },
+            &startup,
+        );
+        let v = value(&startup);
+        assert_eq!(v["bind_map_applied"]["generation"], 1);
+        assert_eq!(
+            v["bind_map_applied"]["ips_file_sha256"],
+            IpsFile::from_bytes(content.as_bytes()).unwrap().sha256()
+        );
+        assert!(v.get("bind_map_pending").is_none());
+        if empty_start {
+            continue;
+        }
+        source.begin_reload();
+        assert_fixture(
+            "telemetry-rev2-pending-unknown",
+            &document(&conns, source.report()),
+        );
+        publish("", 2);
+        let (a, b, prior) = source.read_args().unwrap();
+        source.adopt(read_bind_map(a, b, prior).await);
+        let pending = document(&conns, &source.pending_report());
+        assert_fixture("telemetry-rev2-pending-known", &pending);
+        let v = value(&pending);
+        assert_eq!(v["bind_map_applied"]["generation"], 1);
+        assert_eq!(v["bind_map_pending"]["generation"], 2);
+        source.finish_apply();
+        let final_empty = document(&[], source.report());
+        assert_fixture("telemetry-rev2-final-empty-applied", &final_empty);
+        let v = value(&final_empty);
+        assert_eq!(v["bind_map_applied"]["generation"], 2);
+        assert_eq!(
+            v["bind_map_applied"]["ips_file_sha256"],
+            IpsFile::from_bytes(b"").unwrap().sha256()
+        );
+        assert!(v.get("bind_map_pending").is_none());
+    }
+}

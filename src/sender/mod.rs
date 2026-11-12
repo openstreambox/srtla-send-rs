@@ -201,6 +201,7 @@ pub async fn run_sender_with_config(
         create_connections_from_links(&links, receiver_host, receiver_port, &binder, &mut conn_io)
             .await;
 
+    link_source.finish_apply();
     shared_stats.update_with_bind_map(
         &connections,
         &config.snapshot(),
@@ -274,6 +275,7 @@ pub async fn run_sender_with_config(
     let mut rehome = RehomeGate::new(config.rehome_on_failure());
     let mut pending_changes: Option<PendingConnectionChanges> = None;
     let mut pending_bind_map_report = None;
+    let mut pending_bind_map_request = None;
     // Weak-link classifier. Its per-link `weak` verdict is consumed by
     // Enhanced selection as an admission gate.
     let mut weak_link_filter = srtla_core::selection::classifier::WeakLinkFilter::new();
@@ -297,7 +299,25 @@ pub async fn run_sender_with_config(
     // Answers from the off-loop ADR-003 pair read a SIGHUP spawns.
     #[cfg(unix)]
     let (bind_map_tx, mut bind_map_rx) =
-        tokio::sync::mpsc::unbounded_channel::<links::PairReadResult>();
+        tokio::sync::mpsc::unbounded_channel::<(u64, links::PairReadResult)>();
+    #[cfg(unix)]
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel();
+    #[cfg(unix)]
+    {
+        let ingress_stats = shared_stats.clone();
+        tokio::spawn(async move {
+            while sighup.recv().await.is_some() {
+                let request = if require_bind_map {
+                    ingress_stats.begin_reload_request()
+                } else {
+                    0
+                };
+                if reload_tx.send(request).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     // Main loop - run housekeeping frequently like C version
     // Run housekeeping once before entering the main event loop so we start in a clean state.
@@ -408,8 +428,10 @@ pub async fn run_sender_with_config(
                         }
 
                         let mut applied_bind_map_report = None;
+                        let mut applied_bind_map_request = None;
                         if let Some(changes) = pending_changes.take()
                             && let Some(new_links) = changes.new_links
+                            && (!require_bind_map || pending_bind_map_request == Some(shared_stats.current_reload_request()))
                         {
                             shared_stats.observe_connection_bytes(&connections);
                             info!("applying queued connection changes: {} uplinks", new_links.len());
@@ -431,7 +453,11 @@ pub async fn run_sender_with_config(
                                 &mut seq_tracker,
                                 &binder,
                             ).await;
-                            applied_bind_map_report = pending_bind_map_report.take();
+                            if pending_bind_map_report.take().is_some() {
+                                applied_bind_map_request = pending_bind_map_request.take();
+                                link_source.finish_apply();
+                                applied_bind_map_report = Some(link_source.report().clone());
+                            }
                             info!("connection changes applied successfully");
                             if require_bind_map && connections.is_empty() {
                                 // Forget index-scoped registration state so a later
@@ -487,13 +513,14 @@ pub async fn run_sender_with_config(
                             conn.loss_degraded =
                                 cc_snap.map(|s| s.loss_degraded).unwrap_or(false);
                         }
-                        shared_stats.update_with_bind_map(
+                        shared_stats.update_for_reload(
                             &connections,
                             &housekeeping_snap,
                             Some(&classification),
                             Some(&link_cc_snapshots),
                             Some(&link_identities(&connections, &conn_io)),
                             applied_bind_map_report.as_ref(),
+                            applied_bind_map_request,
                         );
 
                         // Fan the fresh snapshot out to any `stats` subscribers
@@ -537,16 +564,25 @@ pub async fn run_sender_with_config(
 
     #[cfg(unix)]
     event_loop! {
-        _ = sighup.recv() => {
+        Some(request) = reload_rx.recv() => {
+            if require_bind_map && request != shared_stats.current_reload_request() { continue; }
             info!("received SIGHUP - evaluating uplink IP reload from {}", ips_file);
             // With `--bind-map` the reload runs the ADR-003 pair protocol, whose
             // bounded hash-mismatch retry can take up to 2 s. Holding the event
             // loop for that long would stall packet forwarding, so the read goes
             // to a spawned task and answers back through `bind_map_rx`.
             if let Some((ips_path, sidecar, prior)) = link_source.read_args() {
+                if require_bind_map {
+                    pending_changes = None;
+                    pending_bind_map_report = None;
+                    pending_bind_map_request = None;
+                    link_source.begin_reload();
+                    shared_stats.set_bind_map_if_current(link_source.report().clone(), request);
+                }
                 let tx = bind_map_tx.clone();
                 tokio::spawn(async move {
-                    let _ = tx.send(links::read_bind_map(ips_path, sidecar, prior).await);
+                    let read = links::read_bind_map(ips_path, sidecar, prior).await;
+                    let _ = tx.send((request, read));
                 });
             } else {
                 // Legacy reload guard: refuse a reload that resolves to zero
@@ -589,21 +625,33 @@ pub async fn run_sender_with_config(
             )
             .await;
         }
-        Some(read) = bind_map_rx.recv() => {
-            let new_links = link_source.adopt(read);
-            let report = link_source.report().clone();
+        Some((request, read)) = bind_map_rx.recv() => {
+            let adopted = if require_bind_map {
+                shared_stats.with_reload_request(request, || {
+                    let links = link_source.adopt(read);
+                    (links, link_source.report().clone())
+                })
+            } else {
+                let links = link_source.adopt(read);
+                Some((links, link_source.report().clone()))
+            };
+            let Some((new_links, report)) = adopted else {
+                info!("discarding superseded bind-map read");
+                continue;
+            };
             if new_links.is_empty() && !link_source.accepts_empty_reload() {
                 // Empty legacy/degraded reads cannot withdraw a running bond.
                 warn!("bind-map reload produced no usable uplinks; keeping current connections");
                 if pending_changes.is_some() { pending_bind_map_report = Some(report); }
+                else if require_bind_map { shared_stats.set_bind_map_if_current(report, request); }
                 else { shared_stats.set_bind_map(report); }
             } else {
                 if require_bind_map {
-                    let mut pending = report.clone();
-                    pending.disposition.state = crate::bind_map::BindMapDisposition::PendingApply.as_str();
-                    shared_stats.set_bind_map(pending);
+                    let pending = link_source.pending_report();
+                    shared_stats.set_bind_map_if_current(pending, request);
                 }
                 pending_bind_map_report = Some(report);
+                pending_bind_map_request = if require_bind_map { Some(request) } else { None };
                 pending_changes = Some(PendingConnectionChanges {
                     new_links: Some(new_links),
                     receiver_host: receiver_host.to_string(),

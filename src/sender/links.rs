@@ -68,7 +68,10 @@ pub async fn read_bind_map(
 pub struct LinkSource {
     ips_file: String,
     sidecar: Option<String>,
+    // Highest accepted candidate, including a queued candidate not yet applied.
     last_valid: Option<MappedPool>,
+    applied: Option<MappedPool>,
+    pending: Option<MappedPool>,
     require_bind_map: bool,
     report: BindMapReport,
 }
@@ -80,6 +83,8 @@ impl LinkSource {
             ips_file: paths.ips_file.to_string(),
             sidecar: paths.bind_map.map(ToString::to_string),
             last_valid: None,
+            applied: None,
+            pending: None,
             require_bind_map: false,
             // A legacy run never resolves, so the default is what it reports for
             // its whole lifetime: absent, running legacy, nothing excluded.
@@ -106,10 +111,48 @@ impl LinkSource {
         &self.report
     }
 
+    /// The actual published pending projection, with applied state retained.
+    #[must_use]
+    pub fn pending_report(&self) -> BindMapReport {
+        let mut report = self.report.clone();
+        report.disposition.state = BindMapDisposition::PendingApply.as_str();
+        report
+    }
+
+    /// Start a new required reload: invalidate queued application, retaining
+    /// actual applied state and the monotonic accepted-generation watermark.
+    pub fn begin_reload(&mut self) {
+        if self.require_bind_map {
+            self.pending = None;
+            self.report.disposition.state = BindMapDisposition::PendingApply.as_str();
+            self.report.bind_map_applied = self.applied.as_ref().map(Into::into);
+            self.report.bind_map_pending = None;
+        }
+    }
+
+    /// Call only after sockets/readers match the pending target (or at startup).
+    pub fn finish_apply(&mut self) {
+        if self.require_bind_map {
+            if let Some(pool) = self.pending.take() {
+                self.applied = Some(pool);
+            }
+            self.report.bind_map_applied = self.applied.as_ref().map(Into::into);
+            self.report.bind_map_pending = None;
+        }
+    }
+
+    fn retained_pool(&self) -> Option<&MappedPool> {
+        if self.require_bind_map {
+            self.applied.as_ref()
+        } else {
+            self.last_valid.as_ref()
+        }
+    }
+
     /// What a degradation leaves running: a live bond keeps its last valid
     /// mapped pool, a startup that never had one falls open to legacy.
     fn retention(&self) -> BindMapDisposition {
-        if self.last_valid.is_some() {
+        if self.retained_pool().is_some() {
             BindMapDisposition::RetainedLastValid
         } else if self.require_bind_map {
             BindMapDisposition::RequiredBindingRefused
@@ -161,17 +204,29 @@ impl LinkSource {
                 // previous status standing would tell a UI the map is still
                 // active while the sender is running on nothing new.
                 self.report = BindMapReport::degraded(err.reason(), self.retention());
+                self.report.bind_map_applied = self.applied.as_ref().map(Into::into);
+                self.pending = None;
                 return SmallVec::new();
             }
         };
-        let phase = match self.last_valid.as_ref() {
+        let mut outcome = pair.map;
+        if self.require_bind_map
+            && let (Ok(pool), Some(prior)) = (&outcome, &self.last_valid)
+            && (pool.generation < prior.generation
+                || (pool.generation == prior.generation && pool != prior))
+        {
+            outcome = Err(BindMapError::StaleGeneration {
+                generation: pool.generation,
+            });
+        }
+        let phase = match self.retained_pool() {
             Some(last_valid) => ResolvePhase::Reload { last_valid },
             None => ResolvePhase::Startup,
         };
         let resolution = if self.require_bind_map {
-            resolve_required(pair.map, &pair.ips, phase)
+            resolve_required(outcome, &pair.ips, phase)
         } else {
-            resolve(pair.map, &pair.ips, phase)
+            resolve(outcome, &pair.ips, phase)
         };
         self.report = BindMapReport::from(&resolution);
         log_outcome(resolution.status, resolution.disposition);
@@ -187,8 +242,16 @@ impl LinkSource {
             );
         }
         let specs = specs_from_effective_links(&resolution.links);
+        self.pending = None;
         if let Some(applied) = resolution.applied {
+            if self.require_bind_map {
+                self.pending = Some(applied.clone());
+            }
             self.last_valid = Some(applied);
+        }
+        if self.require_bind_map {
+            self.report.bind_map_applied = self.applied.as_ref().map(Into::into);
+            self.report.bind_map_pending = self.pending.as_ref().map(Into::into);
         }
         specs
     }

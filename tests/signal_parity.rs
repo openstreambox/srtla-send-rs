@@ -38,9 +38,14 @@ struct SenderProc {
 
 impl SenderProc {
     fn spawn(args: &[&str]) -> Self {
+        Self::spawn_with_env(args, &[])
+    }
+
+    fn spawn_with_env(args: &[&str], vars: &[(&str, &str)]) -> Self {
         let mut child = Command::new(BIN)
             .args(args)
             .env("RUST_LOG", "info")
+            .envs(vars.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -502,6 +507,9 @@ fn empty_acknowledgement_follows_socket_closure_on_startup_and_rapid_readd() {
             if let Ok(bytes) = std::fs::read(&stats)
                 && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
                 && v["last_updated_ms"].as_u64().unwrap() > after
+                && v["bind_map_applied"]["generation"] == 2 + cycle * 2
+                && v["bind_map_applied"]["ips_file_sha256"]
+                    == IpsFile::from_bytes(b"").unwrap().sha256()
                 && v["connections"].as_array().unwrap().is_empty()
                 && v["bind_map_status"]["state"] == "active"
                 && v["disposition"]["state"] == "mapped"
@@ -596,4 +604,206 @@ fn required_non_unicast_sources_never_emit_probes() {
         proc.signal("TERM");
         assert_eq!(proc.wait_exit(KILL_WINDOW), Some(0));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn controlled_read_ordering(noop: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    use srtla_send::bind_map::IpsFile;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let ips = root.join("ips");
+    let map = root.join("map");
+    let stats = root.join("stats");
+    let library = root.join("gate.so");
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-O2"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/bind_map_read_gate.c"
+            ))
+            .args(["-ldl", "-o"])
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let publish = |content: &str, generation: u64| {
+        let rows = if content.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{"link_id":"path-a","ip":content,"iface":"lo"}])
+        };
+        for (path,data) in [(&ips,content.to_owned()),(&map,serde_json::json!({"schema_version":1,"generation":generation,
+            "ips_file_sha256":IpsFile::from_bytes(content.as_bytes()).unwrap().sha256(),"links":rows}).to_string())] {
+            let tmp=path.with_extension("tmp");std::fs::write(&tmp,data).unwrap();
+            std::fs::set_permissions(&tmp,std::fs::Permissions::from_mode(0o600)).unwrap();std::fs::rename(tmp,path).unwrap();
+        }
+    };
+    let wait_file = |name: &str| {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !root.join(name).exists() {
+            assert!(Instant::now() < end, "missing {name}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    };
+    publish("127.0.0.1", 1);
+    let listener = free_udp_port();
+    let mut proc = SenderProc::spawn_with_env(
+        &[
+            &listener.to_string(),
+            "127.0.0.1",
+            &free_udp_port().to_string(),
+            ips.to_str().unwrap(),
+            "--require-bind-map",
+            "--bind-map",
+            map.to_str().unwrap(),
+            "--stats-file",
+            stats.to_str().unwrap(),
+            "--stats-file-interval",
+            "10",
+        ],
+        &[
+            ("LD_PRELOAD", library.to_str().unwrap()),
+            ("SRTLA_TEST_GATE", root.to_str().unwrap()),
+            ("SRTLA_TEST_GENERATIONS", if noop { ",1,2," } else { ",2," }),
+        ],
+    );
+    assert!(proc.wait_for_log("sender ready for reload signals", START_TIMEOUT));
+    let observe = |generation: u64, state: &str| {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(bytes) = std::fs::read(&stats)
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && v["bind_map_applied"]["generation"] == generation
+                && v["disposition"]["state"] == state
+            {
+                return v;
+            }
+            assert!(
+                Instant::now() < end,
+                "missing {generation}/{state}: {}",
+                proc.logs()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    };
+    observe(1, "mapped");
+    std::fs::write(root.join("arm"), "").unwrap();
+    publish("127.0.0.1", if noop { 1 } else { 2 });
+    proc.signal("HUP");
+    wait_file(if noop { "captured-1" } else { "captured-2" });
+    let final_generation = if noop { 2 } else { 3 };
+    publish("", final_generation);
+    proc.signal("HUP");
+    if noop {
+        wait_file("captured-2");
+        std::fs::write(root.join("release-1"), "").unwrap();
+        assert!(proc.wait_for_log("discarding superseded bind-map read", LOG_TIMEOUT));
+        let pending = observe(1, "pending_apply");
+        assert!(
+            pending.get("bind_map_pending").is_none(),
+            "new read has no known identity yet"
+        );
+        assert_eq!(
+            owned_udp_ports(proc.child.id()).len(),
+            2,
+            "older no-op cannot withdraw or publish"
+        );
+        std::fs::write(root.join("release-2"), "").unwrap();
+    }
+    let final_report = observe(final_generation, "mapped");
+    assert_eq!(
+        final_report["bind_map_applied"]["ips_file_sha256"],
+        IpsFile::from_bytes(b"").unwrap().sha256()
+    );
+    assert!(final_report["connections"].as_array().unwrap().is_empty());
+    assert_eq!(owned_udp_ports(proc.child.id()), vec![listener]);
+    if !noop {
+        std::fs::write(root.join("release-2"), "").unwrap();
+        assert!(proc.wait_for_log("discarding superseded bind-map read", LOG_TIMEOUT));
+        observe(final_generation, "mapped");
+        assert_eq!(
+            owned_udp_ports(proc.child.id()),
+            vec![listener],
+            "old read recreated a socket after acknowledgement"
+        );
+    }
+    proc.signal("TERM");
+    assert_eq!(proc.wait_exit(KILL_WINDOW), Some(0));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn obsolete_read_cannot_recreate_sockets_after_newer_empty_ack() {
+    controlled_read_ordering(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn same_generation_noop_finishing_during_newer_read_keeps_pending() {
+    controlled_read_ordering(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn empty_startup_publishes_exact_applied_identity_without_uplink_sockets() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use srtla_send::bind_map::IpsFile;
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("map");
+    let stats = dir.path().join("stats");
+    std::fs::write(&ips, "").unwrap();
+    let sha = IpsFile::from_bytes(b"").unwrap().sha256().to_owned();
+    std::fs::write(
+        &map,
+        serde_json::json!({
+            "schema_version": 1, "generation": 7,
+            "ips_file_sha256": sha, "links": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = free_udp_port();
+    let mut proc = SenderProc::spawn(&[
+        &listener.to_string(),
+        "127.0.0.1",
+        &free_udp_port().to_string(),
+        ips.to_str().unwrap(),
+        "--require-bind-map",
+        "--bind-map",
+        map.to_str().unwrap(),
+        "--stats-file",
+        stats.to_str().unwrap(),
+        "--stats-file-interval",
+        "10",
+    ]);
+    assert!(proc.wait_for_log("sender ready for reload signals", START_TIMEOUT));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(bytes) = std::fs::read(&stats)
+            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && v["bind_map_applied"]["generation"] == 7
+        {
+            assert_eq!(v["bind_map_applied"]["ips_file_sha256"], sha);
+            assert_eq!(v["disposition"]["state"], "mapped");
+            assert_eq!(v["connections"], serde_json::json!([]));
+            assert!(v.get("bind_map_pending").is_none());
+            assert_eq!(owned_udp_ports(proc.child.id()), vec![listener]);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "startup identity missing: {}",
+            proc.logs()
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    proc.signal("TERM");
+    assert_eq!(proc.wait_exit(KILL_WINDOW), Some(0));
 }

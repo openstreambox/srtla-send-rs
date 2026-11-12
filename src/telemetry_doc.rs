@@ -55,7 +55,7 @@
 use serde::Serialize;
 use srtla_core::utils::wall_clock_ms;
 
-use crate::bind_map::{BindMapReport, BindMapStatusRecord, DispositionRecord};
+use crate::bind_map::{BindMapIdentity, BindMapReport, BindMapStatusRecord, DispositionRecord};
 use crate::stats::StatsSnapshot;
 
 /// JSON schema version. See the module docs for what does and does not bump it.
@@ -137,6 +137,10 @@ struct TelemetryDoc<'a> {
     bind_map_status: Option<&'a BindMapStatusRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disposition: Option<&'a DispositionRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bind_map_applied: Option<&'a BindMapIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bind_map_pending: Option<&'a BindMapIdentity>,
 }
 
 /// Everything a snapshot document is built from, other than its timestamp.
@@ -167,6 +171,8 @@ pub fn build_telemetry_json(last_updated_ms: u64, inputs: &TelemetryInputs<'_>) 
         bytes_sent_total: inputs.session_bytes_sent,
         bind_map_status: inputs.bind_map.map(|r| &r.bind_map_status),
         disposition: inputs.bind_map.map(|r| &r.disposition),
+        bind_map_applied: inputs.bind_map.and_then(|r| r.bind_map_applied.as_ref()),
+        bind_map_pending: inputs.bind_map.and_then(|r| r.bind_map_pending.as_ref()),
     };
     // The doc is plain scalars / strings, so serialization cannot fail; fall back
     // to an empty object defensively rather than panicking on the hot path.
