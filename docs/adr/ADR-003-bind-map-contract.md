@@ -404,6 +404,13 @@ of spawn by `capabilities.bind_map: false` (§7), never by a status field.
 | `retained_last_valid` | A degraded reload was rejected; the last valid mapped pool is still running. |
 | `legacy_unique_only` | Legacy behavior; no collision groups were present. |
 | `startup_collision_excluded` | Degraded at startup with at least one collision group; representatives run, the rest are excluded and reported. |
+| `required_binding_refused` | Required-mode startup has no valid map; no uplinks run. |
+| `pending_apply` | A required-mode request is being read or applied; never a completed receipt. |
+
+The last two dispositions are opt-in extensions (§9). In revision 2,
+`pending_apply` starts before the candidate identity is known. Optional
+`bind_map_applied` and `bind_map_pending` objects identify publication state
+(§9.5); status alone never acknowledges a request.
 
 `startup_collision_excluded` carries the affected groups: the colliding IP, the effective
 row, and the excluded rows.
@@ -591,7 +598,10 @@ index explicitly. After binding, the socket's actual local IP must equal the
 canonical mapped source (and link-local scope must match). Any failure refuses
 the socket; it never substitutes an IP-only binder. Dry-run opens no sockets
 and cannot prove runtime permissions or future interface state. Existing
-non-required binders keep their behavior.
+non-required binders keep their behavior. Required sends use a canonical IPv4
+sockaddr for an IPv4-mapped receiver address, at initial creation and socket
+rebuild; the original receiver identity is retained for DNS/re-home checks.
+Native IPv6 receiver addresses retain their scope.
 
 A required-mode reload reports `disposition.state = pending_apply` until
 application completes. It is not a withdrawal acknowledgement, even when the
@@ -633,6 +643,10 @@ A changed pool requires a STRICT increase; the same generation is allowed only
 for an identical pool. This overrides §3's writer-reset tolerance for required
 mode. Restarting a writer counter requires a new supervised sender lifetime
 or continuing above the live accepted watermark. Default mode keeps §3.
+
+A degraded required-mode read does not queue connection changes, cancel readers
+or rebuild the retained pool. It publishes a coherent degraded report with the
+actual connections and previously applied identity.
 
 Each ingress request supersedes earlier reads and queued applies. Results
 carry their ingress epoch; obsolete results are discarded even if they finish

@@ -531,3 +531,13 @@ Match `bind_map_applied.generation` and `ips_file_sha256` to the exact latest
 publication within the supervised producer lifetime; timestamps and pending
 identities do not acknowledge application. Required generations cannot regress.
 See ADR-003 §9.5 and the `telemetry-rev2-*.json` producer fixtures.
+
+A refused required reload updates its degraded report and applied identity with
+the actual connection snapshot; it does not queue a retained-pool application or
+cancel live readers. The [control protocol reference](docs/CONTROL_PROTOCOL.md#get_stats)
+lists the pending/refused states and the identities on runtime snapshots too.
+
+Required-mode sends also canonicalize IPv4-mapped receiver addresses, so an
+IPv4 source can forward to a receiver written as `::ffff:<IPv4>`, including
+after reconnect. Native IPv6 destination scopes and default-mode behavior stay
+unchanged.

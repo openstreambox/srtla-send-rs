@@ -52,13 +52,19 @@ const INJECT_SEQ_BASE: u32 = 1_000;
 struct MiniReceiver {
     port: u16,
     data_packets: Arc<AtomicU64>,
+    last_data_peer: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl MiniReceiver {
     fn start() -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind mini receiver");
+        Self::start_on("127.0.0.1")
+    }
+
+    fn start_on(ip: &str) -> Self {
+        let socket =
+            UdpSocket::bind(SocketAddr::new(ip.parse().unwrap(), 0)).expect("bind mini receiver");
         let port = socket.local_addr().expect("receiver addr").port();
         socket
             .set_read_timeout(Some(Duration::from_millis(50)))
@@ -68,6 +74,8 @@ impl MiniReceiver {
         let stop = Arc::new(AtomicBool::new(false));
 
         let counter = data_packets.clone();
+        let last_data_peer = Arc::new(std::sync::Mutex::new(None));
+        let last_peer = last_data_peer.clone();
         let halt = stop.clone();
         let handle = thread::spawn(move || {
             let mut buf = [0u8; 2048];
@@ -78,6 +86,9 @@ impl MiniReceiver {
                 if n < 2 {
                     continue;
                 }
+                if buf[0] & 0x80 == 0 {
+                    *last_peer.lock().unwrap() = Some(peer);
+                }
                 serve(&socket, &buf[..n], peer, &counter);
             }
         });
@@ -85,6 +96,7 @@ impl MiniReceiver {
         Self {
             port,
             data_packets,
+            last_data_peer,
             stop,
             handle: Some(handle),
         }
@@ -445,6 +457,178 @@ fn unpublished_tail_bytes_are_preserved_on_required_withdrawal_and_default_repla
         assert!(
             bond_total(&final_snapshot) >= floor,
             "late bytes lost: required={required}, wire floor={floor}, snapshot={final_snapshot}"
+        );
+    }
+}
+
+#[test]
+fn required_native_and_mapped_sources_forward_data_with_exact_wire_source() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use srtla_send::bind_map::IpsFile;
+    for (source, host, receiver_ip) in [
+        ("127.0.0.1", "127.0.0.1", "127.0.0.1"),
+        ("::ffff:127.0.0.1", "127.0.0.1", "127.0.0.1"),
+        ("::1", "::1", "::1"),
+        ("127.0.0.1", "::ffff:127.0.0.1", "127.0.0.1"),
+    ] {
+        let receiver = MiniReceiver::start_on(receiver_ip);
+        let dir = tempfile::tempdir().unwrap();
+        let ips = dir.path().join("ips");
+        let map = dir.path().join("map");
+        let stats = dir.path().join("stats");
+        std::fs::write(&ips, source).unwrap();
+        std::fs::write(
+            &map,
+            serde_json::json!({
+                "schema_version":1, "generation":1,
+                "ips_file_sha256":IpsFile::from_bytes(source.as_bytes()).unwrap().sha256(),
+                "links":[{"link_id":"path-a", "ip":source, "iface":"lo"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let port = free_udp_port();
+        let child = Command::new(BIN)
+            .args([
+                &port.to_string(),
+                host,
+                &receiver.port.to_string(),
+                ips.to_str().unwrap(),
+                "--require-bind-map",
+                "--bind-map",
+                map.to_str().unwrap(),
+                "--stats-file",
+                stats.to_str().unwrap(),
+                "--stats-file-interval",
+                "10",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _sender = Sender { child };
+        wait_for(READY_TIMEOUT, || {
+            let snap = read_stats(&stats)?;
+            all_links_active(&snap).then_some(())
+        })
+        .unwrap_or_else(|| panic!("source {source} to {host} did not register"));
+        inject(port, INJECT_SEQ_BASE, INJECT_BATCH);
+        wait_for(SNAPSHOT_TIMEOUT, || {
+            (receiver.data_packets.load(Ordering::Relaxed) > 0).then_some(())
+        })
+        .unwrap_or_else(|| panic!("source {source} to {host} forwarded no DATA"));
+        let peer = receiver.last_data_peer.lock().unwrap().unwrap();
+        assert_eq!(
+            peer.ip().to_canonical(),
+            source.parse::<std::net::IpAddr>().unwrap().to_canonical()
+        );
+        let snap = read_stats(&stats).unwrap();
+        assert_eq!(snap["bind_map_applied"]["generation"], 1);
+        assert_eq!(snap["connections"][0]["iface"], "lo");
+    }
+}
+
+#[test]
+fn required_degraded_reload_keeps_readers_and_socket_while_data_continues() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use srtla_send::bind_map::IpsFile;
+    let receiver = MiniReceiver::start();
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("map");
+    let stats = dir.path().join("stats");
+    let log = dir.path().join("log");
+    std::fs::write(&ips, "127.0.0.1").unwrap();
+    std::fs::write(
+        &map,
+        serde_json::json!({
+            "schema_version":1, "generation":1,
+            "ips_file_sha256":IpsFile::from_bytes(b"127.0.0.1").unwrap().sha256(),
+            "links":[{"link_id":"path-a", "ip":"127.0.0.1", "iface":"lo"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let port = free_udp_port();
+    let output = std::fs::File::create(&log).unwrap();
+    let child = Command::new(BIN)
+        .args([
+            &port.to_string(),
+            "127.0.0.1",
+            &receiver.port.to_string(),
+            ips.to_str().unwrap(),
+            "--require-bind-map",
+            "--bind-map",
+            map.to_str().unwrap(),
+            "--stats-file",
+            stats.to_str().unwrap(),
+            "--stats-file-interval",
+            "10",
+        ])
+        .env("RUST_LOG", "info")
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .unwrap();
+    let sender = Sender { child };
+    wait_for(READY_TIMEOUT, || {
+        let snap = read_stats(&stats)?;
+        all_links_active(&snap).then_some(())
+    })
+    .expect("initial link registered");
+    inject(port, INJECT_SEQ_BASE, INJECT_BATCH);
+    wait_for(SNAPSHOT_TIMEOUT, || {
+        (receiver.data_packets.load(Ordering::Relaxed) > 0).then_some(())
+    })
+    .expect("initial DATA forwarded");
+    let peer = *receiver.last_data_peer.lock().unwrap();
+    for missing_ips in [false, true] {
+        if missing_ips {
+            std::fs::remove_file(&ips).unwrap();
+        } else {
+            std::fs::write(&map, "{broken").unwrap();
+        }
+        sender.sighup();
+        let snap = wait_for(SNAPSHOT_TIMEOUT, || {
+            let snap = read_stats(&stats)?;
+            (snap["bind_map_status"]["state"] == "degraded"
+                && snap["bind_map_status"]["reason"]
+                    == if missing_ips {
+                        "unreadable"
+                    } else {
+                        "malformed"
+                    }
+                && snap["disposition"]["state"] == "retained_last_valid")
+                .then_some(snap)
+        })
+        .expect("refusal report");
+        assert_eq!(snap["bind_map_applied"]["generation"], 1);
+        assert!(snap.get("bind_map_pending").is_none());
+        assert_eq!(snap["connections"].as_array().unwrap().len(), 1);
+        let before = receiver.data_packets.load(Ordering::Relaxed);
+        inject(
+            port,
+            INJECT_SEQ_BASE * (if missing_ips { 3 } else { 2 }),
+            INJECT_BATCH,
+        );
+        wait_for(SNAPSHOT_TIMEOUT, || {
+            (receiver.data_packets.load(Ordering::Relaxed) > before).then_some(())
+        })
+        .expect("DATA continues after bad reload");
+        assert_eq!(
+            *receiver.last_data_peer.lock().unwrap(),
+            peer,
+            "refusal replaced the live socket"
+        );
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("applying queued connection changes"),
+            "a degraded read must not cancel readers and apply the retained pool again"
         );
     }
 }

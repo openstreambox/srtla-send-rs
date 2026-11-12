@@ -69,6 +69,22 @@ Result:
 
 Return per-link telemetry (the JSON previously returned by `stats`).
 
+Required binding adds optional `bind_map_applied` and `bind_map_pending` objects,
+each `{generation, ips_file_sha256}`, to this same snapshot. File telemetry
+carries the same identities, while its per-link rate is `bitrate_bps` and the
+runtime snapshot uses `bitrate_bytes_per_sec`. The applied identity and connection
+set share one snapshot lock. Require `bind_map_contract >= 2`, both required-mode
+capabilities and the supervised process lifetime before treating the exact latest
+published generation/SHA as applied. A timestamp alone is not an acknowledgement.
+
+`disposition.state` can also be `required_binding_refused` (no valid startup map,
+no uplinks) or `pending_apply` (a read/application is in flight). Pending may have
+no known identity yet; even a known `bind_map_pending` is intent only. A degraded
+reload reports `retained_last_valid`, retains the applied identity and leaves live
+sockets/readers untouched. Missing identity means unknown, never success. The
+status, disposition and identity rules are specified in
+[ADR-003 §9](adr/ADR-003-bind-map-contract.md#9-required-binding-opt-in-extension).
+
 ## Subscriptions
 
 The Unix control socket supports server-push subscriptions. Polling `get_stats` at 1 Hz misses sub-second link-state changes (NAK bursts, quality drops, reconnects); subscriptions let clients receive push events on the same socket they already use for requests.

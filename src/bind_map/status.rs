@@ -99,7 +99,7 @@ pub enum BindMapDisposition {
     StartupCollisionExcluded,
     /// Required binding has no valid mapping; no uplinks run.
     RequiredBindingRefused,
-    /// A validated required-mode reload is awaiting socket/reader application.
+    /// A required-mode reload request is being read or applied.
     PendingApply,
 }
 

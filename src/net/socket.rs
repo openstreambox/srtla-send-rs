@@ -108,6 +108,10 @@ impl UplinkBinder for DeviceBinder {
 
 #[cfg(target_os = "linux")]
 impl UplinkBinder for CheckedDeviceBinder {
+    fn requires_checked_device(&self) -> bool {
+        true
+    }
+
     fn bind(&self, sock: &Socket, ip: IpAddr) -> Result<()> {
         self.0.bind_inner(sock, ip, true)
     }

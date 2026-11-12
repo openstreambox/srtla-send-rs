@@ -295,7 +295,10 @@ async fn connect_uplink(
     let sock = create_uplink_socket(spec.ip)?;
     link_binder.bind(&sock, spec.ip)?;
     sock.set_nonblocking(true)?;
-    let socket = Arc::new(BatchUdpSocket::new(sock, remote)?);
+    let socket = Arc::new(BatchUdpSocket::new(
+        sock,
+        send_peer(remote, link_binder.as_ref()),
+    )?);
 
     let conn_id = rand::rng().next_u64();
     let label = spec.label(receiver_host, receiver_port);
@@ -310,6 +313,20 @@ async fn connect_uplink(
         route_health,
     };
     Ok((conn, io))
+}
+
+/// IPv4-mapped receiver literals name IPv4 destinations. Required sockets must
+/// send their canonical sockaddr even when DNS/literal parsing returned IPv6.
+/// Keep the original remote identity for DNS drift/re-home comparisons.
+fn send_peer(remote: SocketAddr, binder: &dyn UplinkBinder) -> SocketAddr {
+    if binder.requires_checked_device()
+        && let SocketAddr::V6(v6) = remote
+        && let Some(ip) = v6.ip().to_ipv4_mapped()
+    {
+        SocketAddr::new(ip.into(), v6.port())
+    } else {
+        remote
+    }
 }
 
 /// The binder this link's socket is created with.
@@ -398,7 +415,10 @@ pub(super) fn rebuild_uplink_socket(
     let sock = create_uplink_socket(conn.local_ip)?;
     io.binder.bind(&sock, conn.local_ip)?;
     sock.set_nonblocking(true)?;
-    io.socket = Arc::new(BatchUdpSocket::new(sock, io.remote)?);
+    io.socket = Arc::new(BatchUdpSocket::new(
+        sock,
+        send_peer(io.remote, io.binder.as_ref()),
+    )?);
 
     conn.reset_for_reconnect(now);
     // A reconnected link comes back with an empty packet log, so the tracker
@@ -548,5 +568,57 @@ mod tests {
             claim_dns_drift_warning(base + DNS_DRIFT_WARN_INTERVAL_MS),
             "the warning is due again once the window has passed"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod required_receiver_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mapped_receiver_forwards_before_and_after_required_socket_rebuild() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = SocketAddr::new(
+            "::ffff:127.0.0.1".parse().unwrap(),
+            receiver.local_addr().unwrap().port(),
+        );
+        let binder: Arc<dyn UplinkBinder> = Arc::new(crate::net::RequiredBinding);
+        let spec = UplinkSpec {
+            iface: Some(crate::bind_map::IfaceName::parse("lo").unwrap()),
+            link_id: Some(crate::bind_map::LinkId::parse("path-a").unwrap()),
+            ..UplinkSpec::unmapped("127.0.0.1".parse().unwrap())
+        };
+        let (mut conn, mut io) = connect_uplink(&spec, "::ffff:127.0.0.1", remote.port(), &binder)
+            .await
+            .unwrap();
+        assert_eq!(io.remote, remote);
+        assert_eq!(
+            send_peer(remote, &crate::net::SourceIpBinder),
+            remote,
+            "default peer behavior must stay unchanged"
+        );
+        let mut seq = SequenceTracker::new();
+        for rebuilt in [false, true] {
+            if rebuilt {
+                rebuild_uplink_socket(&mut conn, &mut io, &mut seq, now_ms()).unwrap();
+            }
+            assert_eq!(
+                io.remote, remote,
+                "canonical send must preserve DNS identity"
+            );
+            io.send_control_padded(b"probe").await.unwrap();
+            let mut packet = [0; 64];
+            let (n, peer) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                receiver.recv_from(&mut packet),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&packet[..5], b"probe");
+            assert_eq!(n, 32);
+            assert_eq!(peer.ip(), spec.ip);
+            assert!(io.binder.requires_checked_device());
+        }
     }
 }

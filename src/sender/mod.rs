@@ -639,7 +639,18 @@ pub async fn run_sender_with_config(
                 info!("discarding superseded bind-map read");
                 continue;
             };
-            if new_links.is_empty() && !link_source.accepts_empty_reload() {
+            if require_bind_map && report.bind_map_status.state != "active" {
+                // Refusal changes only the report. In particular, do not cancel
+                // live readers or re-apply a retained pool after a bad read.
+                pending_changes = None;
+                pending_bind_map_report = None;
+                pending_bind_map_request = None;
+                shared_stats.update_for_reload(
+                    &connections, &config.snapshot(), None, None,
+                    Some(&link_identities(&connections, &conn_io)),
+                    Some(&report), Some(request),
+                );
+            } else if new_links.is_empty() && !link_source.accepts_empty_reload() {
                 // Empty legacy/degraded reads cannot withdraw a running bond.
                 warn!("bind-map reload produced no usable uplinks; keeping current connections");
                 if pending_changes.is_some() { pending_bind_map_report = Some(report); }
