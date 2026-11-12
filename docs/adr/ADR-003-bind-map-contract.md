@@ -559,6 +559,25 @@ empty reloads keep their existing refusal/retention behavior.
 
 ### 9.4 Unicast sources and completed withdrawal receipts
 
+**Probe `capabilities.bind_map_contract` as an integer >= 1**, in addition to
+both `bind_map_required == true` and `bind_map_required_empty_reload == true`,
+before relying on this section. Revision `1` advertises the complete required
+binding contract: fail-closed startup, canonical assigned unicast sources,
+checked local binding, pending state, joined teardown and atomic applied
+acknowledgement. It is advertised by the CLI and runtime capability document
+only on Linux; other platforms emit `0`. Absent, zero, non-integer or failed
+probe means these guarantees are unverified and the consumer MUST NOT rely on
+them or downgrade a required-binding spawn.
+
+Earlier builds advertised the two booleans while accepting non-unicast sources
+and acknowledging empty reloads before teardown completed. The booleans alone
+therefore do not establish §9.4. This new numeric revision starts at `1`;
+future revisions increase monotonically and retain earlier guarantees, allowing
+a consumer to require its minimum revision rather than accumulate booleans.
+The number describes supported behavior, not whether required mode is enabled.
+It is independent of the capability-document, bind-map and telemetry schema
+versions; those stay unchanged.
+
 Required-mode sources are canonical unicast addresses: unspecified, limited
 broadcast and multicast addresses are rejected, including IPv4-mapped IPv6
 spellings. Directed IPv4 broadcasts are rejected using the selected device's

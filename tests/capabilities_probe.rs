@@ -75,6 +75,7 @@ fn probe_carries_the_frozen_document_shape() {
         keys,
         [
             "bind_map",
+            "bind_map_contract",
             "bind_map_required",
             "bind_map_required_empty_reload",
             "conn_timeout_ms",
@@ -163,5 +164,14 @@ fn required_empty_reload_capability_is_platform_honest() {
     assert_eq!(
         probe_document()["capabilities"]["bind_map_required_empty_reload"],
         cfg!(target_os = "linux")
+    );
+}
+
+#[test]
+fn probe_advertises_the_verified_required_binding_contract_revision() {
+    let v = probe_document();
+    assert_eq!(
+        v["capabilities"]["bind_map_contract"].as_u64(),
+        Some(if cfg!(target_os = "linux") { 1 } else { 0 })
     );
 }

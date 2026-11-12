@@ -28,16 +28,19 @@ use serde::Serialize;
 /// schema's version or of any sidecar's.
 pub const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 
+/// Required-binding behavioral contract, ADR-003 §9.4; independent of schemas.
+pub const BIND_MAP_CONTRACT_VERSION: u32 = 1;
+
 /// Scheduling modes this build accepts for `--mode` and for the JSON-RPC
 /// `set_mode` method. Mirrors `srtla_core::mode::SchedulingMode`.
 const MODES: [&str; 2] = ["classic", "enhanced"];
 
 /// What this build can do.
 ///
-/// Two entries are platform-derived rather than constant, because a build that
+/// Some entries are platform-derived rather than constant, because a build that
 /// cannot honor a feature must not claim it can:
 ///
-/// - `bind_map` — egress pinning is `SO_BINDTODEVICE`, which is Linux-only.
+/// - `bind_map`, required-binding flags and contract revision — device pinning is Linux-only.
 /// - `control_socket_jsonrpc` — the control socket is a Unix domain socket.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Capabilities {
@@ -47,6 +50,8 @@ pub struct Capabilities {
     pub bind_map_required: bool,
     /// Whether required mode supports validated empty-map withdrawal.
     pub bind_map_required_empty_reload: bool,
+    /// Required-binding contract revision; zero means unsupported/unverified.
+    pub bind_map_contract: u32,
     /// Whether `--stats-file` publishes the telemetry snapshot document.
     pub stats_file: bool,
     /// Whether `--dry-run` validates the configuration without binding.
@@ -80,6 +85,11 @@ pub fn capability_document() -> CapabilityDocument {
             bind_map: cfg!(target_os = "linux"),
             bind_map_required: cfg!(target_os = "linux"),
             bind_map_required_empty_reload: cfg!(target_os = "linux"),
+            bind_map_contract: if cfg!(target_os = "linux") {
+                BIND_MAP_CONTRACT_VERSION
+            } else {
+                0
+            },
             stats_file: true,
             dry_run: true,
             control_socket_jsonrpc: cfg!(unix),
@@ -135,6 +145,7 @@ mod tests {
             keys,
             [
                 "bind_map",
+                "bind_map_contract",
                 "bind_map_required",
                 "bind_map_required_empty_reload",
                 "conn_timeout_ms",
@@ -177,5 +188,23 @@ mod tests {
         let doc = capability_document();
         assert!(doc.capabilities.bind_map);
         assert!(doc.capabilities.control_socket_jsonrpc);
+    }
+}
+
+#[cfg(test)]
+mod bind_map_contract_tests {
+    #[test]
+    fn revision_one_means_unicast_and_joined_apply_on_linux_only() {
+        let document = super::capability_document();
+        assert_eq!(super::BIND_MAP_CONTRACT_VERSION, 1);
+        assert_eq!(
+            document.capabilities.bind_map_contract,
+            if cfg!(target_os = "linux") { 1 } else { 0 }
+        );
+        let json: serde_json::Value = serde_json::from_str(&super::capability_json()).unwrap();
+        assert_eq!(
+            json["capabilities"]["bind_map_contract"].as_u64(),
+            Some(if cfg!(target_os = "linux") { 1 } else { 0 })
+        );
     }
 }
