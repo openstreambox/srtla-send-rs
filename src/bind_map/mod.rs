@@ -32,7 +32,9 @@ pub use parser::{
     parse_sidecar,
 };
 pub use report::{BindMapReport, BindMapStatusRecord, CollisionRecord, DispositionRecord};
-pub use resolve::{EffectiveLink, Resolution, ResolvePhase, resolve, resolve_absent};
+pub use resolve::{
+    EffectiveLink, Resolution, ResolvePhase, resolve, resolve_absent, resolve_required,
+};
 pub use retry::{
     BIND_MAP_RETRY_ATTEMPTS, BIND_MAP_RETRY_BUDGET_MS, BIND_MAP_RETRY_DELAY_MS, BindMapPaths,
     PairRead, read_pair,

@@ -505,3 +505,8 @@ For maximum stability:
 
 - Use classic mode (`--mode classic`) for predictable, simple behavior
 - Increase hysteresis threshold if experiencing unnecessary switching
+
+For device-isolated uplinks, probe `capabilities.bind_map_required == true` and
+pass `--require-bind-map --bind-map <path>`. Degraded startup waits with no
+uplinks; degraded reload retains the last mapped pool. See
+[ADR-003 §9](docs/adr/ADR-003-bind-map-contract.md#9-required-binding-opt-in-extension).

@@ -124,6 +124,7 @@ pub async fn run_sender_with_config(
     receiver_port: u16,
     ips_file: &str,
     bind_map: Option<&str>,
+    require_bind_map: bool,
     config: DynamicConfig,
     shared_stats: SharedStats,
     critical_window: srtla_core::priority::CriticalWindow,
@@ -161,6 +162,9 @@ pub async fn run_sender_with_config(
     // file exactly as it always has and every spec is unmapped, so the bind-map
     // module is never entered at all.
     let mut link_source = LinkSource::new(&SenderPaths { ips_file, bind_map });
+    if require_bind_map {
+        link_source.require_bind_map()?;
+    }
 
     // A missing / empty / all-invalid ips file at startup is NOT fatal: bind no
     // uplinks, start with an EMPTY pool, and wait for a SIGHUP reload. CeraUI

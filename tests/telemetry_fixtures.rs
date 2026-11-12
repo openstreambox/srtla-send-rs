@@ -355,3 +355,17 @@ fn the_unknown_field_fixture_is_a_superset_of_a_valid_document() {
         "ignored-by-todays-reader"
     );
 }
+
+#[test]
+fn required_binding_refusal_publishes_fresh_empty_connections() {
+    let report = BindMapReport::degraded(
+        DegradedReason::UnknownIface,
+        BindMapDisposition::RequiredBindingRefused,
+    );
+    let produced = document(&[], &report);
+    assert_fixture("telemetry-required-binding-refused", &produced);
+    let doc = value(&produced);
+    assert_eq!(doc["last_updated_ms"], FIXED_MS);
+    assert_eq!(doc["connections"], serde_json::json!([]));
+    assert_eq!(doc["disposition"]["state"], "required_binding_refused");
+}

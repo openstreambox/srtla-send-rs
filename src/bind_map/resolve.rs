@@ -100,6 +100,38 @@ pub fn resolve(
     }
 }
 
+/// Required-binding variant: a degraded first read never creates source-only links.
+/// Once a valid mapping exists, reload retains its source and device bindings.
+#[must_use]
+pub fn resolve_required(
+    outcome: Result<MappedPool, BindMapError>,
+    ips: &IpsFile,
+    phase: ResolvePhase<'_>,
+) -> Resolution {
+    // An unspecified address binds a wildcard, not the promised source.
+    let outcome = outcome.and_then(|pool| {
+        if let Some(index) = pool.rows.iter().position(|row| row.ip.is_unspecified()) {
+            Err(BindMapError::InvalidRow {
+                index,
+                field: "ip",
+                detail: "required binding needs a concrete source address".into(),
+            })
+        } else {
+            Ok(pool)
+        }
+    });
+    if let (Err(err), ResolvePhase::Startup) = (&outcome, &phase) {
+        return Resolution {
+            status: BindMapStatus::Degraded(err.reason()),
+            disposition: BindMapDisposition::RequiredBindingRefused,
+            links: Vec::new(),
+            excluded: Vec::new(),
+            applied: None,
+        };
+    }
+    resolve(outcome, ips, phase)
+}
+
 fn degrade(reason: DegradedReason, ips: &IpsFile, phase: ResolvePhase<'_>) -> Resolution {
     match phase {
         // A live bond already has interface bindings. Falling back to legacy
@@ -171,4 +203,35 @@ fn exclude_collisions(accepted: &[IpAddr]) -> (Vec<EffectiveLink>, Vec<Collision
     }
 
     (links, groups)
+}
+
+#[cfg(test)]
+mod required_tests {
+    use super::*;
+
+    #[test]
+    fn degraded_startup_never_returns_source_only_links() {
+        for bytes in [b"10.0.0.9\n".as_slice(), b"10.0.0.9\n10.0.0.9\n".as_slice()] {
+            let ips = IpsFile::from_bytes(bytes).unwrap();
+            for error in [
+                BindMapError::MissingFile { path: "map".into() },
+                BindMapError::UnknownIface {
+                    index: 0,
+                    iface: "wwan0".into(),
+                },
+                BindMapError::RetryExhausted { attempts: 5 },
+                BindMapError::MalformedJson("invalid".into()),
+            ] {
+                let reason = error.reason();
+                let result = resolve_required(Err(error), &ips, ResolvePhase::Startup);
+                assert_eq!(result.status, BindMapStatus::Degraded(reason));
+                assert_eq!(
+                    result.disposition,
+                    BindMapDisposition::RequiredBindingRefused
+                );
+                assert!(result.links.is_empty());
+                assert!(result.applied.is_none());
+            }
+        }
+    }
 }

@@ -75,6 +75,7 @@ fn probe_carries_the_frozen_document_shape() {
         keys,
         [
             "bind_map",
+            "bind_map_required",
             "conn_timeout_ms",
             "control_socket_jsonrpc",
             "dry_run",
@@ -139,4 +140,19 @@ fn an_unknown_flag_alongside_the_probe_is_a_usage_error() {
     assert_eq!(out.status.code(), Some(USAGE_ERROR_CODE));
     assert!(out.stdout.is_empty(), "no document on a usage error");
     assert!(!out.stderr.is_empty(), "usage error explains itself");
+}
+
+#[test]
+fn required_binding_capability_is_platform_honest() {
+    assert_eq!(
+        probe_document()["capabilities"]["bind_map_required"],
+        cfg!(target_os = "linux")
+    );
+}
+
+#[test]
+fn required_binding_flag_requires_a_sidecar() {
+    let out = run(&["5000", "127.0.0.1", "5001", "ips.txt", "--require-bind-map"]);
+    assert_eq!(out.status.code(), Some(USAGE_ERROR_CODE));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--bind-map"));
 }

@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use super::connections::{specs_from_effective_links, specs_from_ips};
 use crate::bind_map::{
     BindMapDisposition, BindMapError, BindMapPaths, BindMapReport, BindMapStatus, MappedPool,
-    PairRead, ResolvePhase, SystemIfaces, ValidateCtx, read_pair, resolve,
+    PairRead, ResolvePhase, SystemIfaces, ValidateCtx, read_pair, resolve, resolve_required,
 };
 use crate::net::UplinkSpec;
 use crate::sender::read_ip_list;
@@ -69,6 +69,7 @@ pub struct LinkSource {
     ips_file: String,
     sidecar: Option<String>,
     last_valid: Option<MappedPool>,
+    require_bind_map: bool,
     report: BindMapReport,
 }
 
@@ -79,10 +80,19 @@ impl LinkSource {
             ips_file: paths.ips_file.to_string(),
             sidecar: paths.bind_map.map(ToString::to_string),
             last_valid: None,
+            require_bind_map: false,
             // A legacy run never resolves, so the default is what it reports for
             // its whole lifetime: absent, running legacy, nothing excluded.
             report: BindMapReport::default(),
         }
+    }
+
+    /// Refuse all source-only fallback paths. A sidecar is mandatory.
+    pub fn require_bind_map(&mut self) -> Result<()> {
+        anyhow::ensure!(self.sidecar.is_some(), "required binding needs --bind-map");
+        anyhow::ensure!(cfg!(target_os = "linux"), "required binding needs Linux");
+        self.require_bind_map = true;
+        Ok(())
     }
 
     #[must_use]
@@ -101,6 +111,8 @@ impl LinkSource {
     fn retention(&self) -> BindMapDisposition {
         if self.last_valid.is_some() {
             BindMapDisposition::RetainedLastValid
+        } else if self.require_bind_map {
+            BindMapDisposition::RequiredBindingRefused
         } else {
             BindMapDisposition::LegacyUniqueOnly
         }
@@ -144,7 +156,11 @@ impl LinkSource {
             Some(last_valid) => ResolvePhase::Reload { last_valid },
             None => ResolvePhase::Startup,
         };
-        let resolution = resolve(pair.map, &pair.ips, phase);
+        let resolution = if self.require_bind_map {
+            resolve_required(pair.map, &pair.ips, phase)
+        } else {
+            resolve(pair.map, &pair.ips, phase)
+        };
         self.report = BindMapReport::from(&resolution);
         log_outcome(resolution.status, resolution.disposition);
         for group in &resolution.excluded {

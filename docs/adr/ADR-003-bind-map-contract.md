@@ -481,3 +481,51 @@ this repo: `src/net/socket.rs` (`DeviceBinder`), `src/net/spec.rs`
 (`UplinkSpec`/`SocketKey`), `src/net/egress.rs` (ifindex staleness),
 `src/net/route.rs` + `src/sender/egress_tick.rs` (the read-only route invariant), and
 `src/stats.rs` + `src/telemetry_doc.rs` (the telemetry echo).
+
+## 9. Required binding (opt-in extension)
+
+A caller requiring device isolation probes for literal
+`capabilities.bind_map_required == true` before spawning with
+`--require-bind-map --bind-map <path>`. The capability is true only on Linux,
+where both source binding and `SO_BINDTODEVICE` are enforced. It is advertised
+by both the pre-spawn probe and runtime `get_capabilities`; support does not
+mean the flag is enabled. Missing/false capability, failed probe, malformed
+output or timeout means the caller MUST refuse a required-binding spawn.
+It MUST NOT downgrade that spawn to source-only links.
+
+The flag requires a sidecar path. Without the flag, §§6–7 remain unchanged.
+In particular, `bind_map: true` alone does **not** guarantee fail-closed startup.
+
+### 9.1 STARTUP and recovery
+
+Before a valid pair has been applied, **any** degraded read refuses the entire
+pair, including unique IPs and same-IP representatives. No uplink sockets are
+created. The listener stays alive with an empty pool, awaiting SIGHUP; device
+arrival requires a new read, not a process restart. The pair is atomic: a single
+missing interface refuses all its rows rather than applying a partial mapping.
+
+Existing telemetry reports `bind_map_status.state = degraded` with the existing
+reason and `disposition.state = required_binding_refused`. `connections` is
+empty, and each new snapshot has its normal fresh publish timestamp. There
+are no collision representatives to report. Logs include the degradation reason
+and disposition. The producer fixture is
+`tests/fixtures/telemetry-required-binding-refused.json`; required fields and
+`schema_version = 1` are unchanged.
+
+### 9.2 Applied mappings and RELOAD
+
+Required mode also rejects unspecified source addresses (`0.0.0.0` / `::`)
+as `malformed`: binding a wildcard would not pin a source.
+Every accepted link uses the existing device-first, source-second binder.
+Failure of either operation refuses that socket and logs the failure; it never
+retries with a source-only binder. Existing bound reconnect and interface
+staleness handling remain in force. A valid map status describes validation,
+not proof that every socket connected; consumers also inspect connections.
+
+A degraded reload after a valid pair retains the last valid mapped pool and
+reports `retained_last_valid`, exactly as §6.2. This is **not withdrawal**:
+supervisors needing immediate withdrawal must fence that path and publish a
+valid replacement, then observe fresh producer evidence of socket removal.
+Before the first valid pair, every degraded reload remains empty and refused.
+`--dry-run` continues to reject unusable pairs with nonzero exit; it does not
+open sockets or prove runtime bind permissions.

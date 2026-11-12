@@ -97,12 +97,15 @@ pub enum BindMapDisposition {
     LegacyUniqueOnly,
     /// Degraded at startup with at least one collision group.
     StartupCollisionExcluded,
+    /// Required binding has no valid mapping; no uplinks run.
+    RequiredBindingRefused,
 }
 
 impl BindMapDisposition {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::RequiredBindingRefused => "required_binding_refused",
             Self::Mapped => "mapped",
             Self::RetainedLastValid => "retained_last_valid",
             Self::LegacyUniqueOnly => "legacy_unique_only",

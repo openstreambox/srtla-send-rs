@@ -87,6 +87,11 @@ struct Cli {
     #[arg(long = "bind-map")]
     bind_map: Option<String>,
 
+    /// Require source and device binding for every uplink; degraded startup
+    /// waits with no uplinks for a valid bind-map and SIGHUP.
+    #[arg(long = "require-bind-map", requires = "bind_map")]
+    require_bind_map: bool,
+
     /// Unix domain socket path for remote toggle control (e.g.,
     /// /tmp/srtla.sock)
     #[arg(long = "control-socket")]
@@ -371,6 +376,7 @@ async fn main() -> Result<()> {
         receiver_port,
         ips_file,
         args.bind_map.as_deref(),
+        args.require_bind_map,
         config,
         shared_stats,
         critical_window,

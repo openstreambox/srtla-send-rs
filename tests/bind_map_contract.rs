@@ -284,3 +284,149 @@ fn dry_run_validates_the_sidecar_too_and_refuses_an_unusable_one() {
         "the ADR-003 degraded reason must be reported verbatim; got: {stderr}"
     );
 }
+
+// Required-binding startup and reload use the same pair validator as production.
+#[tokio::test]
+async fn required_binding_refuses_unique_and_duplicate_sources_without_a_map() {
+    use srtla_send::bind_map::{BindMapDisposition, BindMapReport, ResolvePhase, resolve_required};
+    for contents in ["10.0.0.9\n", IPS_A] {
+        let dir = tempfile::tempdir().unwrap();
+        publish(&dir.path().join("srtla_ips"), contents);
+        let pair = read_pair(
+            BindMapPaths {
+                ips_file: &dir.path().join("srtla_ips"),
+                sidecar: &dir.path().join("missing.json"),
+            },
+            ValidateCtx {
+                ifaces: &oracle(),
+                prior: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resolution = resolve_required(pair.map, &pair.ips, ResolvePhase::Startup);
+        assert!(resolution.links.is_empty());
+        assert!(resolution.applied.is_none());
+        assert_eq!(
+            resolution.disposition,
+            BindMapDisposition::RequiredBindingRefused
+        );
+        let report = BindMapReport::from(&resolution);
+        assert_eq!(report.bind_map_status.state, "degraded");
+        assert_eq!(report.bind_map_status.reason, Some("missing_file"));
+    }
+}
+
+#[tokio::test]
+async fn required_binding_missing_device_then_appears_and_degraded_reload_retains_twins() {
+    use srtla_send::bind_map::{BindMapDisposition, ResolvePhase, resolve_required};
+    let dir = tempfile::tempdir().unwrap();
+    publish(&dir.path().join("srtla_ips"), IPS_A);
+    publish(&dir.path().join("bind_map.json"), &sidecar_for(IPS_A, 1));
+    let absent = StaticIfaces::new(["wwan0"]);
+    let paths = BindMapPaths {
+        ips_file: &dir.path().join("srtla_ips"),
+        sidecar: &dir.path().join("bind_map.json"),
+    };
+    let pair = read_pair(
+        paths,
+        ValidateCtx {
+            ifaces: &absent,
+            prior: None,
+        },
+    )
+    .await
+    .unwrap();
+    let refused = resolve_required(pair.map, &pair.ips, ResolvePhase::Startup);
+    assert!(
+        refused.links.is_empty(),
+        "one missing device refuses the entire pair"
+    );
+    assert_eq!(refused.status.reason().unwrap().as_str(), "unknown_iface");
+    // Device arrival alone does not publish a map: a fresh read (SIGHUP) does.
+    let pair = read_pair(
+        paths,
+        ValidateCtx {
+            ifaces: &oracle(),
+            prior: None,
+        },
+    )
+    .await
+    .unwrap();
+    let active = resolve_required(pair.map, &pair.ips, ResolvePhase::Startup);
+    assert_eq!(active.links.len(), 2);
+    assert_eq!(active.links[0].ip, active.links[1].ip);
+    assert_ne!(active.links[0].iface, active.links[1].iface);
+    assert!(
+        active
+            .links
+            .iter()
+            .all(|link| link.iface.is_some() && link.link_id.is_some())
+    );
+    let prior = active.applied.unwrap();
+    let pair = read_pair(
+        paths,
+        ValidateCtx {
+            ifaces: &absent,
+            prior: Some(&prior),
+        },
+    )
+    .await
+    .unwrap();
+    let retained = resolve_required(
+        pair.map,
+        &pair.ips,
+        ResolvePhase::Reload { last_valid: &prior },
+    );
+    assert_eq!(retained.disposition, BindMapDisposition::RetainedLastValid);
+    assert_eq!(retained.links, active.links);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn required_link_source_stays_empty_until_a_valid_pair_is_published() {
+    use srtla_send::sender::{LinkSource, SenderPaths};
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("map");
+    let mut source = LinkSource::new(&SenderPaths {
+        ips_file: ips.to_str().unwrap(),
+        bind_map: Some(map.to_str().unwrap()),
+    });
+    source.require_bind_map().unwrap();
+    assert!(source.startup().await.unwrap().is_empty());
+    assert_eq!(
+        source.report().disposition.state,
+        "required_binding_refused"
+    );
+    publish(&ips, "127.0.0.1\n");
+    assert!(source.startup().await.unwrap().is_empty());
+    publish(&map, &sidecar_for("127.0.0.1\n", 1).replace("wwan0", "lo"));
+    let links = source.startup().await.unwrap();
+    assert_eq!(links.len(), 1);
+    assert_eq!(source.report().disposition.state, "mapped");
+}
+#[tokio::test]
+async fn required_binding_refuses_wildcard_sources() {
+    use srtla_send::bind_map::{ResolvePhase, resolve_required};
+    for contents in ["0.0.0.0\n", "::\n"] {
+        let dir = tempfile::tempdir().unwrap();
+        publish(&dir.path().join("srtla_ips"), contents);
+        publish(&dir.path().join("bind_map.json"), &sidecar_for(contents, 1));
+        let pair = read_pair(
+            BindMapPaths {
+                ips_file: &dir.path().join("srtla_ips"),
+                sidecar: &dir.path().join("bind_map.json"),
+            },
+            ValidateCtx {
+                ifaces: &oracle(),
+                prior: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resolution = resolve_required(pair.map, &pair.ips, ResolvePhase::Startup);
+        assert!(resolution.links.is_empty());
+        assert_eq!(resolution.status.reason().unwrap().as_str(), "malformed");
+    }
+}

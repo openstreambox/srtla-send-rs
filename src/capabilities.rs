@@ -43,6 +43,8 @@ const MODES: [&str; 2] = ["classic", "enhanced"];
 pub struct Capabilities {
     /// Whether `--bind-map` can actually steer egress on this platform.
     pub bind_map: bool,
+    /// Whether --require-bind-map refuses source-only startup fallback.
+    pub bind_map_required: bool,
     /// Whether `--stats-file` publishes the telemetry snapshot document.
     pub stats_file: bool,
     /// Whether `--dry-run` validates the configuration without binding.
@@ -74,6 +76,7 @@ pub fn capability_document() -> CapabilityDocument {
         version: env!("CARGO_PKG_VERSION"),
         capabilities: Capabilities {
             bind_map: cfg!(target_os = "linux"),
+            bind_map_required: cfg!(target_os = "linux"),
             stats_file: true,
             dry_run: true,
             control_socket_jsonrpc: cfg!(unix),
@@ -129,6 +132,7 @@ mod tests {
             keys,
             [
                 "bind_map",
+                "bind_map_required",
                 "conn_timeout_ms",
                 "control_socket_jsonrpc",
                 "dry_run",
