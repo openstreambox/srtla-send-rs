@@ -274,7 +274,7 @@ pub async fn run_sender_with_config(
     // to a genuinely new address. `--no-rehome` turns it off entirely.
     let mut rehome = RehomeGate::new(config.rehome_on_failure());
     let mut pending_changes: Option<PendingConnectionChanges> = None;
-    let mut pending_bind_map_report = None;
+    let mut pending_bind_map_report: Option<crate::bind_map::BindMapReport> = None;
     let mut pending_bind_map_request = None;
     // Weak-link classifier. Its per-link `weak` verdict is consumed by
     // Enhanced selection as an admission gate.
