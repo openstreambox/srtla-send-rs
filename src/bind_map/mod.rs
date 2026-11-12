@@ -34,6 +34,7 @@ pub use parser::{
 pub use report::{BindMapReport, BindMapStatusRecord, CollisionRecord, DispositionRecord};
 pub use resolve::{
     EffectiveLink, Resolution, ResolvePhase, resolve, resolve_absent, resolve_required,
+    validate_required_pool,
 };
 pub use retry::{
     BIND_MAP_RETRY_ATTEMPTS, BIND_MAP_RETRY_BUDGET_MS, BIND_MAP_RETRY_DELAY_MS, BindMapPaths,
@@ -60,4 +61,21 @@ pub async fn dry_run_validate(ips_file: &str, sidecar: &str) -> Result<MappedPoo
     )
     .await?;
     pair.map
+}
+
+/// Required binding depends on Linux device-and-source socket binding.
+pub fn ensure_required_binding_supported() -> anyhow::Result<()> {
+    anyhow::ensure!(cfg!(target_os = "linux"), "required binding needs Linux");
+    Ok(())
+}
+
+#[cfg(test)]
+mod required_platform_tests {
+    #[test]
+    fn required_binding_support_matches_the_platform() {
+        assert_eq!(
+            super::ensure_required_binding_supported().is_ok(),
+            cfg!(target_os = "linux")
+        );
+    }
 }

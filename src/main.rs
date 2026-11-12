@@ -243,6 +243,10 @@ async fn main() -> Result<()> {
     let receiver_port = args.receiver_port.expect("required");
     let ips_file = args.ips_file.as_deref().expect("required");
 
+    if args.require_bind_map {
+        srtla_send::bind_map::ensure_required_binding_supported()?;
+    }
+
     // `--dry-run` validates the configuration and exits before any socket is
     // bound: the local SRT listener is bound inside `run_sender_with_config`,
     // which this path never reaches.
@@ -256,6 +260,13 @@ async fn main() -> Result<()> {
             Some(sidecar) => Some(
                 srtla_send::bind_map::dry_run_validate(ips_file, sidecar)
                     .await
+                    .and_then(|pool| {
+                        if args.require_bind_map {
+                            srtla_send::bind_map::validate_required_pool(pool)
+                        } else {
+                            Ok(pool)
+                        }
+                    })
                     .map_err(|e| anyhow!("bind-map is unusable ({}): {e}", e.reason()))?,
             ),
         };

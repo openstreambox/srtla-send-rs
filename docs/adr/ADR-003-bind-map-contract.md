@@ -514,8 +514,11 @@ and disposition. The producer fixture is
 
 ### 9.2 Applied mappings and RELOAD
 
-Required mode also rejects unspecified source addresses (`0.0.0.0` / `::`)
+Required mode also rejects unspecified source addresses (`0.0.0.0` / `::`),
+including the IPv4-mapped spelling `::ffff:0.0.0.0`,
 as `malformed`: binding a wildcard would not pin a source.
+Required-mode dry-run uses the same canonical-address validation and Linux
+platform guard as runtime. Default dry-run behavior is unchanged.
 Every accepted link uses the existing device-first, source-second binder.
 Failure of either operation refuses that socket and logs the failure; it never
 retries with a source-only binder. Existing bound reconnect and interface

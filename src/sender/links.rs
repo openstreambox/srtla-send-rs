@@ -90,7 +90,7 @@ impl LinkSource {
     /// Refuse all source-only fallback paths. A sidecar is mandatory.
     pub fn require_bind_map(&mut self) -> Result<()> {
         anyhow::ensure!(self.sidecar.is_some(), "required binding needs --bind-map");
-        anyhow::ensure!(cfg!(target_os = "linux"), "required binding needs Linux");
+        crate::bind_map::ensure_required_binding_supported()?;
         self.require_bind_map = true;
         Ok(())
     }

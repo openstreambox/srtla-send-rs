@@ -100,6 +100,23 @@ pub fn resolve(
     }
 }
 
+/// Validate the concrete-source contract shared by runtime and dry-run.
+pub fn validate_required_pool(pool: MappedPool) -> Result<MappedPool, BindMapError> {
+    // Linux treats IPv4-mapped 0.0.0.0 as a wildcard too.
+    if let Some(index) = pool
+        .rows
+        .iter()
+        .position(|row| row.ip.to_canonical().is_unspecified())
+    {
+        return Err(BindMapError::InvalidRow {
+            index,
+            field: "ip",
+            detail: "required binding needs a concrete source address".into(),
+        });
+    }
+    Ok(pool)
+}
+
 /// Required-binding variant: a degraded first read never creates source-only links.
 /// Once a valid mapping exists, reload retains its source and device bindings.
 #[must_use]
@@ -108,18 +125,7 @@ pub fn resolve_required(
     ips: &IpsFile,
     phase: ResolvePhase<'_>,
 ) -> Resolution {
-    // An unspecified address binds a wildcard, not the promised source.
-    let outcome = outcome.and_then(|pool| {
-        if let Some(index) = pool.rows.iter().position(|row| row.ip.is_unspecified()) {
-            Err(BindMapError::InvalidRow {
-                index,
-                field: "ip",
-                detail: "required binding needs a concrete source address".into(),
-            })
-        } else {
-            Ok(pool)
-        }
-    });
+    let outcome = outcome.and_then(validate_required_pool);
     if let (Err(err), ResolvePhase::Startup) = (&outcome, &phase) {
         return Resolution {
             status: BindMapStatus::Degraded(err.reason()),

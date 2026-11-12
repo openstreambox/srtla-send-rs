@@ -409,7 +409,7 @@ async fn required_link_source_stays_empty_until_a_valid_pair_is_published() {
 #[tokio::test]
 async fn required_binding_refuses_wildcard_sources() {
     use srtla_send::bind_map::{ResolvePhase, resolve_required};
-    for contents in ["0.0.0.0\n", "::\n"] {
+    for contents in ["0.0.0.0\n", "::\n", "::ffff:0.0.0.0\n"] {
         let dir = tempfile::tempdir().unwrap();
         publish(&dir.path().join("srtla_ips"), contents);
         publish(&dir.path().join("bind_map.json"), &sidecar_for(contents, 1));
@@ -462,4 +462,70 @@ async fn only_required_mode_authorizes_a_valid_empty_reload() {
         assert!(source.adopt(pair).is_empty());
         assert_eq!(source.accepts_empty_reload(), required);
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn required_dry_run_uses_the_runtime_concrete_source_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("map");
+    for (source, wildcard) in [
+        ("0.0.0.0", true),
+        ("::", true),
+        ("::ffff:0.0.0.0", true),
+        ("::ffff:127.0.0.1", false),
+        ("127.0.0.1", false),
+    ] {
+        let content = format!("{source}\n");
+        publish(&ips, &content);
+        publish(&map, &sidecar_for(&content, 1).replace("wwan0", "lo"));
+        for required in [false, true] {
+            let mut cmd = Command::new(BIN);
+            cmd.args([
+                "5000",
+                "127.0.0.1",
+                "5001",
+                ips.to_str().unwrap(),
+                "--dry-run",
+                "--bind-map",
+                map.to_str().unwrap(),
+            ]);
+            if required {
+                cmd.arg("--require-bind-map");
+            }
+            let out = cmd.env("RUST_LOG", "off").output().unwrap();
+            assert_eq!(
+                out.status.success(),
+                !required || !wildcard,
+                "source={source}, required={required}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if required && wildcard {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(stderr.contains("concrete source address") && stderr.contains("malformed"));
+                assert!(!String::from_utf8_lossy(&out.stdout).contains("configuration valid"));
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn required_dry_run_refuses_unsupported_platforms_before_reading_inputs() {
+    let out = Command::new(BIN)
+        .args([
+            "5000",
+            "127.0.0.1",
+            "5001",
+            "missing-ips",
+            "--dry-run",
+            "--bind-map",
+            "missing-map",
+            "--require-bind-map",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("required binding needs Linux"));
 }
