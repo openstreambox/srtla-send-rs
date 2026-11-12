@@ -409,7 +409,16 @@ async fn required_link_source_stays_empty_until_a_valid_pair_is_published() {
 #[tokio::test]
 async fn required_binding_refuses_wildcard_sources() {
     use srtla_send::bind_map::{ResolvePhase, resolve_required};
-    for contents in ["0.0.0.0\n", "::\n", "::ffff:0.0.0.0\n"] {
+    for contents in [
+        "0.0.0.0\n",
+        "::\n",
+        "::ffff:0.0.0.0\n",
+        "255.255.255.255\n",
+        "224.0.0.1\n",
+        "ff02::1\n",
+        "::ffff:255.255.255.255\n",
+        "::ffff:224.0.0.1\n",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         publish(&dir.path().join("srtla_ips"), contents);
         publish(&dir.path().join("bind_map.json"), &sidecar_for(contents, 1));
@@ -474,8 +483,15 @@ fn required_dry_run_uses_the_runtime_concrete_source_checks() {
         ("0.0.0.0", true),
         ("::", true),
         ("::ffff:0.0.0.0", true),
+        ("255.255.255.255", true),
+        ("224.0.0.1", true),
+        ("ff02::1", true),
+        ("::ffff:255.255.255.255", true),
+        ("::ffff:224.0.0.1", true),
         ("::ffff:127.0.0.1", false),
         ("127.0.0.1", false),
+        ("192.0.2.1", true),
+        ("fe80::1234", true),
     ] {
         let content = format!("{source}\n");
         publish(&ips, &content);
@@ -503,7 +519,10 @@ fn required_dry_run_uses_the_runtime_concrete_source_checks() {
             );
             if required && wildcard {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                assert!(stderr.contains("concrete source address") && stderr.contains("malformed"));
+                assert!(
+                    (stderr.contains("concrete source address") || stderr.contains("not assigned"))
+                        && stderr.contains("malformed")
+                );
                 assert!(!String::from_utf8_lossy(&out.stdout).contains("configuration valid"));
             }
         }

@@ -321,7 +321,13 @@ fn link_binder_for(spec: &UplinkSpec, default: &Arc<dyn UplinkBinder>) -> Arc<dy
     match spec.iface.as_ref() {
         None => default.clone(),
         #[cfg(target_os = "linux")]
-        Some(iface) => Arc::new(crate::net::DeviceBinder::new(iface.as_str())),
+        Some(iface) => {
+            if default.requires_checked_device() {
+                Arc::new(crate::net::DeviceBinder::checked(iface.as_str()))
+            } else {
+                Arc::new(crate::net::DeviceBinder::new(iface.as_str()))
+            }
+        }
         #[cfg(not(target_os = "linux"))]
         Some(_) => default.clone(),
     }

@@ -62,7 +62,7 @@ impl From<&CollisionGroup> for CollisionRecord {
 /// What is the sender actually running, and at whose expense?
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DispositionRecord {
-    /// `mapped` | `retained_last_valid` | `legacy_unique_only` | `startup_collision_excluded`.
+    /// `mapped` | `retained_last_valid` | `legacy_unique_only` | `startup_collision_excluded` | `pending_apply`.
     pub state: &'static str,
     /// The groups a `startup_collision_excluded` disposition cost. Empty for
     /// every other disposition, and omitted from the JSON when empty.

@@ -97,7 +97,8 @@ pub async fn handle_housekeeping(
                             // Fall back to recovery if reconnect fails
                             recover_connection(conn, seq_tracker);
                         } else {
-                            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx);
+                            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx)
+                                .await;
                         }
                     }
                     None => {
@@ -172,7 +173,7 @@ pub async fn handle_housekeeping(
             .is_some_and(|reader| reader.handle.is_finished());
         if reader_dead && let Some(io) = conn_io.get(&conn.conn_id) {
             warn!("{}: uplink reader task ended; restarting", conn.label);
-            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx);
+            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx).await;
         }
     }
 
@@ -306,7 +307,7 @@ mod tests {
 
         let (packet_tx, _packet_rx) = create_uplink_channel();
         let mut reader_handles: HashMap<ConnectionId, ReaderHandle> = HashMap::new();
-        sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
+        sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx).await;
 
         // Abort the reader and let the runtime drive cancellation to completion,
         // reproducing a silently dead task (a handle that reports is_finished()).

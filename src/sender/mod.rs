@@ -132,6 +132,11 @@ pub async fn run_sender_with_config(
     binder: std::sync::Arc<dyn crate::net::UplinkBinder>,
     mut on_shutdown: ShutdownHooks,
 ) -> Result<()> {
+    let binder: std::sync::Arc<dyn crate::net::UplinkBinder> = if require_bind_map {
+        std::sync::Arc::new(crate::net::RequiredBinding)
+    } else {
+        binder
+    };
     info!(
         "starting srtla_send: local_srt_port={}, receiver={}:{}, ips_file={}, mode={}",
         local_srt_port,
@@ -177,7 +182,6 @@ pub async fn run_sender_with_config(
             SmallVec::new()
         }
     };
-    shared_stats.set_bind_map(link_source.report().clone());
     debug!(
         "uplinks loaded: {}",
         links
@@ -197,6 +201,14 @@ pub async fn run_sender_with_config(
         create_connections_from_links(&links, receiver_host, receiver_port, &binder, &mut conn_io)
             .await;
 
+    shared_stats.update_with_bind_map(
+        &connections,
+        &config.snapshot(),
+        None,
+        None,
+        Some(&link_identities(&connections, &conn_io)),
+        Some(link_source.report()),
+    );
     let mut reg = SrtlaRegistrationManager::new();
 
     // Probing bootstraps the connection group. With an empty pool there is
@@ -215,7 +227,7 @@ pub async fn run_sender_with_config(
 
     let (packet_tx, mut packet_rx) = create_uplink_channel();
     let mut reader_handles: HashMap<ConnectionId, ReaderHandle> = HashMap::new();
-    sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
+    sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx).await;
 
     // Create instant ACK forwarding channel (sends client addr with packet)
     let (instant_tx, mut instant_rx) =
@@ -261,6 +273,7 @@ pub async fn run_sender_with_config(
     // to a genuinely new address. `--no-rehome` turns it off entirely.
     let mut rehome = RehomeGate::new(config.rehome_on_failure());
     let mut pending_changes: Option<PendingConnectionChanges> = None;
+    let mut pending_bind_map_report = None;
     // Weak-link classifier. Its per-link `weak` verdict is consumed by
     // Enhanced selection as an admission gate.
     let mut weak_link_filter = srtla_core::selection::classifier::WeakLinkFilter::new();
@@ -279,6 +292,8 @@ pub async fn run_sender_with_config(
     let mut sigterm = signal(SignalKind::terminate())?;
     #[cfg(unix)]
     let mut sigint = signal(SignalKind::interrupt())?;
+    #[cfg(unix)]
+    info!("sender ready for reload signals");
     // Answers from the off-loop ADR-003 pair read a SIGHUP spawns.
     #[cfg(unix)]
     let (bind_map_tx, mut bind_map_rx) =
@@ -392,6 +407,57 @@ pub async fn run_sender_with_config(
                             warn!("housekeeping failed: {err}");
                         }
 
+                        let mut applied_bind_map_report = None;
+                        if let Some(changes) = pending_changes.take()
+                            && let Some(new_links) = changes.new_links
+                        {
+                            info!("applying queued connection changes: {} uplinks", new_links.len());
+                            if require_bind_map {
+                                // Abort AND join: abort alone leaves reader-owned socket
+                                // Arcs alive until cancellation is polled.
+                                for (_, reader) in reader_handles.drain() {
+                                    reader.handle.abort();
+                                    let _ = reader.handle.await;
+                                }
+                            }
+                            apply_connection_changes(
+                                &mut connections,
+                                &mut conn_io,
+                                &new_links,
+                                &changes.receiver_host,
+                                changes.receiver_port,
+                                &mut last_selected_idx,
+                                &mut seq_tracker,
+                                &binder,
+                            ).await;
+                            applied_bind_map_report = pending_bind_map_report.take();
+                            info!("connection changes applied successfully");
+                            if require_bind_map && connections.is_empty() {
+                                // Forget index-scoped registration state so a later
+                                // re-add starts a fresh handshake, including probes.
+                                reg.reset_for_rehome();
+                            }
+                            sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx).await;
+                            // Bootstrap registration when a reload populated an
+                            // empty pool. `start_probing` self-guards (no-op once
+                            // probing has begun), so this only fires on the
+                            // empty-pool -> first-uplinks transition and never
+                            // disturbs an established bond's reload.
+                            if !connections.is_empty() {
+                                let probes = reg.start_probing(
+                                    &mut connections,
+                                    srtla_core::utils::now_ms(),
+                                );
+                                for (idx, pkt) in probes {
+                                    if let Some(conn) = connections.get(idx)
+                                        && let Some(io) = conn_io.get(&conn.conn_id)
+                                    {
+                                        let _ = io.send_control_padded(&pkt).await;
+                                    }
+                                }
+                            }
+                        }
+
                         // Run the weak-link classifier and per-link CC
                         // controller, stamp results onto each connection
                         // for selection to consume, and surface via stats.
@@ -420,12 +486,13 @@ pub async fn run_sender_with_config(
                             conn.loss_degraded =
                                 cc_snap.map(|s| s.loss_degraded).unwrap_or(false);
                         }
-                        shared_stats.update(
+                        shared_stats.update_with_bind_map(
                             &connections,
                             &housekeeping_snap,
                             Some(&classification),
                             Some(&link_cc_snapshots),
                             Some(&link_identities(&connections, &conn_io)),
+                            applied_bind_map_report.as_ref(),
                         );
 
                         // Fan the fresh snapshot out to any `stats` subscribers
@@ -436,54 +503,13 @@ pub async fn run_sender_with_config(
                             subscription_hub.publish("stats", value).await;
                         }
 
-                        if let Some(changes) = pending_changes.take()
-                            && let Some(new_links) = changes.new_links
-                        {
-                            info!("applying queued connection changes: {} uplinks", new_links.len());
-                            apply_connection_changes(
-                                &mut connections,
-                                &mut conn_io,
-                                &new_links,
-                                &changes.receiver_host,
-                                changes.receiver_port,
-                                &mut last_selected_idx,
-                                &mut seq_tracker,
-                                &binder,
-                            ).await;
-                            info!("connection changes applied successfully");
-                            if require_bind_map && connections.is_empty() {
-                                // Forget index-scoped registration state so a later
-                                // re-add starts a fresh handshake, including probes.
-                                reg.reset_for_rehome();
-                            }
-                            sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
-                            // Bootstrap registration when a reload populated an
-                            // empty pool. `start_probing` self-guards (no-op once
-                            // probing has begun), so this only fires on the
-                            // empty-pool -> first-uplinks transition and never
-                            // disturbs an established bond's reload.
-                            if !connections.is_empty() {
-                                let probes = reg.start_probing(
-                                    &mut connections,
-                                    srtla_core::utils::now_ms(),
-                                );
-                                for (idx, pkt) in probes {
-                                    if let Some(conn) = connections.get(idx)
-                                        && let Some(io) = conn_io.get(&conn.conn_id)
-                                    {
-                                        let _ = io.send_control_padded(&pkt).await;
-                                    }
-                                }
-                            }
-                        }
-
                         status_elapsed_ms = status_elapsed_ms.saturating_add(HOUSEKEEPING_INTERVAL_MS);
                         if status_elapsed_ms >= STATUS_LOG_INTERVAL_MS {
                             log_connection_status(&connections, &conn_io, last_selected_idx, &config);
                             status_elapsed_ms = status_elapsed_ms.saturating_sub(STATUS_LOG_INTERVAL_MS);
                         }
 
-                        sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
+                        sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx).await;
                         let config_snap = config.snapshot();
                         drain_packet_queue(
                             &mut packet_rx,
@@ -564,11 +590,19 @@ pub async fn run_sender_with_config(
         }
         Some(read) = bind_map_rx.recv() => {
             let new_links = link_source.adopt(read);
-            shared_stats.set_bind_map(link_source.report().clone());
+            let report = link_source.report().clone();
             if new_links.is_empty() && !link_source.accepts_empty_reload() {
                 // Empty legacy/degraded reads cannot withdraw a running bond.
                 warn!("bind-map reload produced no usable uplinks; keeping current connections");
+                if pending_changes.is_some() { pending_bind_map_report = Some(report); }
+                else { shared_stats.set_bind_map(report); }
             } else {
+                if require_bind_map {
+                    let mut pending = report.clone();
+                    pending.disposition.state = crate::bind_map::BindMapDisposition::PendingApply.as_str();
+                    shared_stats.set_bind_map(pending);
+                }
+                pending_bind_map_report = Some(report);
                 pending_changes = Some(PendingConnectionChanges {
                     new_links: Some(new_links),
                     receiver_host: receiver_host.to_string(),

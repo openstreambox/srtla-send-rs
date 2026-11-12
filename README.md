@@ -515,3 +515,10 @@ Consumers needing explicit final-link withdrawal must also require
 `capabilities.bind_map_required_empty_reload == true`. In required mode a
 valid empty mapping removes all uplinks, reports fresh empty connections,
 and stays alive for re-add on SIGHUP (ADR-003 §9.3).
+
+
+Required sources must be assigned unicast addresses on the selected device;
+broadcast/multicast sources are refused, including mapped representations.
+During required reload application, `pending_apply` is not a withdrawal receipt.
+Empty `active` / `mapped` is published only after owned uplink sockets close.
+See ADR-003 §9.4.

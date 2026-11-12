@@ -23,9 +23,25 @@ use tracing::warn;
 /// The uplink identity stays keyed on `IpAddr` in both cases; only the act of
 /// steering the socket differs.
 pub trait UplinkBinder: Send + Sync {
+    /// Required mode must select the checked device binder.
+    fn requires_checked_device(&self) -> bool {
+        false
+    }
+
     /// Steer `sock` (already created with buffers set, no traffic yet) onto the
     /// egress identified by `ip`.
     fn bind(&self, sock: &Socket, ip: IpAddr) -> Result<()>;
+}
+
+/// Required-mode marker: an unmapped socket is always refused.
+pub struct RequiredBinding;
+impl UplinkBinder for RequiredBinding {
+    fn requires_checked_device(&self) -> bool {
+        true
+    }
+    fn bind(&self, _sock: &Socket, _ip: IpAddr) -> Result<()> {
+        anyhow::bail!("required binding needs a device");
+    }
 }
 
 /// Default binder. Binds the socket to the uplink source IP on an ephemeral
@@ -67,6 +83,11 @@ pub struct DeviceBinder {
 #[cfg(target_os = "linux")]
 impl DeviceBinder {
     #[must_use]
+    pub fn checked(ifname: impl Into<String>) -> CheckedDeviceBinder {
+        CheckedDeviceBinder(Self::new(ifname))
+    }
+
+    #[must_use]
     pub fn new(ifname: impl Into<String>) -> Self {
         Self {
             ifname: ifname.into(),
@@ -74,16 +95,66 @@ impl DeviceBinder {
     }
 }
 
+/// Required-mode device binder, preserving the default binder's public shape.
+#[cfg(target_os = "linux")]
+pub struct CheckedDeviceBinder(DeviceBinder);
+
 #[cfg(target_os = "linux")]
 impl UplinkBinder for DeviceBinder {
     fn bind(&self, sock: &Socket, ip: IpAddr) -> Result<()> {
+        self.bind_inner(sock, ip, false)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl UplinkBinder for CheckedDeviceBinder {
+    fn bind(&self, sock: &Socket, ip: IpAddr) -> Result<()> {
+        self.0.bind_inner(sock, ip, true)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl DeviceBinder {
+    fn bind_inner(&self, sock: &Socket, ip: IpAddr, checked: bool) -> Result<()> {
+        if checked {
+            super::source::require_assigned_source(ip, &self.ifname)?;
+        }
         // The socket2 method is `bind_device` (NOT `set_bind_device`); passing
         // `None` would clear the binding rather than set it.
         sock.bind_device(Some(self.ifname.as_bytes()))
             .with_context(|| format!("bind socket to device {}", self.ifname))?;
-        let addr = SocketAddr::new(ip, 0);
+        let mut addr = SocketAddr::new(ip, 0);
+        if checked
+            && let SocketAddr::V6(v6) = &mut addr
+            && v6.ip().is_unicast_link_local()
+        {
+            let name = std::ffi::CString::new(self.ifname.as_str())?;
+            // SAFETY: name is a valid terminated string.
+            let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+            anyhow::ensure!(index != 0, "device disappeared before bind");
+            v6.set_scope_id(index);
+        }
         sock.bind(&addr.into())
-            .with_context(|| format!("bind socket to {ip} on {}", self.ifname))
+            .with_context(|| format!("bind socket to {ip} on {}", self.ifname))?;
+        if checked {
+            let local = sock
+                .local_addr()?
+                .as_socket()
+                .context("local address is not IP")?;
+            anyhow::ensure!(
+                local.ip().to_canonical() == ip.to_canonical(),
+                "bound local address differs from mapped source"
+            );
+            if let (SocketAddr::V6(expected), SocketAddr::V6(actual)) = (addr, local)
+                && expected.ip().is_unicast_link_local()
+            {
+                anyhow::ensure!(
+                    expected.scope_id() == actual.scope_id(),
+                    "bound source scope differs"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

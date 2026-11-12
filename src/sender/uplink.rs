@@ -157,7 +157,7 @@ pub fn spawn_reader(
     ReaderHandle { handle }
 }
 
-pub fn sync_readers(
+pub async fn sync_readers(
     connections: &[SrtlaConnection],
     conn_io: &ConnIoMap,
     readers: &mut HashMap<ConnectionId, ReaderHandle>,
@@ -181,17 +181,20 @@ pub fn sync_readers(
         }
     }
 
-    readers.retain(|conn_id, reader| {
-        if active_ids.contains(conn_id) {
-            true
-        } else {
+    let removed: Vec<_> = readers
+        .keys()
+        .filter(|id| !active_ids.contains(id))
+        .copied()
+        .collect();
+    for id in removed {
+        if let Some(reader) = readers.remove(&id) {
             reader.handle.abort();
-            false
+            let _ = reader.handle.await;
         }
-    });
+    }
 }
 
-pub fn restart_reader_for(
+pub async fn restart_reader_for(
     conn: &SrtlaConnection,
     socket: Arc<BatchUdpSocket>,
     readers: &mut HashMap<ConnectionId, ReaderHandle>,
@@ -199,6 +202,7 @@ pub fn restart_reader_for(
 ) {
     if let Some(reader) = readers.remove(&conn.conn_id) {
         reader.handle.abort();
+        let _ = reader.handle.await;
     }
     readers.insert(
         conn.conn_id,
@@ -211,4 +215,28 @@ pub fn create_uplink_channel() -> (
     UnboundedReceiver<UplinkPacket>,
 ) {
     unbounded_channel::<UplinkPacket>()
+}
+
+#[cfg(test)]
+mod reader_retirement_tests {
+    use super::*;
+    #[tokio::test]
+    async fn removing_a_reader_joins_its_socket_owner_before_returning() {
+        use crate::net::{SourceIpBinder, UplinkBinder, create_uplink_socket};
+        let ip = "127.0.0.1".parse().unwrap();
+        let sock = create_uplink_socket(ip).unwrap();
+        SourceIpBinder.bind(&sock, ip).unwrap();
+        let socket = Arc::new(BatchUdpSocket::new(sock, "127.0.0.1:9".parse().unwrap()).unwrap());
+        let weak = Arc::downgrade(&socket);
+        let (tx, _rx) = create_uplink_channel();
+        let mut readers = HashMap::new();
+        readers.insert(1, spawn_reader(1, "path-a".into(), socket, tx.clone()));
+        tokio::task::yield_now().await;
+        sync_readers(&[], &HashMap::new(), &mut readers, &tx).await;
+        assert!(readers.is_empty());
+        assert!(
+            weak.upgrade().is_none(),
+            "cancelled reader still owns the socket"
+        );
+    }
 }

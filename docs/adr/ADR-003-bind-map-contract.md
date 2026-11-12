@@ -555,3 +555,31 @@ and retain the last valid pool, including an already-empty pool. Existing
 generation rules (§3) still apply: counters can restart; changing the SHA with
 the same generation is not by itself a rejection. Without required mode,
 empty reloads keep their existing refusal/retention behavior.
+
+
+### 9.4 Unicast sources and completed withdrawal receipts
+
+Required-mode sources are canonical unicast addresses: unspecified, limited
+broadcast and multicast addresses are rejected, including IPv4-mapped IPv6
+spellings. Directed IPv4 broadcasts are rejected using the selected device's
+current address/netmask where available; /31 and /32 have no directed broadcast.
+IPv6 has no broadcast; its multicast addresses are rejected.
+
+Dry-run and socket creation also require the source to be assigned to the
+selected device. Private addresses, loopback and link-local unicast are allowed
+when assigned there. IPv6 link-local binding sets the selected device's scope
+index explicitly. After binding, the socket's actual local IP must equal the
+canonical mapped source (and link-local scope must match). Any failure refuses
+the socket; it never substitutes an IP-only binder. Dry-run opens no sockets
+and cannot prove runtime permissions or future interface state. Existing
+non-required binders keep their behavior.
+
+A required-mode reload reports `disposition.state = pending_apply` until
+application completes. It is not a withdrawal acknowledgement, even when the
+previous connection snapshot was empty. Reader tasks holding old sockets are
+aborted AND joined before removal is acknowledged. Only after connection/I/O
+changes and reader teardown complete are the final report and connection
+snapshot published together under one lock. Fresh empty `active` / `mapped`
+therefore acknowledges that owned uplink sockets are closed. The local listener
+remains alive. Startup publishes its mapped report with its actual connection
+snapshot, avoiding an initial active/empty report while uplink sockets exist.

@@ -262,7 +262,18 @@ async fn main() -> Result<()> {
                     .await
                     .and_then(|pool| {
                         if args.require_bind_map {
-                            srtla_send::bind_map::validate_required_pool(pool)
+                            let pool = srtla_send::bind_map::validate_required_pool(pool)?;
+                            for (index, row) in pool.rows.iter().enumerate() {
+                                net::source::require_assigned_source(row.ip, row.iface.as_str())
+                                    .map_err(|err| {
+                                        srtla_send::bind_map::BindMapError::InvalidRow {
+                                            index,
+                                            field: "ip",
+                                            detail: err.to_string(),
+                                        }
+                                    })?;
+                            }
+                            Ok(pool)
                         } else {
                             Ok(pool)
                         }

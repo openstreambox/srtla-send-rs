@@ -16,6 +16,7 @@ pub mod batch_recv;
 pub mod egress;
 pub mod route;
 mod socket;
+pub mod source;
 mod spec;
 
 #[cfg(target_vendor = "apple")]
@@ -31,9 +32,10 @@ pub use route::{RouteHealth, RouteTransition, classify_route_transition, observe
 #[cfg(unix)]
 pub use socket::CallbackBinder;
 #[cfg(target_os = "linux")]
-pub use socket::DeviceBinder;
+pub use socket::{CheckedDeviceBinder, DeviceBinder};
 pub use socket::{
-    SourceIpBinder, UplinkBinder, create_uplink_socket, resolve_remote, resolve_remote_all,
+    RequiredBinding, SourceIpBinder, UplinkBinder, create_uplink_socket, resolve_remote,
+    resolve_remote_all,
 };
 pub use spec::{SocketKey, UplinkSpec};
 use srtla_core::connection::BATCH_SEND_SIZE;

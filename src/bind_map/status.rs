@@ -99,6 +99,8 @@ pub enum BindMapDisposition {
     StartupCollisionExcluded,
     /// Required binding has no valid mapping; no uplinks run.
     RequiredBindingRefused,
+    /// A validated required-mode reload is awaiting socket/reader application.
+    PendingApply,
 }
 
 impl BindMapDisposition {
@@ -106,6 +108,7 @@ impl BindMapDisposition {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::RequiredBindingRefused => "required_binding_refused",
+            Self::PendingApply => "pending_apply",
             Self::Mapped => "mapped",
             Self::RetainedLastValid => "retained_last_valid",
             Self::LegacyUniqueOnly => "legacy_unique_only",

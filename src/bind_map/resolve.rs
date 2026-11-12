@@ -102,17 +102,14 @@ pub fn resolve(
 
 /// Validate the concrete-source contract shared by runtime and dry-run.
 pub fn validate_required_pool(pool: MappedPool) -> Result<MappedPool, BindMapError> {
-    // Linux treats IPv4-mapped 0.0.0.0 as a wildcard too.
-    if let Some(index) = pool
-        .rows
-        .iter()
-        .position(|row| row.ip.to_canonical().is_unspecified())
-    {
-        return Err(BindMapError::InvalidRow {
-            index,
-            field: "ip",
-            detail: "required binding needs a concrete source address".into(),
-        });
+    for (index, row) in pool.rows.iter().enumerate() {
+        crate::net::source::validate_source(row.ip, row.iface.as_str()).map_err(|err| {
+            BindMapError::InvalidRow {
+                index,
+                field: "ip",
+                detail: format!("required binding needs a concrete source address: {err}"),
+            }
+        })?;
     }
     Ok(pool)
 }

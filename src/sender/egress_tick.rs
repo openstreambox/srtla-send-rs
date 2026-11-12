@@ -76,7 +76,7 @@ pub async fn handle_egress(
         warn!("{label}: failed to rebind after an egress fault: {e}");
         recover_connection(conn, seq_tracker);
     } else {
-        restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx);
+        restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx).await;
     }
     TickFlow::Skip
 }

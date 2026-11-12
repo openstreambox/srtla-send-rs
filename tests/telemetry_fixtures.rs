@@ -369,3 +369,13 @@ fn required_binding_refusal_publishes_fresh_empty_connections() {
     assert_eq!(doc["connections"], serde_json::json!([]));
     assert_eq!(doc["disposition"]["state"], "required_binding_refused");
 }
+
+#[test]
+fn pending_apply_is_not_an_empty_withdrawal_acknowledgement() {
+    let report = BindMapReport::new(BindMapStatus::Active, BindMapDisposition::PendingApply, &[]);
+    let produced = document(&[], &report);
+    assert_fixture("telemetry-pending-apply", &produced);
+    let doc = value(&produced);
+    assert_eq!(doc["disposition"]["state"], "pending_apply");
+    assert_ne!(doc["disposition"]["state"], "mapped");
+}

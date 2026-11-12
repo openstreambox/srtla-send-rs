@@ -318,6 +318,7 @@ fn required_mapping_can_withdraw_every_link_and_readd_after_degraded_reads() {
                 && v["last_updated_ms"].as_u64().unwrap() > after
                 && v["connections"].as_array().unwrap().len() == count
                 && v["bind_map_status"]["state"] == state
+                && v["disposition"]["state"] != "pending_apply"
                 && reason.is_none_or(|r| v["bind_map_status"]["reason"] == r)
             {
                 assert_eq!(
@@ -398,4 +399,201 @@ fn required_mapping_can_withdraw_every_link_and_readd_after_degraded_reads() {
         .expect("fresh registration probe after re-add");
     proc.signal("TERM");
     assert_eq!(proc.wait_exit(KILL_WINDOW), Some(0));
+}
+
+#[cfg(target_os = "linux")]
+fn owned_udp_ports(pid: u32) -> Vec<u16> {
+    let inodes: std::collections::HashSet<_> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter_map(|p| {
+            p.to_str()?
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')
+                .map(str::to_owned)
+        })
+        .collect();
+    ["udp", "udp6"]
+        .iter()
+        .flat_map(|name| {
+            std::fs::read_to_string(format!("/proc/{pid}/net/{name}"))
+                .unwrap()
+                .lines()
+                .skip(1)
+                .filter_map(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    if !inodes.contains(fields[9]) {
+                        return None;
+                    }
+                    u16::from_str_radix(fields[1].split(':').nth(1).unwrap(), 16).ok()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn empty_acknowledgement_follows_socket_closure_on_startup_and_rapid_readd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use srtla_send::bind_map::IpsFile;
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("map");
+    let stats = dir.path().join("stats");
+    let publish = |ip: &str, generation: u64| {
+        let content = if ip.is_empty() {
+            String::new()
+        } else {
+            format!("{ip}\n")
+        };
+        let links = if ip.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{"link_id":"path-a","ip":ip,"iface":"lo"}])
+        };
+        let doc = serde_json::json!({"schema_version":1,"generation":generation,
+            "ips_file_sha256":IpsFile::from_bytes(content.as_bytes()).unwrap().sha256(), "links":links});
+        for (path, content) in [(&ips, content), (&map, doc.to_string())] {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, content).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(tmp, path).unwrap();
+        }
+    };
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let listen_port = free_udp_port();
+    publish("127.0.0.1", 1);
+    let mut proc = SenderProc::spawn(&[
+        &listen_port.to_string(),
+        "127.0.0.1",
+        &receiver.local_addr().unwrap().port().to_string(),
+        ips.to_str().unwrap(),
+        "--require-bind-map",
+        "--bind-map",
+        map.to_str().unwrap(),
+        "--stats-file",
+        stats.to_str().unwrap(),
+        "--stats-file-interval",
+        "10",
+    ]);
+    let mut packet = [0; 2048];
+    receiver.recv(&mut packet).unwrap();
+    assert!(proc.wait_for_log("sender ready for reload signals", START_TIMEOUT));
+    // Wait for the first publication before the initial withdrawal.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !stats.exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(2));
+    }
+    for cycle in 0..5 {
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        publish("", 2 + cycle * 2);
+        proc.signal("HUP");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(bytes) = std::fs::read(&stats)
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && v["last_updated_ms"].as_u64().unwrap() > after
+                && v["connections"].as_array().unwrap().is_empty()
+                && v["bind_map_status"]["state"] == "active"
+                && v["disposition"]["state"] == "mapped"
+            {
+                assert_eq!(
+                    owned_udp_ports(proc.child.id()),
+                    vec![listen_port],
+                    "withdrawal acknowledged while uplink sockets remain, cycle {cycle}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no withdrawal acknowledgement: {}",
+                proc.logs()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        receiver.set_nonblocking(true).unwrap();
+        while receiver.recv(&mut packet).is_ok() {}
+        receiver.set_nonblocking(false).unwrap();
+        publish("127.0.0.1", 3 + cycle * 2);
+        proc.signal("HUP");
+        receiver
+            .recv(&mut packet)
+            .expect("re-add must send a new probe");
+        // Immediately withdraw: do not wait for a nonempty stats snapshot.
+    }
+    proc.signal("TERM");
+    assert_eq!(proc.wait_exit(KILL_WINDOW), Some(0));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn required_non_unicast_sources_never_emit_probes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use srtla_send::bind_map::IpsFile;
+    for source in [
+        "255.255.255.255",
+        "224.0.0.1",
+        "239.1.2.3",
+        "ff02::1",
+        "::ffff:255.255.255.255",
+        "::ffff:224.0.0.1",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ips = dir.path().join("ips");
+        let map = dir.path().join("map");
+        let stats = dir.path().join("stats");
+        let content = format!("{source}\n");
+        std::fs::write(&ips, &content).unwrap();
+        std::fs::write(
+            &map,
+            serde_json::json!({"schema_version":1,"generation":1,
+            "ips_file_sha256":IpsFile::from_bytes(content.as_bytes()).unwrap().sha256(),
+            "links":[{"link_id":"path-a","ip":source,"iface":"lo"}]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        let mut proc = SenderProc::spawn(&[
+            &free_udp_port().to_string(),
+            "127.0.0.1",
+            &receiver.local_addr().unwrap().port().to_string(),
+            ips.to_str().unwrap(),
+            "--require-bind-map",
+            "--bind-map",
+            map.to_str().unwrap(),
+            "--stats-file",
+            stats.to_str().unwrap(),
+            "--stats-file-interval",
+            "10",
+        ]);
+        assert!(
+            proc.wait_for_log("required_binding_refused", START_TIMEOUT),
+            "{source}: {}",
+            proc.logs()
+        );
+        let mut packet = [0; 2048];
+        assert!(
+            receiver.recv(&mut packet).is_err(),
+            "{source} emitted a probe"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&stats).unwrap()).unwrap();
+        assert!(v["connections"].as_array().unwrap().is_empty());
+        assert_eq!(v["disposition"]["state"], "required_binding_refused");
+        proc.signal("TERM");
+        assert_eq!(proc.wait_exit(KILL_WINDOW), Some(0));
+    }
 }

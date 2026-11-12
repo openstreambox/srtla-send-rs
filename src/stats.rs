@@ -396,11 +396,6 @@ impl SessionBytes {
 pub struct SharedStats {
     inner: Arc<RwLock<StatsSnapshot>>,
     session_bytes: Arc<Mutex<SessionBytes>>,
-    /// The ADR-003 operating mode, on its OWN lock. `update` rebuilds the whole
-    /// snapshot every housekeeping tick while this changes only on a reload, so
-    /// keeping it here means a reload cannot be overwritten by the next tick and
-    /// a tick never has to know about the bind-map.
-    bind_map: Arc<RwLock<crate::bind_map::BindMapReport>>,
 }
 
 impl SharedStats {
@@ -408,17 +403,16 @@ impl SharedStats {
         Self {
             inner: Arc::new(RwLock::new(StatsSnapshot::default())),
             session_bytes: Arc::new(Mutex::new(SessionBytes::default())),
-            bind_map: Arc::new(RwLock::new(crate::bind_map::BindMapReport::default())),
         }
     }
 
     /// Record the sender's current ADR-003 operating mode.
     ///
-    /// Called once at startup and once per reload — never from the housekeeping
-    /// tick, which is exactly why it has its own lock.
+    /// Use only when the connection set is unchanged (a refused reload).
+    /// Applied changes use `update_with_bind_map` after socket teardown.
     pub fn set_bind_map(&self, report: crate::bind_map::BindMapReport) {
-        if let Ok(mut guard) = self.bind_map.write() {
-            *guard = report;
+        if let Ok(mut guard) = self.inner.write() {
+            guard.bind_map = report;
         }
     }
 
@@ -435,6 +429,27 @@ impl SharedStats {
         classification: Option<&ClassificationResult>,
         link_cc: Option<&HashMap<u64, LinkCcSnapshot>>,
         identities: Option<&HashMap<u64, LinkIdentity>>,
+    ) {
+        self.update_with_bind_map(
+            connections,
+            config,
+            classification,
+            link_cc,
+            identities,
+            None,
+        );
+    }
+
+    /// Publish connection state and an applied bind-map report under one lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_bind_map(
+        &self,
+        connections: &[SrtlaConnection],
+        config: &ConfigSnapshot,
+        classification: Option<&ClassificationResult>,
+        link_cc: Option<&HashMap<u64, LinkCcSnapshot>>,
+        identities: Option<&HashMap<u64, LinkIdentity>>,
+        report: Option<&crate::bind_map::BindMapReport>,
     ) {
         let current_time_ms = now_ms();
         let quality_enabled = config.quality_enabled && !config.mode.is_classic();
@@ -575,22 +590,17 @@ impl SharedStats {
         }
 
         if let Ok(mut guard) = self.inner.write() {
+            snapshot.bind_map = report.cloned().unwrap_or_else(|| guard.bind_map.clone());
             *guard = snapshot;
         }
     }
 
-    /// Get current stats snapshot, with the ADR-003 operating mode composed in
-    /// from its own lock.
+    /// Read one coherent connection/report snapshot.
     pub fn get(&self) -> StatsSnapshot {
-        let mut snapshot = self
-            .inner
+        self.inner
             .read()
             .map(|guard| guard.clone())
-            .unwrap_or_default();
-        if let Ok(guard) = self.bind_map.read() {
-            snapshot.bind_map = guard.clone();
-        }
-        snapshot
+            .unwrap_or_default()
     }
 
     /// Serialize to JSON.

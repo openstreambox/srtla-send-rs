@@ -330,7 +330,9 @@ async fn rehome_bond(
     for conn in connections.iter_mut() {
         match conn_io.get_mut(&conn.conn_id) {
             Some(io) => match rebuild_uplink_socket(conn, io, seq_tracker, now) {
-                Ok(()) => restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx),
+                Ok(()) => {
+                    restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx).await
+                }
                 Err(e) => {
                     warn!(
                         "{}: failed to rebuild socket for re-home ({e}); leaving it to the \
