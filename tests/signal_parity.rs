@@ -575,8 +575,9 @@ fn required_non_unicast_sources_never_emit_probes() {
         receiver
             .set_read_timeout(Some(Duration::from_millis(150)))
             .unwrap();
+        let listener = free_udp_port();
         let mut proc = SenderProc::spawn(&[
-            &free_udp_port().to_string(),
+            &listener.to_string(),
             "127.0.0.1",
             &receiver.local_addr().unwrap().port().to_string(),
             ips.to_str().unwrap(),
@@ -593,14 +594,30 @@ fn required_non_unicast_sources_never_emit_probes() {
             "{source}: {}",
             proc.logs()
         );
+        // The log and asynchronous stats-file writer are different clocks.
+        // Do not mistake the initial default snapshot for the refusal report.
+        let deadline = Instant::now() + START_TIMEOUT;
+        let v = loop {
+            if let Ok(bytes) = std::fs::read(&stats)
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && v["disposition"]["state"] == "required_binding_refused"
+            {
+                break v;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{source}: refusal not published: {}",
+                proc.logs()
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert!(v["connections"].as_array().unwrap().is_empty());
+        assert_eq!(owned_udp_ports(proc.child.id()), vec![listener]);
         let mut packet = [0; 2048];
         assert!(
             receiver.recv(&mut packet).is_err(),
             "{source} emitted a probe"
         );
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&stats).unwrap()).unwrap();
-        assert!(v["connections"].as_array().unwrap().is_empty());
-        assert_eq!(v["disposition"]["state"], "required_binding_refused");
         proc.signal("TERM");
         assert_eq!(proc.wait_exit(KILL_WINDOW), Some(0));
     }
