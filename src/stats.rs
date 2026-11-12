@@ -416,6 +416,14 @@ impl SharedStats {
         }
     }
 
+    /// Bank the old pool's final deltas before teardown, without publishing.
+    pub fn observe_connection_bytes(&self, connections: &[SrtlaConnection]) {
+        self.session_bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observe(connections);
+    }
+
     /// Update stats from current connection state.
     ///
     /// `classification` carries the weak-link classifier's per-tick output.
@@ -735,5 +743,51 @@ mod tests {
         };
         stats.update(&[], &config, None, None, None);
         assert_eq!(stats.get().session_bytes_sent, 0);
+    }
+}
+
+#[cfg(test)]
+mod departing_bytes_tests {
+    use super::*;
+    #[test]
+    fn final_queued_bytes_survive_removal_and_replacement_without_early_publication() {
+        for replace in [false, true] {
+            let stats = SharedStats::new();
+            let config = ConfigSnapshot::default();
+            let mut old =
+                SrtlaConnection::new_registering(1, "old".into(), "127.0.0.1".parse().unwrap(), 0);
+            old.queue_data_packet(&[0; 100], Some(1), 0);
+            stats.update(std::slice::from_ref(&old), &config, None, None, None);
+            assert_eq!(stats.get().session_bytes_sent, 100);
+            old.queue_data_packet(&[0; 37], Some(2), 1);
+            stats.observe_connection_bytes(std::slice::from_ref(&old));
+            assert_eq!(
+                stats.get().session_bytes_sent,
+                100,
+                "banking must not publish an intermediate snapshot"
+            );
+            let mut next = Vec::new();
+            if replace {
+                let mut new = SrtlaConnection::new_registering(
+                    2,
+                    "new".into(),
+                    "127.0.0.1".parse().unwrap(),
+                    1,
+                );
+                new.queue_data_packet(&[0; 11], Some(3), 1);
+                next.push(new);
+            }
+            stats.update(&next, &config, None, None, None);
+            assert_eq!(
+                stats.get().session_bytes_sent,
+                if replace { 148 } else { 137 }
+            );
+            stats.update(&next, &config, None, None, None);
+            assert_eq!(
+                stats.get().session_bytes_sent,
+                if replace { 148 } else { 137 },
+                "do not double count"
+            );
+        }
     }
 }

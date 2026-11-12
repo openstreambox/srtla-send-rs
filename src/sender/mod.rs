@@ -411,6 +411,7 @@ pub async fn run_sender_with_config(
                         if let Some(changes) = pending_changes.take()
                             && let Some(new_links) = changes.new_links
                         {
+                            shared_stats.observe_connection_bytes(&connections);
                             info!("applying queued connection changes: {} uplinks", new_links.len());
                             if require_bind_map {
                                 // Abort AND join: abort alone leaves reader-owned socket

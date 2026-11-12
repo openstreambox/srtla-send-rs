@@ -343,3 +343,108 @@ fn bond_bytes_sent_total_is_monotonic_across_a_sighup_link_removal() {
         "the mini receiver never saw forwarded data; the bond was not actually carrying"
     );
 }
+
+#[test]
+fn unpublished_tail_bytes_are_preserved_on_required_withdrawal_and_default_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use srtla_send::bind_map::IpsFile;
+    for required in [false, true] {
+        let receiver = MiniReceiver::start();
+        let dir = tempfile::tempdir().unwrap();
+        let ips = dir.path().join("ips");
+        let map = dir.path().join("map");
+        let stats = dir.path().join("stats");
+        let publish = |content: &str, generation: u64| {
+            let links = if content.is_empty() {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([{"link_id":"path-a","ip":"127.0.0.1","iface":"lo"}])
+            };
+            for (path, data) in [
+                (&ips, content.to_owned()),
+                (
+                    &map,
+                    serde_json::json!({"schema_version":1,"generation":generation,
+                    "ips_file_sha256":IpsFile::from_bytes(content.as_bytes()).unwrap().sha256(),
+                    "links":links})
+                    .to_string(),
+                ),
+            ] {
+                let tmp = path.with_extension("tmp");
+                std::fs::write(&tmp, data).unwrap();
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::rename(tmp, path).unwrap();
+            }
+        };
+        publish("127.0.0.1\n", 1);
+        let port = free_udp_port();
+        let mut cmd = Command::new(BIN);
+        cmd.args([
+            &port.to_string(),
+            "127.0.0.1",
+            &receiver.port.to_string(),
+            ips.to_str().unwrap(),
+            "--stats-file",
+            stats.to_str().unwrap(),
+            "--stats-file-interval",
+            "10",
+        ]);
+        if required {
+            cmd.args(["--require-bind-map", "--bind-map", map.to_str().unwrap()]);
+        }
+        let sender = Sender {
+            child: cmd
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        };
+        wait_for(READY_TIMEOUT, || {
+            let snap = read_stats(&stats)?;
+            all_links_active(&snap).then_some(())
+        })
+        .expect("initial link registered");
+        inject(port, 10_000, 10);
+        wait_for(SNAPSHOT_TIMEOUT, || {
+            let snap = read_stats(&stats)?;
+            (bond_total(&snap) > 0).then_some(())
+        })
+        .expect("initial byte snapshot");
+        // Real traffic reaches the receiver after the last published accounting
+        // tick, then the entire old pool leaves before the next one.
+        let before = receiver.data_packets.load(Ordering::Relaxed);
+        inject(port, 20_000, 10);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while receiver.data_packets.load(Ordering::Relaxed) < before + 10 {
+            assert!(Instant::now() < deadline, "tail packets were not forwarded");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let floor = receiver.data_packets.load(Ordering::Relaxed) * PAYLOAD_LEN as u64;
+        assert!(
+            bond_total(&read_stats(&stats).unwrap()) < floor,
+            "precondition: tail traffic must be newer than the published accounting snapshot"
+        );
+        if required {
+            publish("", 2);
+        } else {
+            std::fs::write(&ips, "127.0.0.2\n").unwrap();
+        }
+        sender.sighup();
+        let final_snapshot = wait_for(SNAPSHOT_TIMEOUT, || {
+            let snap = read_stats(&stats)?;
+            let links = snap["connections"].as_array()?;
+            let applied = if required {
+                links.is_empty() && snap["disposition"]["state"] == "mapped"
+            } else {
+                links.len() == 1 && link_totals(&snap)[0] == 0
+            };
+            applied.then_some(snap)
+        })
+        .expect("old pool removed/replaced");
+        assert!(
+            bond_total(&final_snapshot) >= floor,
+            "late bytes lost: required={required}, wire floor={floor}, snapshot={final_snapshot}"
+        );
+    }
+}
