@@ -28,7 +28,7 @@ pub use connections::{
 // Re-export public items used by tests
 #[allow(unused_imports)]
 pub use housekeeping::GLOBAL_TIMEOUT_MS;
-use housekeeping::handle_housekeeping;
+use housekeeping::{handle_housekeeping, retire_unverified_sources};
 // ADR-003: where the uplink set comes from (legacy ips file, or the bind-map
 // pair read).
 #[allow(unused_imports)]
@@ -73,6 +73,8 @@ use crate::config::DynamicConfig;
 use crate::stats::SharedStats;
 
 pub const HOUSEKEEPING_INTERVAL_MS: u64 = 1000;
+/// How often required mode re-checks live links' sources between ticks.
+pub const SOURCE_CHECK_INTERVAL_MS: u64 = 200;
 const STATUS_LOG_INTERVAL_MS: u64 = 30_000;
 
 /// Cleanup callbacks run exactly once when the sender returns.
@@ -312,6 +314,18 @@ pub async fn run_sender_with_config(
         Duration::from_millis(BATCH_FLUSH_INTERVAL_MS),
     );
     batch_flush_timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+    // Required mode only: re-check every live link's source between ticks, so
+    // a moved address stops being used within this interval, not a full tick.
+    let mut source_check_timer = time::interval_at(
+        Instant::now() + Duration::from_millis(SOURCE_CHECK_INTERVAL_MS),
+        Duration::from_millis(SOURCE_CHECK_INTERVAL_MS),
+    );
+    source_check_timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    // The last tick's classifier and CC output, so a retirement between ticks
+    // publishes a complete snapshot rather than blanking those fields.
+    let mut last_classification = None;
+    let mut last_link_cc = None;
 
     let mut status_elapsed_ms: u64 = 0;
     let mut last_client_addr: Option<SocketAddr> = None;
@@ -559,6 +573,8 @@ pub async fn run_sender_with_config(
                             applied_bind_map_report.as_ref(),
                             applied_bind_map_request,
                         );
+                        last_classification = Some(classification);
+                        last_link_cc = Some(link_cc_snapshots);
 
                         // Fan the fresh snapshot out to any `stats` subscribers
                         // on the async control socket. Cheap no-op if no one
@@ -592,6 +608,24 @@ pub async fn run_sender_with_config(
                         .await;
                     }
                     $($sighup_branch)*
+                    _ = source_check_timer.tick(), if require_bind_map => {
+                        if retire_unverified_sources(
+                            &mut connections,
+                            &mut conn_io,
+                            &mut reader_handles,
+                            &mut seq_tracker,
+                        ).await {
+                            shared_stats.update_for_reload(
+                                &connections,
+                                &config.snapshot(),
+                                last_classification.as_ref(),
+                                last_link_cc.as_ref(),
+                                Some(&link_identities(&connections, &conn_io)),
+                                None,
+                                None,
+                            );
+                        }
+                    }
                     _ = batch_flush_timer.tick() => {
                         flush_all_batches(&mut connections, &mut conn_io, &mut seq_tracker).await;
                     }

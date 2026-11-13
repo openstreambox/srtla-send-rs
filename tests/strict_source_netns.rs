@@ -35,6 +35,20 @@ const RECEIVER_PORT: u16 = 5000;
 const NOTICED_WITHIN: Duration = Duration::from_secs(3);
 /// The slow reconnect backoff (5 s), one tick, registration, and slack.
 const RETURNS_WITHIN: Duration = Duration::from_secs(12);
+/// A required link is checked against its device every 200 ms, so it must be
+/// retired well inside one 1 s housekeeping tick (telemetry interval and
+/// polling included).
+const RETIRED_WITHIN: Duration = Duration::from_millis(650);
+/// Distinct namespace names within one test process.
+static TOPOLOGIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The scenarios measure timing on shared CPU; run them one at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn ip(args: &[&str]) -> bool {
     Command::new("ip")
@@ -50,7 +64,8 @@ fn ip_checked(args: &[&str]) {
 
 /// Root, and allowed to create a network namespace.
 fn can_build_namespaces() -> bool {
-    let probe = format!("srtla-probe-{}", std::process::id());
+    let n = TOPOLOGIES.fetch_add(1, Ordering::SeqCst);
+    let probe = format!("srtla-probe-{}-{n}", std::process::id());
     // SAFETY: `geteuid` takes no arguments and cannot fail.
     let root = unsafe { libc::geteuid() } == 0;
     let ok = root && ip(&["netns", "add", &probe]);
@@ -71,9 +86,10 @@ struct Topology {
 impl Topology {
     fn build() -> Self {
         let pid = std::process::id();
+        let n = TOPOLOGIES.fetch_add(1, Ordering::SeqCst);
         let topology = Self {
-            sender: format!("srtla-tx-{pid}"),
-            receiver: format!("srtla-rx-{pid}"),
+            sender: format!("srtla-tx-{pid}-{n}"),
+            receiver: format!("srtla-rx-{pid}-{n}"),
         };
         for ns in [&topology.sender, &topology.receiver] {
             ip_checked(&["netns", "add", ns]);
@@ -388,6 +404,10 @@ fn assert_retired_and_silent(
         NOTICED_WITHIN,
         |sender| sender.is_retired("a"),
     );
+    assert!(
+        noticed <= RETIRED_WITHIN,
+        "{case}: retired after {noticed:?}, not within {RETIRED_WITHIN:?}"
+    );
     let retired_at = Instant::now();
     let row = sender.row("a").unwrap();
     assert_eq!(row["iface"], "v0", "{case}: identity lost: {row}");
@@ -425,6 +445,7 @@ fn assert_returns(receiver: &Receiver, sender: &Sender, case: &str) {
 
 #[test]
 fn a_required_link_goes_down_with_its_source_and_returns_with_it() {
+    let _serial = serial();
     if !can_build_namespaces() {
         eprintln!("Skipping: needs root and iproute2 to build network namespaces");
         return;
@@ -477,6 +498,22 @@ fn a_required_link_goes_down_with_its_source_and_returns_with_it() {
     topology.plug(0);
     assert_returns(&receiver, &sender, "replug");
 
+    // Short blips, each caught well inside one housekeeping tick.
+    for blip in 0..4 {
+        let case = format!("short blip {blip}");
+        thread::sleep(Duration::from_millis(300 + 170 * blip));
+        topology.unassign(0, "v0");
+        assert_retired_and_silent(
+            &topology,
+            &receiver,
+            &sender,
+            &case,
+            Duration::from_millis(400),
+        );
+        topology.assign(0, "v0");
+        assert_returns(&receiver, &sender, &case);
+    }
+
     let logs = sender.logs();
     assert!(
         !logs.contains("received SIGHUP"),
@@ -485,6 +522,12 @@ fn a_required_link_goes_down_with_its_source_and_returns_with_it() {
     assert!(
         !logs.contains("has no I/O entry"),
         "a retired link must not be reported as a broken one:\n{logs}"
+    );
+    // A returning link is bound against the device as it is now, so the next
+    // egress check has nothing stale to rebind.
+    assert!(
+        !logs.contains("re-enumerated"),
+        "a returned link kept the old interface index:\n{logs}"
     );
     assert!(
         matches!(sender.child.try_wait(), Ok(None)),

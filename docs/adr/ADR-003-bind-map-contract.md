@@ -614,12 +614,15 @@ and cannot prove runtime permissions or future interface state. Existing
 non-required binders keep their behavior. Required sends use a canonical IPv4
 sockaddr for an IPv4-mapped receiver address, at initial creation and socket
 rebuild; the original receiver identity is retained for DNS/re-home checks.
-Native IPv6 receiver addresses retain their scope. Housekeeping checks source
-assignment before sending, against one reading of the host's addresses per
-tick. A lost assignment or failed checked socket rebuild retires the link: its
-socket is closed and its reader joined, so nothing is sent from it. A reading
-that fails proves nothing and retires the link the same way; the log names the
-inspection, not the address.
+Native IPv6 receiver addresses retain their scope. Source assignment is
+checked every 200 ms between housekeeping ticks and again before each tick
+sends, each time against one reading of the host's addresses. A socket bound
+before its address moved can therefore send for at most that interval; those
+datagrams still leave through the mapped device (`SO_BINDTODEVICE`), only their
+source address is stale. A lost assignment or a failed checked socket
+rebuild retires the link: it holds no socket and no reader, so
+nothing is sent from it. A reading that fails proves nothing and retires the
+link the same way; the log names the inspection, not the address.
 
 A retired link stays in the pool under its mapped identity. Its telemetry row
 keeps `link_id` and `iface`, reports `weight_percent` 0 and carries the

@@ -10,7 +10,9 @@ use super::connections::{reconnect_uplink, recover_connection, revive_uplink};
 use super::egress_tick;
 use super::rehome::{RehomeGate, try_rehome};
 use super::sequence::SequenceTracker;
-use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for};
+use super::uplink::{
+    ConnIo, ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for,
+};
 use crate::net::source::HostAddrs;
 
 pub const GLOBAL_TIMEOUT_MS: u64 = 10_000;
@@ -88,20 +90,9 @@ pub async fn handle_housekeeping(
         // Source assignment can change without an ifindex change. Required
         // links must stop using the old socket before this tick sends anything.
         if let Some(io) = conn_io.get(&conn.conn_id)
-            && io.binder.requires_checked_device()
-            && let Err(e) = io.spec.iface.as_ref().map_or_else(
-                || Err(anyhow!("required link has no mapped device")),
-                |iface| {
-                    host_addrs
-                        .get_or_insert_with(HostAddrs::read)
-                        .require_assigned(conn.local_ip, iface.as_str())
-                },
-            )
+            && let Some(e) = unverified_source(conn, io, &mut host_addrs)
         {
-            warn!(
-                "{}: {e}; link retired, retrying until its source is verified on its device",
-                conn.label
-            );
+            log_retired_for(conn, &e);
             super::uplink::retire_uplink(conn, conn_io, reader_handles, seq_tracker).await;
             continue;
         }
@@ -319,6 +310,65 @@ pub async fn handle_housekeeping(
     // Old entries are naturally overwritten when the buffer wraps around.
 
     Ok(())
+}
+
+/// Why a live link may not keep its socket: only a required link whose source
+/// is not verified on its mapped device in this reading of the host.
+fn unverified_source(
+    conn: &SrtlaConnection,
+    io: &ConnIo,
+    addrs: &mut Option<HostAddrs>,
+) -> Option<anyhow::Error> {
+    if !io.binder.requires_checked_device() {
+        return None;
+    }
+    io.spec
+        .iface
+        .as_ref()
+        .map_or_else(
+            || Err(anyhow!("required link has no mapped device")),
+            |iface| {
+                addrs
+                    .get_or_insert_with(HostAddrs::read)
+                    .require_assigned(conn.local_ip, iface.as_str())
+            },
+        )
+        .err()
+}
+
+fn log_retired_for(conn: &SrtlaConnection, e: &anyhow::Error) {
+    warn!(
+        "{}: {e}; link retired, retrying until its source is verified on its device",
+        conn.label
+    );
+}
+
+/// Required-mode check between housekeeping ticks.
+///
+/// Source assignment can change at any moment, and a socket bound before the
+/// change keeps sending with the old source until something notices. This runs
+/// on a short interval so that is a fraction of a tick: every live required
+/// link is checked against one reading of the host's addresses, and the ones
+/// that fail are retired exactly as housekeeping would. Returns whether any
+/// link was retired. Takes no reading when no live link is required.
+pub async fn retire_unverified_sources(
+    connections: &mut [SrtlaConnection],
+    conn_io: &mut ConnIoMap,
+    reader_handles: &mut HashMap<ConnectionId, ReaderHandle>,
+    seq_tracker: &mut SequenceTracker,
+) -> bool {
+    let mut addrs = None;
+    let mut retired = false;
+    for conn in connections.iter_mut() {
+        if let Some(io) = conn_io.get(&conn.conn_id)
+            && let Some(e) = unverified_source(conn, io, &mut addrs)
+        {
+            log_retired_for(conn, &e);
+            super::uplink::retire_uplink(conn, conn_io, reader_handles, seq_tracker).await;
+            retired = true;
+        }
+    }
+    retired
 }
 
 /// Put a link that just got a new socket back in front of the receiver: REG1
@@ -754,6 +804,17 @@ mod tests {
             "link did not return within the slow backoff: {returned_after:?}"
         );
         assert!(!f.conn_io.is_retired(id));
+        // It starts over like any rebuilt link: fresh protocol state and a new
+        // registration grace window from the moment it came back.
+        let back_at = t0 + (5 + returned_after.unwrap()) * 1000;
+        assert_eq!(
+            f.connections[0].reconnection.startup_grace_deadline_ms,
+            back_at + STARTUP_GRACE_MS
+        );
+        assert_eq!(
+            f.connections[0].reconnection.last_reconnect_attempt_ms,
+            back_at
+        );
         let io = f.conn_io.get(&id).unwrap();
         assert_eq!(io.spec.link_id.as_ref().unwrap().as_str(), "path-a");
         assert_eq!(io.spec.iface.as_ref().unwrap().as_str(), "lo");
@@ -802,6 +863,44 @@ mod tests {
         assert!(!f.reader_handles.contains_key(&id));
         assert!(socket.upgrade().is_none(), "faulted socket still open");
         assert!(!f.connections[0].connected);
+    }
+
+    /// Between ticks only required links are checked, and only failing ones
+    /// are retired; a default link is never touched.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_between_ticks_check_retires_only_unverified_required_links() {
+        let (mut f, id, assigned) = required_link(remote(1), true).await;
+        f.connections.push(create_test_connection().await);
+        let default = f.connections[1].conn_id;
+        f.conn_io
+            .insert(default, crate::test_helpers::create_test_conn_io());
+        async fn check(f: &mut RehomeFixture) -> bool {
+            retire_unverified_sources(
+                &mut f.connections,
+                &mut f.conn_io,
+                &mut f.reader_handles,
+                &mut f.seq_tracker,
+            )
+            .await
+        }
+        // `lo` holds 127.0.0.1, so the required link verifies and is kept.
+        assert!(!check(&mut f).await);
+        assert!(f.conn_io.contains_key(&id));
+        // Its device now names one that does not exist.
+        f.conn_io.get_mut(&id).unwrap().spec.iface =
+            Some(crate::bind_map::IfaceName::parse("missing0").unwrap());
+        let socket = std::sync::Arc::downgrade(&f.conn_io.get(&id).unwrap().socket);
+        assert!(check(&mut f).await);
+        assert!(f.conn_io.is_retired(id));
+        assert!(!f.reader_handles.contains_key(&id));
+        assert!(socket.upgrade().is_none(), "retired socket still open");
+        assert!(
+            f.conn_io.contains_key(&default),
+            "a default link was retired"
+        );
+        assert!(!check(&mut f).await, "nothing left to retire");
+        drop(assigned);
     }
 
     fn remote(last: u8) -> SocketAddr {

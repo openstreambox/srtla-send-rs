@@ -533,8 +533,8 @@ Required sources must be assigned unicast addresses on the selected device;
 broadcast/multicast sources are refused, including mapped representations.
 During required reload application, `pending_apply` is not a withdrawal receipt.
 Empty `active` / `mapped` is published only after owned uplink sockets close.
-A required link whose source leaves its device is retired: no socket, nothing
-sent, and its telemetry row keeps `link_id`/`iface` and adds
+A required link whose source leaves its device is retired within 200 ms: no
+socket, nothing sent, and its telemetry row keeps `link_id`/`iface` and adds
 `binding_state: "retired"`. It returns by itself once the source is back on
 that device; no `SIGHUP` is needed. See ADR-003 §9.4.
 

@@ -26,7 +26,7 @@ CI run does not prove the privileged topology. Run them only through
 `tests/strict_source_netns.rs` is a separate privileged supplement outside that
 gate: it needs only root and iproute2 (no `sudo`, no receiver binaries), builds
 two namespaces joined by veth pairs, and self-skips otherwise. Run it as root,
-for example in a privileged container; it takes about 30 s.
+for example in a privileged container; it takes about 45 s.
 `tests/signal_shutdown.rs` and `tests/signal_parity.rs` build small C shims
 with `cc` and load them through glibc `LD_PRELOAD`; those cases need both.
 

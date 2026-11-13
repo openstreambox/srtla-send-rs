@@ -159,7 +159,8 @@
   snapshots are committed together. Empty active/mapped is a completed receipt.
 
 - **Retired required links (ADR-003 §9.4):** a required link whose source is not
-  verifiably on its mapped device holds no socket and sends nothing. Its row keeps
+  verifiably on its mapped device (checked every 200 ms) holds no socket and
+  sends nothing. Its row keeps
   `link_id`/`iface` and adds the OPTIONAL per-connection key
   `binding_state: "retired"` (absent on every other row and outside required
   mode). The sender retries the checked bind on the reconnect backoff and the
