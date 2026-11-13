@@ -80,10 +80,112 @@ impl ConnIo {
     }
 }
 
+/// What a required-mode link keeps while it holds no socket.
+///
+/// A required link is retired the moment its mapped source stops being
+/// assigned to its mapped device, or a checked socket rebuild fails: its socket
+/// is closed and its reader joined, so nothing can be sent from it. What stays
+/// is everything needed to bind it again through the same checked path, and the
+/// identity telemetry reports it under while it is down.
+pub struct RetiredUplink {
+    pub binder: Arc<dyn UplinkBinder>,
+    pub remote: SocketAddr,
+    pub spec: UplinkSpec,
+    pub egress: EgressLifecycle,
+}
+
 /// Shell-owned map from `conn_id` to its [`ConnIo`]. Lives entirely inside the
 /// single event-loop task and is only ever accessed serially, so a plain
 /// `HashMap` (not a concurrent map) is both correct and cheapest.
-pub type ConnIoMap = HashMap<ConnectionId, ConnIo>;
+///
+/// Dereferences to that map of LIVE sockets, which is what every send and
+/// receive path consults: a link with no entry there cannot transmit. Retired
+/// required links are parked beside it, never inside it, so no send path can
+/// reach one by accident.
+#[derive(Default)]
+pub struct ConnIoMap {
+    live: HashMap<ConnectionId, ConnIo>,
+    retired: HashMap<ConnectionId, RetiredUplink>,
+}
+
+impl ConnIoMap {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Close this link's socket and park what is needed to bind it again.
+    /// Returns false when the link owned no socket.
+    pub fn retire(&mut self, conn_id: ConnectionId) -> bool {
+        let Some(io) = self.live.remove(&conn_id) else {
+            return false;
+        };
+        self.retired.insert(
+            conn_id,
+            RetiredUplink {
+                binder: io.binder,
+                remote: io.remote,
+                spec: io.spec,
+                egress: io.egress,
+            },
+        );
+        true
+    }
+
+    #[must_use]
+    pub fn is_retired(&self, conn_id: ConnectionId) -> bool {
+        self.retired.contains_key(&conn_id)
+    }
+
+    #[must_use]
+    pub fn retired(&self, conn_id: ConnectionId) -> Option<&RetiredUplink> {
+        self.retired.get(&conn_id)
+    }
+
+    pub fn retired_mut(&mut self, conn_id: ConnectionId) -> Option<&mut RetiredUplink> {
+        self.retired.get_mut(&conn_id)
+    }
+
+    /// Every parked link, for the passes that must reach the whole bond.
+    pub fn retired_values_mut(&mut self) -> impl Iterator<Item = &mut RetiredUplink> {
+        self.retired.values_mut()
+    }
+
+    /// Hand a parked link back to its caller, which now owns its socket-less
+    /// state: either to pair it with a fresh socket or to drop it.
+    pub fn unpark(&mut self, conn_id: ConnectionId) -> Option<RetiredUplink> {
+        self.retired.remove(&conn_id)
+    }
+
+    /// Drop everything held for a link that left the pool, live or retired.
+    pub fn forget(&mut self, conn_id: ConnectionId) {
+        self.live.remove(&conn_id);
+        self.retired.remove(&conn_id);
+    }
+}
+
+impl std::ops::Deref for ConnIoMap {
+    type Target = HashMap<ConnectionId, ConnIo>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.live
+    }
+}
+
+impl std::ops::DerefMut for ConnIoMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.live
+    }
+}
+
+impl FromIterator<(ConnectionId, ConnIo)> for ConnIoMap {
+    fn from_iter<T: IntoIterator<Item = (ConnectionId, ConnIo)>>(iter: T) -> Self {
+        Self {
+            live: iter.into_iter().collect(),
+            retired: HashMap::new(),
+        }
+    }
+}
 
 pub struct UplinkPacket {
     pub conn_id: ConnectionId,
@@ -219,6 +321,10 @@ pub async fn drain_readers(readers: &mut HashMap<ConnectionId, ReaderHandle>) {
 }
 
 /// Remove every owner of an unusable socket before any later send or snapshot.
+///
+/// The link stays in the pool, parked: housekeeping retries its checked bind on
+/// the reconnect backoff, so it returns by itself once its source is assigned
+/// to its device again.
 pub async fn retire_uplink(
     conn: &mut SrtlaConnection,
     conn_io: &mut ConnIoMap,
@@ -226,7 +332,7 @@ pub async fn retire_uplink(
     seq_tracker: &mut super::sequence::SequenceTracker,
 ) {
     super::connections::recover_connection(conn, seq_tracker);
-    conn_io.remove(&conn.conn_id);
+    conn_io.retire(conn.conn_id);
     if let Some(reader) = readers.remove(&conn.conn_id) {
         reader.handle.abort();
         let _ = reader.handle.await;
@@ -260,7 +366,7 @@ mod reader_retirement_tests {
             if strict {
                 drain_readers(&mut readers).await;
             } else {
-                sync_readers(&[], &HashMap::new(), &mut readers, &tx).await;
+                sync_readers(&[], &ConnIoMap::new(), &mut readers, &tx).await;
             }
             assert!(readers.is_empty());
             assert!(

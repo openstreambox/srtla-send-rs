@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1311,7 +1310,7 @@ mod tests {
 
         let mut connections = vec![create_test_connection().await];
         let conn_id = connections[0].conn_id;
-        let mut conn_io: ConnIoMap = HashMap::new();
+        let mut conn_io = ConnIoMap::new();
         conn_io.insert(conn_id, conn_io_to(recv_addr));
         let mut seq_tracker = SequenceTracker::new();
 

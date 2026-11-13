@@ -116,6 +116,11 @@ pub async fn apply_connection_changes(
                 }
                 if let Some(io) = conn_io.get_mut(&conn.conn_id) {
                     io.spec = spec.clone();
+                } else if let Some(retired) = conn_io.retired_mut(conn.conn_id) {
+                    // Still down, but a reload is a reason to look again now
+                    // rather than when the backoff next allows it.
+                    retired.spec = spec.clone();
+                    conn.reconnection.last_reconnect_attempt_ms = 0;
                 }
                 connections.push(conn);
             }
@@ -155,10 +160,16 @@ impl Survivors {
         let mut by_link_id = HashMap::new();
         let mut by_key = HashMap::new();
         for conn in std::mem::take(connections) {
-            let Some(io) = conn_io.get(&conn.conn_id) else {
-                continue; // A retired socket must be dialled again on reload.
+            // A retired link has no socket, but it is still the link its spec
+            // names: it keeps its place when the reload still lists it, and
+            // housekeeping goes on retrying its checked bind.
+            let spec = match conn_io.get(&conn.conn_id) {
+                Some(io) => io.spec.clone(),
+                None => match conn_io.retired(conn.conn_id) {
+                    Some(retired) => retired.spec.clone(),
+                    None => continue,
+                },
             };
-            let spec = io.spec.clone();
             let key = spec.socket_key();
             match spec.link_id {
                 Some(id) => {
@@ -212,7 +223,7 @@ impl Survivors {
             .collect();
         for conn_id in &leaving {
             seq_tracker.remove_connection(*conn_id);
-            conn_io.remove(conn_id);
+            conn_io.forget(*conn_id);
         }
         leaving.len()
     }
@@ -437,15 +448,30 @@ pub(super) fn rebuild_uplink_socket(
         .resolve_for_bind(&SystemIfaceResolver)
         .map_err(|fault| anyhow::anyhow!("egress unavailable ({})", fault.as_str()))?;
     io.route_health = observe_route_for(&io.spec);
+    io.socket = open_bound_socket(conn.local_ip, io.binder.as_ref(), io.remote)?;
+    restart_on_new_socket(conn, seq_tracker, now);
+    Ok(())
+}
 
-    let sock = create_uplink_socket(conn.local_ip)?;
-    io.binder.bind(&sock, conn.local_ip)?;
+/// A fresh socket for `ip`, steered by `binder` and aimed at `remote`. For a
+/// required link the binder is the checked one, so this refuses unless the
+/// source is assigned to the mapped device right now.
+fn open_bound_socket(
+    ip: IpAddr,
+    binder: &dyn UplinkBinder,
+    remote: SocketAddr,
+) -> Result<Arc<BatchUdpSocket>> {
+    let sock = create_uplink_socket(ip)?;
+    binder.bind(&sock, ip)?;
     sock.set_nonblocking(true)?;
-    io.socket = Arc::new(BatchUdpSocket::new(
+    Ok(Arc::new(BatchUdpSocket::new(
         sock,
-        send_peer(io.remote, io.binder.as_ref()),
-    )?);
+        send_peer(remote, binder),
+    )?))
+}
 
+/// The protocol-state half of putting a link on a new socket.
+fn restart_on_new_socket(conn: &mut SrtlaConnection, seq_tracker: &mut SequenceTracker, now: u64) {
     conn.reset_for_reconnect(now);
     // A reconnected link comes back with an empty packet log, so the tracker
     // must stop pointing already-queued sequences at it — same stale-ownership
@@ -453,6 +479,45 @@ pub(super) fn rebuild_uplink_socket(
     // the harder reset of the two.
     seq_tracker.remove_connection(conn.conn_id);
     conn.reconnection.reset_startup_grace(now);
+}
+
+/// Give a retired required link its socket back.
+///
+/// The bind goes through the link's own checked binder, exactly as its first
+/// socket did: interface re-resolved by name, source required to be assigned to
+/// that interface, bound address verified. Until all of that holds this returns
+/// an error and the link stays parked without a socket, so a retry can never
+/// transmit from a source that is not on its mapped device. The caller must
+/// spawn the reader for the new `conn_io` entry.
+pub(super) fn revive_uplink(
+    conn: &mut SrtlaConnection,
+    conn_io: &mut ConnIoMap,
+    seq_tracker: &mut SequenceTracker,
+    now: u64,
+) -> Result<()> {
+    let retired = conn_io
+        .retired_mut(conn.conn_id)
+        .ok_or_else(|| anyhow::anyhow!("link is not retired"))?;
+    retired
+        .egress
+        .resolve_for_bind(&SystemIfaceResolver)
+        .map_err(|fault| anyhow::anyhow!("egress unavailable ({})", fault.as_str()))?;
+    let socket = open_bound_socket(conn.local_ip, retired.binder.as_ref(), retired.remote)?;
+    let route_health = observe_route_for(&retired.spec);
+    if let Some(retired) = conn_io.unpark(conn.conn_id) {
+        conn_io.insert(
+            conn.conn_id,
+            ConnIo {
+                socket,
+                binder: retired.binder,
+                remote: retired.remote,
+                spec: retired.spec,
+                egress: retired.egress,
+                route_health,
+            },
+        );
+    }
+    restart_on_new_socket(conn, seq_tracker, now);
     Ok(())
 }
 
@@ -592,6 +657,78 @@ mod tests {
             claim_dns_drift_warning(base + DNS_DRIFT_WARN_INTERVAL_MS),
             "the warning is due again once the window has passed"
         );
+    }
+}
+
+#[cfg(test)]
+mod retired_reload_tests {
+    use super::*;
+    use crate::test_helpers::{create_test_conn_io_map, create_test_connection};
+
+    /// A reload that still lists a retired link keeps it — same connection,
+    /// same identity, still without a socket — and makes its next bind retry
+    /// due at once instead of after whatever backoff was left. A reload that
+    /// no longer lists it drops it for good.
+    #[tokio::test]
+    async fn a_reload_keeps_a_listed_retired_link_and_makes_its_retry_due() {
+        let now = now_ms();
+        let mut connections: SmallVec<SrtlaConnection, 4> = SmallVec::new();
+        connections.push(create_test_connection().await);
+        let id = connections[0].conn_id;
+        let mut conn_io = create_test_conn_io_map(&connections);
+        let mut spec = UplinkSpec {
+            iface: Some(crate::bind_map::IfaceName::parse("lo").unwrap()),
+            link_id: Some(crate::bind_map::LinkId::parse("path-a").unwrap()),
+            ..UplinkSpec::unmapped(connections[0].local_ip)
+        };
+        conn_io.get_mut(&id).unwrap().spec = spec.clone();
+        let mut seq_tracker = SequenceTracker::new();
+        recover_connection(&mut connections[0], &mut seq_tracker);
+        assert!(conn_io.retire(id));
+        connections[0].record_reconnect_attempt(now);
+        assert!(!connections[0].should_attempt_reconnect(now));
+
+        let binder: Arc<dyn UplinkBinder> = Arc::new(crate::net::RequiredBinding);
+        spec.weight = 3;
+        let mut last_selected = None;
+        apply_connection_changes(
+            &mut connections,
+            &mut conn_io,
+            std::slice::from_ref(&spec),
+            "127.0.0.1",
+            9,
+            &mut last_selected,
+            &mut seq_tracker,
+            &binder,
+        )
+        .await;
+
+        assert_eq!(connections.len(), 1, "the retired link left the pool");
+        assert_eq!(connections[0].conn_id, id);
+        assert!(
+            !conn_io.contains_key(&id),
+            "a reload must not conjure a socket"
+        );
+        assert_eq!(conn_io.retired(id).map(|r| &r.spec), Some(&spec));
+        assert_eq!(connections[0].link_weight, 3);
+        assert!(
+            connections[0].should_attempt_reconnect(now),
+            "a reload must make the retired link's retry due"
+        );
+
+        apply_connection_changes(
+            &mut connections,
+            &mut conn_io,
+            &[],
+            "127.0.0.1",
+            9,
+            &mut last_selected,
+            &mut seq_tracker,
+            &binder,
+        )
+        .await;
+        assert!(connections.is_empty());
+        assert!(!conn_io.is_retired(id), "a withdrawn link stayed parked");
     }
 }
 

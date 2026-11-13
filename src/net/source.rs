@@ -4,44 +4,103 @@ use std::net::IpAddr;
 use anyhow::{Result, ensure};
 
 pub fn validate_source(ip: IpAddr, iface: &str) -> Result<()> {
-    let ip = ip.to_canonical();
-    ensure!(
-        !ip.is_unspecified() && !ip.is_multicast(),
-        "source must be concrete unicast"
-    );
-    if let IpAddr::V4(v4) = ip {
-        ensure!(!v4.is_broadcast(), "source must not be broadcast");
-    }
-    #[cfg(target_os = "linux")]
-    ensure!(
-        !source_facts(ip, iface)?.1,
-        "source must not be directed broadcast"
-    );
-    #[cfg(not(target_os = "linux"))]
-    let _ = iface;
-    Ok(())
+    HostAddrs::read().validate(ip, iface)
 }
 
 pub fn require_assigned_source(ip: IpAddr, iface: &str) -> Result<()> {
-    validate_source(ip, iface)?;
+    HostAddrs::read().require_assigned(ip, iface)
+}
+
+/// One reading of the host's interface addresses.
+///
+/// Housekeeping checks every required link against the same reading, so a tick
+/// costs one `getifaddrs` however many links the bond has. A reading that
+/// failed is kept as a failure: assignment then cannot be proven, and every
+/// check against it refuses, naming the inspection rather than the address.
+pub struct HostAddrs {
     #[cfg(target_os = "linux")]
-    {
+    rows: Option<Vec<HostAddr>>,
+}
+
+#[cfg(target_os = "linux")]
+struct HostAddr {
+    iface: Vec<u8>,
+    addr: Option<IpAddr>,
+    netmask: Option<IpAddr>,
+    broadcast_capable: bool,
+}
+
+impl HostAddrs {
+    #[must_use]
+    pub fn read() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            rows: read_host_addrs(),
+        }
+    }
+
+    /// Concrete unicast, and not a directed broadcast on `iface`.
+    pub fn validate(&self, ip: IpAddr, iface: &str) -> Result<()> {
+        let ip = ip.to_canonical();
         ensure!(
-            source_facts(ip.to_canonical(), iface)?.0,
-            "source is not assigned to device {iface}"
+            !ip.is_unspecified() && !ip.is_multicast(),
+            "source must be concrete unicast"
         );
+        if let IpAddr::V4(v4) = ip {
+            ensure!(!v4.is_broadcast(), "source must not be broadcast");
+        }
+        #[cfg(target_os = "linux")]
+        ensure!(
+            !self.source_facts(ip, iface)?.1,
+            "source must not be directed broadcast"
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = iface;
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        anyhow::bail!("required binding needs Linux")
+
+    /// [`validate`](Self::validate), and assigned to `iface` in this reading.
+    pub fn require_assigned(&self, ip: IpAddr, iface: &str) -> Result<()> {
+        self.validate(ip, iface)?;
+        #[cfg(target_os = "linux")]
+        {
+            ensure!(
+                self.source_facts(ip.to_canonical(), iface)?.0,
+                "source is not assigned to device {iface}"
+            );
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            anyhow::bail!("required binding needs Linux")
+        }
+    }
+
+    /// Whether a source is assigned to this device, and whether it is a directed
+    /// broadcast there. /31 and /32 have no directed broadcast.
+    #[cfg(target_os = "linux")]
+    fn source_facts(&self, ip: IpAddr, iface: &str) -> Result<(bool, bool)> {
+        let Some(rows) = self.rows.as_ref() else {
+            anyhow::bail!("cannot inspect interface addresses");
+        };
+        let mut assigned = false;
+        let mut broadcast = false;
+        for row in rows.iter().filter(|row| row.iface == iface.as_bytes()) {
+            assigned |= row.addr == Some(ip);
+            if row.broadcast_capable
+                && let (Some(IpAddr::V4(addr)), Some(IpAddr::V4(mask)), IpAddr::V4(source)) =
+                    (row.addr, row.netmask, ip)
+            {
+                broadcast |= directed_broadcast(addr, mask, source);
+            }
+        }
+        Ok((assigned, broadcast))
     }
 }
 
-/// Whether a source is assigned to this device, and whether it is a directed
-/// broadcast there. /31 and /32 have no directed broadcast.
+/// `None` when the host would not list its addresses.
 #[cfg(target_os = "linux")]
-fn source_facts(ip: IpAddr, iface: &str) -> Result<(bool, bool)> {
+fn read_host_addrs() -> Option<Vec<HostAddr>> {
     struct Addrs(*mut libc::ifaddrs);
     impl Drop for Addrs {
         fn drop(&mut self) {
@@ -51,36 +110,31 @@ fn source_facts(ip: IpAddr, iface: &str) -> Result<(bool, bool)> {
     }
     let mut head = std::ptr::null_mut();
     // SAFETY: head is writable; successful list remains alive until Addrs drops.
-    ensure!(
-        unsafe { libc::getifaddrs(&mut head) } == 0,
-        "cannot inspect interface addresses"
-    );
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return None;
+    }
     let list = Addrs(head);
     let mut cur = list.0;
-    let mut assigned = false;
-    let mut broadcast = false;
+    let mut rows = Vec::new();
     while !cur.is_null() {
         // SAFETY: cur belongs to the live getifaddrs list.
         let row = unsafe { &*cur };
-        // SAFETY: getifaddrs supplies a terminated interface name.
-        if !row.ifa_name.is_null()
-            && unsafe { std::ffi::CStr::from_ptr(row.ifa_name) }.to_bytes() == iface.as_bytes()
-        {
-            // SAFETY: optional sockaddr pointers belong to the same live row.
-            let addr = unsafe { address(row.ifa_addr) };
-            assigned |= addr == Some(ip);
-            if row.ifa_flags & libc::IFF_BROADCAST as u32 != 0 {
+        if !row.ifa_name.is_null() {
+            rows.push(HostAddr {
+                // SAFETY: getifaddrs supplies a terminated interface name.
+                iface: unsafe { std::ffi::CStr::from_ptr(row.ifa_name) }
+                    .to_bytes()
+                    .to_vec(),
+                // SAFETY: optional sockaddr pointers belong to the same live row.
+                addr: unsafe { address(row.ifa_addr) },
                 // SAFETY: optional netmask belongs to this row.
-                if let (Some(IpAddr::V4(addr)), Some(IpAddr::V4(mask)), IpAddr::V4(source)) =
-                    (addr, unsafe { address(row.ifa_netmask) }, ip)
-                {
-                    broadcast |= directed_broadcast(addr, mask, source);
-                }
-            }
+                netmask: unsafe { address(row.ifa_netmask) },
+                broadcast_capable: row.ifa_flags & libc::IFF_BROADCAST as u32 != 0,
+            });
         }
         cur = row.ifa_next;
     }
-    Ok((assigned, broadcast))
+    Some(rows)
 }
 
 #[cfg(target_os = "linux")]
@@ -141,6 +195,43 @@ mod tests {
         ] {
             assert!(validate_source(ip.parse().unwrap(), "lo").is_ok(), "{ip}");
         }
+    }
+
+    /// A reading that failed proves nothing, so it refuses — and says that
+    /// the inspection failed, not that the address is gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_address_reading_refuses_and_names_the_inspection() {
+        let ip = "127.0.0.1".parse().unwrap();
+        assert!(HostAddrs::read().require_assigned(ip, "lo").is_ok());
+        let err = HostAddrs { rows: None }
+            .require_assigned(ip, "lo")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "cannot inspect interface addresses");
+        let err = HostAddrs::read()
+            .require_assigned(ip, "missing0")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "source is not assigned to device missing0");
+    }
+
+    /// One reading answers for every link checked against it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_reading_serves_every_link_of_a_tick() {
+        let addrs = HostAddrs::read();
+        for source in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert!(
+                addrs
+                    .require_assigned(source.parse().unwrap(), "lo")
+                    .is_ok(),
+                "{source}"
+            );
+        }
+        assert!(
+            addrs
+                .require_assigned("192.0.2.1".parse().unwrap(), "lo")
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]

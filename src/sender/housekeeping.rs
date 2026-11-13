@@ -6,11 +6,12 @@ use srtla_core::registration::SrtlaRegistrationManager;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 
-use super::connections::{reconnect_uplink, recover_connection};
+use super::connections::{reconnect_uplink, recover_connection, revive_uplink};
 use super::egress_tick;
 use super::rehome::{RehomeGate, try_rehome};
 use super::sequence::SequenceTracker;
 use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for};
+use crate::net::source::HostAddrs;
 
 pub const GLOBAL_TIMEOUT_MS: u64 = 10_000;
 
@@ -53,18 +54,52 @@ pub async fn handle_housekeeping(
         }
     }
 
+    // One reading of the host's addresses serves every required link this
+    // tick; a bond without required links never takes it.
+    let mut host_addrs: Option<HostAddrs> = None;
+
     // housekeeping: drive registration, send keepalives
     for (i, conn) in connections.iter_mut().enumerate() {
+        // A retired required link holds no socket, so nothing below applies to
+        // it. Its only business is the retry: on the reconnect backoff, bind
+        // again through the checked path, which refuses until the source is
+        // assigned to the mapped device.
+        if conn_io.is_retired(conn.conn_id) {
+            if conn.should_attempt_reconnect(current_ms) {
+                conn.record_reconnect_attempt(current_ms);
+                match revive_uplink(conn, conn_io, seq_tracker, current_ms) {
+                    Ok(()) => {
+                        info!(
+                            "{}: mapped source is on its device again; link socket re-established",
+                            conn.label
+                        );
+                        if let Some(io) = conn_io.get(&conn.conn_id) {
+                            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx)
+                                .await;
+                        }
+                        resend_registration(i, conn, reg, conn_io, current_ms).await;
+                    }
+                    Err(e) => debug!("{}: still retired ({e:#})", conn.label),
+                }
+            }
+            continue;
+        }
+
         // Source assignment can change without an ifindex change. Required
         // links must stop using the old socket before this tick sends anything.
         if let Some(io) = conn_io.get(&conn.conn_id)
             && io.binder.requires_checked_device()
-            && io.spec.iface.as_ref().is_none_or(|iface| {
-                crate::net::source::require_assigned_source(conn.local_ip, iface.as_str()).is_err()
-            })
+            && let Err(e) = io.spec.iface.as_ref().map_or_else(
+                || Err(anyhow!("required link has no mapped device")),
+                |iface| {
+                    host_addrs
+                        .get_or_insert_with(HostAddrs::read)
+                        .require_assigned(conn.local_ip, iface.as_str())
+                },
+            )
         {
             warn!(
-                "{}: mapped source unavailable; link down until reload",
+                "{}: {e}; link retired, retrying until its source is verified on its device",
                 conn.label
             );
             super::uplink::retire_uplink(conn, conn_io, reader_handles, seq_tracker).await;
@@ -137,34 +172,7 @@ pub async fn handle_housekeeping(
                     }
                 }
 
-                match reg.pending_reg2_idx() {
-                    Some(idx) if idx == i => {
-                        info!("{} marked for recovery; re-sending REG1", label);
-                        let pkt = reg.build_reg1_for(i, current_ms);
-                        if let Some(io) = conn_io.get(&conn.conn_id) {
-                            match io.send_control_padded(&pkt).await {
-                                Ok(_) => conn.note_sent(current_ms),
-                                Err(e) => warn!("Failed to send REG1 to uplink #{i}: {e:?}"),
-                            }
-                        }
-                    }
-                    Some(_) => {
-                        debug!(
-                            "{} timed out but another uplink is awaiting REG2; deferring",
-                            label
-                        );
-                    }
-                    None => {
-                        info!("{} marked for recovery; re-sending REG2", label);
-                        let pkt = reg.build_reg2(i);
-                        if let Some(io) = conn_io.get(&conn.conn_id) {
-                            match io.send_control_padded(&pkt).await {
-                                Ok(_) => conn.note_sent(current_ms),
-                                Err(e) => warn!("Failed to send REG2 to uplink #{i}: {e:?}"),
-                            }
-                        }
-                    }
-                }
+                resend_registration(i, conn, reg, conn_io, current_ms).await;
             } else {
                 debug!("{} timed out but in retry interval", conn.label);
             }
@@ -311,6 +319,45 @@ pub async fn handle_housekeeping(
     // Old entries are naturally overwritten when the buffer wraps around.
 
     Ok(())
+}
+
+/// Put a link that just got a new socket back in front of the receiver: REG1
+/// when it is the link the group registration is waiting on, REG2 otherwise.
+async fn resend_registration(
+    i: usize,
+    conn: &mut SrtlaConnection,
+    reg: &mut SrtlaRegistrationManager,
+    conn_io: &ConnIoMap,
+    current_ms: u64,
+) {
+    match reg.pending_reg2_idx() {
+        Some(idx) if idx == i => {
+            info!("{} marked for recovery; re-sending REG1", conn.label);
+            let pkt = reg.build_reg1_for(i, current_ms);
+            if let Some(io) = conn_io.get(&conn.conn_id) {
+                match io.send_control_padded(&pkt).await {
+                    Ok(_) => conn.note_sent(current_ms),
+                    Err(e) => warn!("Failed to send REG1 to uplink #{i}: {e:?}"),
+                }
+            }
+        }
+        Some(_) => {
+            debug!(
+                "{} timed out but another uplink is awaiting REG2; deferring",
+                conn.label
+            );
+        }
+        None => {
+            info!("{} marked for recovery; re-sending REG2", conn.label);
+            let pkt = reg.build_reg2(i);
+            if let Some(io) = conn_io.get(&conn.conn_id) {
+                match io.send_control_padded(&pkt).await {
+                    Ok(_) => conn.note_sent(current_ms),
+                    Err(e) => warn!("Failed to send REG2 to uplink #{i}: {e:?}"),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -603,6 +650,129 @@ mod tests {
             );
             assert_eq!(stats.get().active_links, 0);
         }
+    }
+
+    /// A required binder whose mapped source can leave its device and come
+    /// back, standing in for an address the kernel would have to be asked to
+    /// remove. While the source is away every bind is refused, exactly as the
+    /// checked device binder refuses one.
+    #[cfg(target_os = "linux")]
+    struct SwitchedBinder(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    #[cfg(target_os = "linux")]
+    impl crate::net::UplinkBinder for SwitchedBinder {
+        fn requires_checked_device(&self) -> bool {
+            true
+        }
+
+        fn bind(&self, sock: &socket2::Socket, ip: IpAddr) -> Result<()> {
+            anyhow::ensure!(
+                self.0.load(std::sync::atomic::Ordering::SeqCst),
+                "source is not assigned to device lo"
+            );
+            crate::net::SourceIpBinder.bind(sock, ip)
+        }
+    }
+
+    /// One established required link on `lo`, mapped as `path-a`, whose source
+    /// the returned switch takes away and gives back.
+    #[cfg(target_os = "linux")]
+    async fn required_link(
+        remote: SocketAddr,
+        assigned: bool,
+    ) -> (
+        RehomeFixture,
+        ConnectionId,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut f = RehomeFixture::new(remote).await;
+        f.connections.truncate(1);
+        let id = f.connections[0].conn_id;
+        f.connections[0].reconnection.connection_established_ms = 1;
+        let switch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(assigned));
+        let io = f.conn_io.get_mut(&id).unwrap();
+        io.binder = std::sync::Arc::new(SwitchedBinder(switch.clone()));
+        io.spec.iface = Some(crate::bind_map::IfaceName::parse("lo").unwrap());
+        io.spec.link_id = Some(crate::bind_map::LinkId::parse("path-a").unwrap());
+        let (tx, _rx) = create_uplink_channel();
+        sync_readers(&f.connections, &f.conn_io, &mut f.reader_handles, &tx).await;
+        (f, id, switch)
+    }
+
+    /// The transient-loss blocker: a required link that lost its source must
+    /// come back by itself, with no reload, once the source is on its device
+    /// again — and must not own a socket or send anything in between.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_retired_link_returns_by_itself_once_its_source_is_back() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut f, id, assigned) = required_link(receiver.local_addr().unwrap(), false).await;
+        let old_socket = std::sync::Arc::downgrade(&f.conn_io.get(&id).unwrap().socket);
+        let mut gate = RehomeGate::new(false);
+
+        // The link times out and its checked reconnect is refused: retired.
+        let t0 = 1_000_000;
+        recover_connection(&mut f.connections[0], &mut f.seq_tracker);
+        f.connections[0].reconnection.last_reconnect_attempt_ms = 0;
+        f.tick(&mut gate, t0).await.unwrap();
+        assert!(f.conn_io.is_retired(id));
+        assert!(old_socket.upgrade().is_none(), "retired socket still open");
+
+        // Source away: every backoff retry is refused, no socket exists, and
+        // not one datagram leaves on this link's behalf.
+        let mut datagram = [0u8; 64];
+        for second in 1..=5 {
+            f.tick(&mut gate, t0 + second * 1000).await.unwrap();
+            assert!(
+                !f.conn_io.contains_key(&id),
+                "socket opened while the source was away"
+            );
+            assert!(f.conn_io.is_retired(id));
+            assert!(!f.reader_handles.contains_key(&id));
+            assert!(
+                receiver.try_recv_from(&mut datagram).is_err(),
+                "a retired link transmitted"
+            );
+        }
+        assert!(
+            f.connections[0].reconnection.reconnect_failure_count >= 4,
+            "the retry must run on the reconnect backoff"
+        );
+
+        // Source back, no reload: the next due retry binds and re-registers.
+        assigned.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut returned_after = None;
+        for second in 6..=9 {
+            f.tick(&mut gate, t0 + second * 1000).await.unwrap();
+            if f.conn_io.contains_key(&id) {
+                returned_after = Some(second - 5);
+                break;
+            }
+        }
+        assert!(
+            returned_after.is_some_and(|seconds| seconds <= 4),
+            "link did not return within the slow backoff: {returned_after:?}"
+        );
+        assert!(!f.conn_io.is_retired(id));
+        let io = f.conn_io.get(&id).unwrap();
+        assert_eq!(io.spec.link_id.as_ref().unwrap().as_str(), "path-a");
+        assert_eq!(io.spec.iface.as_ref().unwrap().as_str(), "lo");
+        assert!(
+            f.reader_handles.contains_key(&id),
+            "no reader on the socket"
+        );
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            receiver.recv_from(&mut datagram),
+        )
+        .await
+        .expect("the returning link must re-register")
+        .unwrap();
+        assert!(n >= srtla_protocol::MIN_CONTROL_PKT_LEN);
+        assert_eq!(
+            srtla_protocol::get_packet_type(&datagram[..n]),
+            Some(srtla_protocol::SRTLA_TYPE_REG2)
+        );
     }
 
     fn remote(last: u8) -> SocketAddr {

@@ -156,6 +156,15 @@
   `pending_apply` until reader cancellation is joined and connection/report
   snapshots are committed together. Empty active/mapped is a completed receipt.
 
+- **Retired required links (ADR-003 §9.4):** a required link whose source is not
+  verifiably on its mapped device holds no socket and sends nothing. Its row keeps
+  `link_id`/`iface` and adds the OPTIONAL per-connection key
+  `binding_state: "retired"` (absent on every other row and outside required
+  mode). The sender retries the checked bind on the reconnect backoff and the
+  link returns without a reload. Unit tests in `src/sender/housekeeping.rs`; the
+  privileged `tests/strict_source_netns.rs` (root and iproute2 only, self-skips)
+  proves it on real interfaces; fixture `telemetry-required-retired.json`.
+
 - **Required-binding contract revision:** require integer `bind_map_contract >= 2`
   alongside both required-binding booleans for §9.4 guarantees. Linux advertises
   2; other platforms 0. Missing/zero is unverified; future revisions retain the

@@ -615,9 +615,29 @@ non-required binders keep their behavior. Required sends use a canonical IPv4
 sockaddr for an IPv4-mapped receiver address, at initial creation and socket
 rebuild; the original receiver identity is retained for DNS/re-home checks.
 Native IPv6 receiver addresses retain their scope. Housekeeping checks source
-assignment before sending. A lost assignment or failed checked socket rebuild
-closes the old socket, joins its reader and marks the connection down until a
-reload can recreate it.
+assignment before sending, against one reading of the host's addresses per
+tick. A lost assignment or failed checked socket rebuild retires the link: its
+socket is closed and its reader joined, so nothing is sent from it. A reading
+that fails proves nothing and retires the link the same way; the log names the
+inspection, not the address.
+
+A retired link stays in the pool under its mapped identity. Its telemetry row
+keeps `link_id` and `iface`, reports `weight_percent` 0 and carries the
+optional per-connection key `binding_state: "retired"`. The key is omitted on
+every other row and outside required mode, so no other document changes. It
+describes the binding, not the path: read it to tell "held down until its
+source is back on its device" from an ordinary dead link, and keep judging
+live links by the existing fields. The top-level report is unaffected; the
+applied mapping still names the row.
+
+The sender retries the checked bind by itself, on the reconnect backoff (four
+attempts one second apart, then every five seconds). Each retry goes through
+the same checked path as the first bind, so it is refused until the source is
+assigned to the mapped device again; an address that is present on another
+device does not satisfy it. On success the link re-registers and returns
+without a reload. A reload that still lists a retired link keeps it and makes
+its next retry due at once; one that no longer lists it drops it. A whole-bond
+re-home repoints retired links with the rest.
 
 Signal streams are registered before the first startup await. A startup
 SIGHUP queues exactly one reload even while pair validation or dialling is in

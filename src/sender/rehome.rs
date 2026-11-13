@@ -317,17 +317,26 @@ async fn rehome_bond(
     new_remote: SocketAddr,
     now: u64,
 ) {
-    // Pass 1 — the atomic part. Nothing here can fail.
+    // Pass 1 — the atomic part. Nothing here can fail. A retired required link
+    // has no socket to move, but it must come back dialling the new address:
+    // returning to the old one would split the bond across two receivers.
     for conn in connections.iter() {
         if let Some(io) = conn_io.get_mut(&conn.conn_id) {
             io.remote = new_remote;
         }
+    }
+    for retired in conn_io.retired_values_mut() {
+        retired.remote = new_remote;
     }
 
     // Pass 2 — rebuild each socket against the new remote, reset the link's
     // protocol state, drop its sequence-tracker ownership and respawn its
     // reader, exactly as the per-uplink reconnect does.
     for conn in connections.iter_mut() {
+        // Already parked without a socket; pass 1 repointed it.
+        if conn_io.is_retired(conn.conn_id) {
+            continue;
+        }
         match conn_io.get_mut(&conn.conn_id) {
             Some(io) => match rebuild_uplink_socket(conn, io, seq_tracker, now) {
                 Ok(()) => {

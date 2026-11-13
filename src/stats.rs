@@ -54,6 +54,10 @@ pub struct LinkStats {
     /// (ADR-003). The sender never invents one, so an unmapped link has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_id: Option<String>,
+    /// `retired` while a required link holds no socket (ADR-003 §9.4); absent
+    /// otherwise, and always absent outside required mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_state: Option<BindingState>,
     /// Human-readable label (e.g., "host:port via ip")
     pub label: String,
     /// True if SRTLA registration completed (REG3 received)
@@ -227,6 +231,7 @@ impl Default for LinkStats {
             ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             iface: None,
             link_id: None,
+            binding_state: None,
             label: String::new(),
             connected: false,
             timed_out: false,
@@ -348,6 +353,23 @@ impl Default for StatsSnapshot {
 pub struct LinkIdentity {
     pub iface: Option<String>,
     pub link_id: Option<String>,
+    /// `Some` only for a retired required link.
+    pub binding_state: Option<BindingState>,
+}
+
+/// The one thing a required-mode link reports about its socket: that it has
+/// none.
+///
+/// A fact about the binding, not about the path. A link that is not retired
+/// omits the key, so every document a required run published before this state
+/// existed is unchanged; the key says nothing about whether a receiver answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingState {
+    /// No socket: the mapped source is not (verifiably) assigned to the mapped
+    /// device. Nothing is sent from this link; the sender retries the checked
+    /// bind by itself and the link returns without a reload.
+    Retired,
 }
 
 /// Monotonic bond-level byte accumulator behind [`StatsSnapshot::session_bytes_sent`].
@@ -638,6 +660,7 @@ impl SharedStats {
                 ip: conn.local_ip,
                 iface: identity.and_then(|i| i.iface.clone()),
                 link_id: identity.and_then(|i| i.link_id.clone()),
+                binding_state: identity.and_then(|i| i.binding_state),
                 label: conn.label.clone(),
                 connected: conn.connected,
                 timed_out,

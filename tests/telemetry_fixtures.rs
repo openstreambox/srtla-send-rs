@@ -27,6 +27,7 @@
 //! | `telemetry-degraded-startup` | `startup_collision_excluded` names the group it broke up. |
 //! | `telemetry-degraded-reload` | `retained_last_valid` says degraded AND still pinned. |
 //! | `telemetry-unknown-fields` | A FUTURE producer's extra keys do not break today's reader. |
+//! | `telemetry-required-retired` | A required link without a socket keeps its `link_id` and says `binding_state: retired`. |
 
 use std::path::PathBuf;
 
@@ -84,6 +85,7 @@ fn conn(conn_id: u32, link_id: Option<&str>, iface: Option<&str>) -> TelemetryCo
         bytes_sent_total: Some(812_000_000),
         iface: iface.map(ToString::to_string),
         link_id: link_id.map(ToString::to_string),
+        binding_state: None,
     }
 }
 
@@ -368,6 +370,39 @@ fn required_binding_refusal_publishes_fresh_empty_connections() {
     assert_eq!(doc["last_updated_ms"], FIXED_MS);
     assert_eq!(doc["connections"], serde_json::json!([]));
     assert_eq!(doc["disposition"]["state"], "required_binding_refused");
+}
+
+#[test]
+fn a_retired_required_link_keeps_its_identity_and_says_so() {
+    let mut conns = mapped_conns();
+    conns[0].weight_percent = 100;
+    conns[1] = TelemetryConn {
+        rtt_ms: 0,
+        weight_percent: 0,
+        window: 0,
+        in_flight: 0,
+        bitrate_bytes_per_sec: 0,
+        binding_state: Some(srtla_send::stats::BindingState::Retired),
+        ..conns[1].clone()
+    };
+    let produced = document(&conns, &active());
+    assert_fixture("telemetry-required-retired", &produced);
+
+    let doc = value(&produced);
+    let rows = doc["connections"].as_array().unwrap();
+    // The applied mapping is unchanged by one link being down.
+    assert_eq!(doc["disposition"]["state"], "mapped");
+    assert!(rows[0].get("binding_state").is_none());
+    assert_eq!(rows[1]["link_id"], "modem-b");
+    assert_eq!(rows[1]["iface"], "wwan1");
+    assert_eq!(rows[1]["binding_state"], "retired");
+    assert_eq!(rows[1]["weight_percent"], 0);
+    // Additive: every other fixture is byte-identical with or without the key.
+    assert!(
+        !parse("telemetry-mapped")
+            .to_string()
+            .contains("binding_state")
+    );
 }
 
 #[test]

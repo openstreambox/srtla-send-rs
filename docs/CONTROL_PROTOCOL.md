@@ -81,8 +81,10 @@ published generation/SHA as applied. A timestamp alone is not an acknowledgement
 no uplinks) or `pending_apply` (a read/application is in flight). Pending may have
 no known identity yet; even a known `bind_map_pending` is intent only. A degraded
 reload reports `retained_last_valid`, retains the applied identity and leaves live
-sockets/readers untouched. Missing identity means unknown, never success. The
-status, disposition and identity rules are specified in
+sockets/readers untouched. Missing identity means unknown, never success. A
+required link that currently holds no socket carries `binding_state: "retired"`
+in its per-link record here and in file telemetry; the key is absent otherwise.
+The status, disposition and identity rules are specified in
 [ADR-003 §9](adr/ADR-003-bind-map-contract.md#9-required-binding-opt-in-extension).
 
 ## Subscriptions

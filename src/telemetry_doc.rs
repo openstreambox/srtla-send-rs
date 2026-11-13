@@ -18,9 +18,11 @@
 //! ```
 //!
 //! Seven per-connection keys are REQUIRED and frozen: `conn_id`, `rtt_ms`,
-//! `nak_count`, `weight_percent`, `window`, `in_flight`, `bitrate_bps`. Three
+//! `nak_count`, `weight_percent`, `window`, `in_flight`, `bitrate_bps`. Four
 //! more are OPTIONAL and omitted entirely (never `null`, never `""`) when they
-//! do not apply: `bytes_sent_total` (ADR-002), `iface` and `link_id` (ADR-003).
+//! do not apply: `bytes_sent_total` (ADR-002), `iface` and `link_id` (ADR-003),
+//! and `binding_state`, present only as `"retired"` on a required link that
+//! holds no socket (ADR-003 §9.4).
 //! The top level carries the same three-optional pattern: `bytes_sent_total`,
 //! `bind_map_status`, `disposition`.
 //!
@@ -56,7 +58,7 @@ use serde::Serialize;
 use srtla_core::utils::wall_clock_ms;
 
 use crate::bind_map::{BindMapIdentity, BindMapReport, BindMapStatusRecord, DispositionRecord};
-use crate::stats::StatsSnapshot;
+use crate::stats::{BindingState, StatsSnapshot};
 
 /// JSON schema version. See the module docs for what does and does not bump it.
 pub const TELEMETRY_SCHEMA_VERSION: u32 = 1;
@@ -82,6 +84,8 @@ pub struct TelemetryConn {
     pub iface: Option<String>,
     /// The sidecar's writer-assigned identity, echoed; `None` when unmapped.
     pub link_id: Option<String>,
+    /// `retired` while a required link holds no socket; `None` otherwise.
+    pub binding_state: Option<BindingState>,
 }
 
 /// Serialized per-connection record. `conn_id` is a string and `bitrate_bps` is
@@ -102,6 +106,8 @@ struct ConnRecord {
     iface: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     link_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binding_state: Option<BindingState>,
 }
 
 impl From<&TelemetryConn> for ConnRecord {
@@ -119,6 +125,7 @@ impl From<&TelemetryConn> for ConnRecord {
             bytes_sent_total: c.bytes_sent_total,
             iface: c.iface.clone(),
             link_id: c.link_id.clone(),
+            binding_state: c.binding_state,
         }
     }
 }
@@ -263,6 +270,9 @@ pub fn conns_from_stats(stats: &StatsSnapshot) -> Vec<TelemetryConn> {
                 // neither, and the key is then omitted rather than emptied.
                 iface: l.iface.clone(),
                 link_id: l.link_id.clone(),
+                // ADR-003 §9.4: present only on a retired required link, so
+                // every other document is byte-identical to what it was.
+                binding_state: l.binding_state,
             }
         })
         .collect()
@@ -301,6 +311,7 @@ mod tests {
             bytes_sent_total: Some(812_000_000),
             iface: None,
             link_id: None,
+            binding_state: None,
         }
     }
 

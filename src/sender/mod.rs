@@ -733,25 +733,37 @@ pub async fn run_sender_with_config(
     event_loop! {}
 }
 
-/// The ADR-003 identity echo for every live uplink, keyed by `conn_id`.
+/// The ADR-003 identity echo for every uplink, keyed by `conn_id`.
 ///
 /// Built from the I/O map rather than the connections themselves: `iface` and
 /// `link_id` are facts about the socket, and the pure core deliberately does
 /// not carry them. An unmapped link contributes an entry with both `None`, so
 /// its telemetry record omits both keys entirely.
+///
+/// A retired required link has no socket, but it keeps the identity it was
+/// mapped under and says so, so a consumer sees the same link go down and come
+/// back instead of an anonymous row.
 fn link_identities(
     connections: &[srtla_core::connection::SrtlaConnection],
     conn_io: &ConnIoMap,
 ) -> HashMap<ConnectionId, crate::stats::LinkIdentity> {
+    use crate::stats::{BindingState, LinkIdentity};
     connections
         .iter()
         .filter_map(|conn| {
-            let io = conn_io.get(&conn.conn_id)?;
+            let (spec, binding_state) = match conn_io.get(&conn.conn_id) {
+                Some(io) => (&io.spec, None),
+                None => (
+                    &conn_io.retired(conn.conn_id)?.spec,
+                    Some(BindingState::Retired),
+                ),
+            };
             Some((
                 conn.conn_id,
-                crate::stats::LinkIdentity {
-                    iface: io.spec.iface.as_ref().map(|i| i.as_str().to_string()),
-                    link_id: io.spec.link_id.as_ref().map(|i| i.as_str().to_string()),
+                LinkIdentity {
+                    iface: spec.iface.as_ref().map(|i| i.as_str().to_string()),
+                    link_id: spec.link_id.as_ref().map(|i| i.as_str().to_string()),
+                    binding_state,
                 },
             ))
         })
@@ -904,5 +916,66 @@ mod queued_apply_tests {
             .is_some()
         );
         assert!(take_current_changes(&mut queued(), false, None, &stats).is_some());
+    }
+}
+
+#[cfg(test)]
+mod retired_identity_tests {
+    use super::*;
+    use crate::test_helpers::{create_test_conn_io_map, create_test_connection};
+
+    /// A retired link keeps the identity it was mapped under and reports that
+    /// it holds no socket; a live link's record is what it always was.
+    #[tokio::test]
+    async fn a_retired_link_keeps_its_identity_and_says_it_is_retired() {
+        let mut connections = vec![
+            create_test_connection().await,
+            create_test_connection().await,
+        ];
+        let mut conn_io = create_test_conn_io_map(&connections);
+        for (conn, link_id) in connections.iter().zip(["path-a", "path-b"]) {
+            let io = conn_io.get_mut(&conn.conn_id).unwrap();
+            io.spec.iface = Some(crate::bind_map::IfaceName::parse("lo").unwrap());
+            io.spec.link_id = Some(crate::bind_map::LinkId::parse(link_id).unwrap());
+        }
+        uplink::retire_uplink(
+            &mut connections[1],
+            &mut conn_io,
+            &mut HashMap::new(),
+            &mut SequenceTracker::new(),
+        )
+        .await;
+
+        let identities = link_identities(&connections, &conn_io);
+        let stats = SharedStats::new();
+        stats.update(
+            &connections,
+            &crate::config::ConfigSnapshot::default(),
+            None,
+            None,
+            Some(&identities),
+        );
+        let snapshot = stats.get();
+        assert_eq!(snapshot.links[0].binding_state, None);
+        assert_eq!(snapshot.links[1].link_id.as_deref(), Some("path-b"));
+        assert_eq!(snapshot.links[1].iface.as_deref(), Some("lo"));
+        assert_eq!(
+            snapshot.links[1].binding_state,
+            Some(crate::stats::BindingState::Retired)
+        );
+
+        let doc: serde_json::Value = serde_json::from_str(
+            &crate::telemetry_doc::build_telemetry_json_from_stats(1, &snapshot),
+        )
+        .unwrap();
+        let rows = doc["connections"].as_array().unwrap();
+        assert!(rows[0].get("binding_state").is_none());
+        assert_eq!(rows[1]["link_id"], "path-b");
+        assert_eq!(rows[1]["iface"], "lo");
+        assert_eq!(rows[1]["binding_state"], "retired");
+        assert_eq!(rows[1]["weight_percent"], 0);
+        let runtime = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(runtime["links"][1]["binding_state"], "retired");
+        assert!(runtime["links"][0].get("binding_state").is_none());
     }
 }
