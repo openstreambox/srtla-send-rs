@@ -478,12 +478,9 @@ pub async fn run_sender_with_config(
                         {
                             shared_stats.observe_connection_bytes(&connections);
                             info!("applying queued connection changes: {} uplinks", new_links.len());
-                            if require_bind_map {
-                                // Abort AND join: abort alone leaves reader-owned socket
-                                // Arcs alive until cancellation is polled.
-                                uplink::drain_readers(&mut reader_handles).await;
-                            }
-                            apply_connection_changes(
+                            apply_queued_links(
+                                require_bind_map,
+                                &mut reader_handles,
                                 &mut connections,
                                 &mut conn_io,
                                 &new_links,
@@ -788,6 +785,41 @@ async fn until_terminated<T>(
     }
 }
 
+/// Apply a queued uplink set to the live pool.
+///
+/// In required mode every reader is aborted AND joined first: abort alone
+/// leaves reader-owned socket `Arc`s alive until cancellation is polled, and no
+/// reader may still own a socket while the pool is being rebuilt. The caller
+/// respawns readers for the resulting pool.
+#[allow(clippy::too_many_arguments)]
+async fn apply_queued_links(
+    require_bind_map: bool,
+    reader_handles: &mut HashMap<ConnectionId, ReaderHandle>,
+    connections: &mut SmallVec<srtla_core::connection::SrtlaConnection, 4>,
+    conn_io: &mut ConnIoMap,
+    new_links: &[crate::net::UplinkSpec],
+    receiver_host: &str,
+    receiver_port: u16,
+    last_selected_idx: &mut Option<usize>,
+    seq_tracker: &mut SequenceTracker,
+    binder: &Arc<dyn crate::net::UplinkBinder>,
+) {
+    if require_bind_map {
+        uplink::drain_readers(reader_handles).await;
+    }
+    apply_connection_changes(
+        connections,
+        conn_io,
+        new_links,
+        receiver_host,
+        receiver_port,
+        last_selected_idx,
+        seq_tracker,
+        binder,
+    )
+    .await;
+}
+
 pub async fn read_ip_list(path: &str) -> Result<SmallVec<IpAddr, 4>> {
     Ok(read_weighted_ip_list(path).await?.0)
 }
@@ -916,6 +948,77 @@ mod queued_apply_tests {
             .is_some()
         );
         assert!(take_current_changes(&mut queued(), false, None, &stats).is_some());
+    }
+}
+
+#[cfg(test)]
+mod queued_link_tests {
+    use std::sync::{Mutex, Weak};
+
+    use super::*;
+    use crate::net::{BatchUdpSocket, SourceIpBinder, UplinkBinder, UplinkSpec};
+    use crate::test_helpers::{create_test_conn_io_map, create_test_connections};
+
+    /// Records, each time a replacement socket is dialled, how many owners the
+    /// watched pre-apply socket still has.
+    struct OwnersAtDial {
+        watched: Weak<BatchUdpSocket>,
+        seen: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl UplinkBinder for OwnersAtDial {
+        fn bind(&self, sock: &socket2::Socket, ip: IpAddr) -> Result<()> {
+            self.seen.lock().unwrap().push(self.watched.strong_count());
+            SourceIpBinder.bind(sock, ip)
+        }
+    }
+
+    /// Owners of the surviving link's socket at the moment a reload dials a
+    /// new link next to it.
+    async fn owners_while_dialling(require_bind_map: bool) -> Vec<usize> {
+        // The survivor is keyed by a documentation address (its test socket is
+        // on loopback all the same), which leaves 127.0.0.1 for the new link.
+        let mut connections = create_test_connections(1).await;
+        let survivor = connections[0].local_ip;
+        let mut conn_io = create_test_conn_io_map(&connections);
+        let (packet_tx, _packet_rx) = create_uplink_channel();
+        let mut readers = HashMap::new();
+        sync_readers(&connections, &conn_io, &mut readers, &packet_tx).await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let binder: Arc<dyn UplinkBinder> = Arc::new(OwnersAtDial {
+            watched: Arc::downgrade(&conn_io[&connections[0].conn_id].socket),
+            seen: seen.clone(),
+        });
+
+        apply_queued_links(
+            require_bind_map,
+            &mut readers,
+            &mut connections,
+            &mut conn_io,
+            &[
+                UplinkSpec::unmapped(survivor),
+                UplinkSpec::unmapped("127.0.0.1".parse().unwrap()),
+            ],
+            "127.0.0.1",
+            9,
+            &mut None,
+            &mut SequenceTracker::new(),
+            &binder,
+        )
+        .await;
+
+        assert_eq!(connections.len(), 2, "the new link was not dialled");
+        seen.lock().unwrap().clone()
+    }
+
+    /// A required apply joins every reader before it touches the pool: while a
+    /// replacement is dialled, the only owner of a pre-apply socket is the I/O
+    /// map. The default apply leaves the reader running, which is what shows
+    /// this probe can tell the two apart.
+    #[tokio::test]
+    async fn a_required_apply_joins_every_reader_before_it_dials() {
+        assert_eq!(owners_while_dialling(true).await, vec![1]);
+        assert_eq!(owners_while_dialling(false).await, vec![2]);
     }
 }
 

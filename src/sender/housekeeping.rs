@@ -775,6 +775,35 @@ mod tests {
         );
     }
 
+    /// A rebind that an egress fault asked for, and the checked bind refused,
+    /// must retire the link rather than leave the faulted socket in place.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_refused_rebind_after_an_egress_fault_retires_the_link() {
+        use crate::net::{EgressLifecycle, SystemIfaceResolver};
+        let (mut f, id, _assigned) = required_link(remote(1), false).await;
+        let io = f.conn_io.get_mut(&id).unwrap();
+        io.egress = EgressLifecycle::for_spec(io.spec.iface.as_ref());
+        io.egress.resolve_for_bind(&SystemIfaceResolver).unwrap();
+        io.egress
+            .note_send_error(&std::io::Error::from_raw_os_error(libc::ENETUNREACH))
+            .expect("an unreachable egress asks for a rebind");
+        let socket = std::sync::Arc::downgrade(&io.socket);
+        // Live and inside its window, so only the egress step can act on it.
+        f.keep_all_uplinks_live(1_000_000);
+        f.connections[0].reconnection.last_reconnect_attempt_ms = 0;
+
+        f.tick(&mut RehomeGate::new(false), 1_000_000)
+            .await
+            .unwrap();
+
+        assert!(!f.conn_io.contains_key(&id), "faulted socket retained");
+        assert!(f.conn_io.is_retired(id));
+        assert!(!f.reader_handles.contains_key(&id));
+        assert!(socket.upgrade().is_none(), "faulted socket still open");
+        assert!(!f.connections[0].connected);
+    }
+
     fn remote(last: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, last)), 5000)
     }

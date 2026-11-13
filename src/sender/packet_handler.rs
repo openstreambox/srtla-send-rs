@@ -678,6 +678,53 @@ mod tests {
         )
     }
 
+    /// A reply that was already queued when its link was retired must not be
+    /// processed: it would count as proof of life for a link with no socket.
+    #[tokio::test]
+    async fn a_packet_queued_for_a_retired_link_is_dropped_unprocessed() {
+        let mut connections = vec![create_test_connection().await];
+        let conn_id = connections[0].conn_id;
+        let mut conn_io = crate::test_helpers::create_test_conn_io_map(&connections);
+        // Retired before it ever registered: the state in which any reply at
+        // all counts as liveness.
+        connections[0].reconnection.connection_established_ms = 0;
+        connections[0].mark_for_recovery();
+        assert!(conn_io.retire(conn_id));
+
+        let (packet_tx, mut packet_rx) = crate::sender::uplink::create_uplink_channel();
+        let keepalive = srtla_protocol::create_keepalive_packet(srtla_core::utils::now_ms());
+        packet_tx
+            .send(UplinkPacket {
+                conn_id,
+                bytes: SmallVec::from_slice_copy(&keepalive),
+            })
+            .unwrap();
+        let (instant_tx, _instant_rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = DynamicConfig::new();
+
+        drain_packet_queue(
+            &mut packet_rx,
+            &mut connections,
+            &conn_io,
+            &mut SrtlaRegistrationManager::new(),
+            &instant_tx,
+            &mut ClientDedup::new(),
+            None,
+            &listener,
+            &SequenceTracker::new(),
+            &config.snapshot(),
+            &config,
+        )
+        .await;
+
+        assert!(packet_rx.try_recv().is_err(), "the packet must be consumed");
+        assert!(
+            connections[0].last_received.is_none(),
+            "a retired link was credited with a reply"
+        );
+    }
+
     /// `SO_BINDTODEVICE` — and therefore the whole ADR-003 device-binding
     /// lifecycle — exists only on Linux: `DeviceBinder` is `#[cfg(target_os =
     /// "linux")]`, and `classify_egress_fault` is a no-op stub off Unix. These

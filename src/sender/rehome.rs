@@ -454,6 +454,67 @@ mod tests {
         .await
     }
 
+    /// Stands in for the checked device binder while a link's source is away.
+    struct RefusingRequiredBinder;
+
+    impl crate::net::UplinkBinder for RefusingRequiredBinder {
+        fn requires_checked_device(&self) -> bool {
+            true
+        }
+
+        fn bind(&self, _sock: &socket2::Socket, _ip: IpAddr) -> anyhow::Result<()> {
+            anyhow::bail!("source is not assigned to its device")
+        }
+    }
+
+    /// A required link whose socket cannot be rebuilt during a re-home is
+    /// retired, not left on the socket aimed at the receiver the bond just
+    /// left — and it is repointed, so it returns to the new receiver.
+    #[tokio::test]
+    async fn a_refused_rebuild_on_re_home_retires_the_link_and_repoints_it() {
+        let old = addr(1);
+        let new = addr(9);
+        let mut bond = Bond::new(old).await;
+        // A third link was already retired before the bond died.
+        bond.connections.push(create_test_connection().await);
+        let parked = bond.connections[2].conn_id;
+        bond.conn_io
+            .insert(parked, crate::test_helpers::create_test_conn_io());
+        bond.conn_io.get_mut(&parked).unwrap().remote = old;
+        bond.connections[2].mark_for_recovery();
+        assert!(bond.conn_io.retire(parked));
+        let (refused, kept) = (bond.connections[0].conn_id, bond.connections[1].conn_id);
+        let io = bond.conn_io.get_mut(&refused).unwrap();
+        io.binder = Arc::new(RefusingRequiredBinder);
+        let socket = Arc::downgrade(&io.socket);
+        let (tx, _rx) = create_uplink_channel();
+        crate::sender::uplink::sync_readers(
+            &bond.connections,
+            &bond.conn_io,
+            &mut bond.reader_handles,
+            &tx,
+        )
+        .await;
+        let mut gate = RehomeGate::with_resolver(true, StubResolver::new(vec![Some(vec![new])]));
+
+        assert!(run_try_rehome(&mut bond, &mut gate, now_ms()).await);
+
+        assert!(
+            !bond.conn_io.contains_key(&refused),
+            "socket to the old receiver retained"
+        );
+        assert!(!bond.reader_handles.contains_key(&refused));
+        assert!(socket.upgrade().is_none(), "old socket still open");
+        assert_eq!(bond.conn_io.retired(refused).unwrap().remote, new);
+        assert_eq!(bond.conn_io.get(&kept).unwrap().remote, new);
+        assert_eq!(
+            bond.conn_io.retired(parked).unwrap().remote,
+            new,
+            "an already retired link must return to the new receiver"
+        );
+        assert!(!bond.conn_io.contains_key(&parked));
+    }
+
     #[test]
     fn receiver_moved_needs_every_pinned_address_to_be_gone() {
         // Still listed: not a move.

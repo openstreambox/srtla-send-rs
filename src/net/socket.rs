@@ -128,17 +128,30 @@ impl DeviceBinder {
         sock.bind_device(Some(self.ifname.as_bytes()))
             .with_context(|| format!("bind socket to device {}", self.ifname))?;
         let addr = device_source_addr(ip, &self.ifname, checked)?;
-        sock.bind(&addr.into())
-            .with_context(|| format!("bind socket to {ip} on {}", self.ifname))?;
-        if checked {
-            let local = sock
-                .local_addr()?
-                .as_socket()
-                .context("local address is not IP")?;
-            verify_bound_source(addr, local)?;
-        }
-        Ok(())
+        bind_source(sock, addr, checked.then_some(addr), &self.ifname)
     }
+}
+
+/// `bind(2)` to `addr`; for a required link, then prove the kernel bound exactly
+/// the `mapped` source. The two addresses are the same in production and are
+/// separate parameters only so the proof can be shown to refuse a mismatch.
+#[cfg(target_os = "linux")]
+fn bind_source(
+    sock: &Socket,
+    addr: SocketAddr,
+    mapped: Option<SocketAddr>,
+    ifname: &str,
+) -> Result<()> {
+    sock.bind(&addr.into())
+        .with_context(|| format!("bind socket to {} on {ifname}", addr.ip()))?;
+    if let Some(mapped) = mapped {
+        let local = sock
+            .local_addr()?
+            .as_socket()
+            .context("local address is not IP")?;
+        verify_bound_source(mapped, local)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -190,6 +203,23 @@ mod checked_source_tests {
             )
             .is_err()
         );
+    }
+
+    /// The post-bind proof is part of the bind itself: a socket the kernel
+    /// bound to some other address is refused, not handed to the sender.
+    #[test]
+    fn checked_bind_refuses_a_socket_bound_to_another_source() {
+        let mapped: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let other: SocketAddr = "127.0.0.2:0".parse().unwrap();
+        let socket = || create_uplink_socket(mapped.ip()).unwrap();
+        assert!(bind_source(&socket(), mapped, Some(mapped), "lo").is_ok());
+        let err = bind_source(&socket(), other, Some(mapped), "lo").unwrap_err();
+        assert!(
+            err.to_string().contains("differs from mapped source"),
+            "{err:#}"
+        );
+        // A default (unchecked) device bind proves nothing and is unchanged.
+        assert!(bind_source(&socket(), other, None, "lo").is_ok());
     }
 
     #[test]
