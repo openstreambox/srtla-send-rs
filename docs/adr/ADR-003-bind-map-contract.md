@@ -645,7 +645,9 @@ progress. SIGTERM and SIGINT are honoured during both startup awaits, in every
 mode: the pending read or dial is abandoned, shutdown hooks run and the process
 exits 0 without waiting for a receiver lookup still in flight.
 Required-mode telemetry starts with `disposition.state = pending_apply` before
-the telemetry sink starts, including during the first pair read.
+the telemetry sink starts, including during the first pair read. Its
+`bind_map_status.state` is then `active` with no identity, as in every later
+pending reload: required mode always has a map, so it never reports `absent`.
 
 A required-mode reload reports `disposition.state = pending_apply` until
 application completes. It is not a withdrawal acknowledgement, even when the

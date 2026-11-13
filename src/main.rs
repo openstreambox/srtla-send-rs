@@ -377,7 +377,16 @@ async fn run() -> Result<()> {
     // Create shared stats for telemetry export
     let shared_stats = stats::SharedStats::new();
     if args.require_bind_map {
-        shared_stats.begin_reload_request();
+        // The first document is published before the first pair read. `absent`
+        // means no `--bind-map` was given, which required mode rules out, so it
+        // starts as every later required reload does: `active` with
+        // `pending_apply` and no identity. Nothing is acknowledged by that.
+        use srtla_send::bind_map::{BindMapDisposition, BindMapReport, BindMapStatus};
+        shared_stats.set_bind_map(BindMapReport::new(
+            BindMapStatus::Active,
+            BindMapDisposition::PendingApply,
+            &[],
+        ));
     }
 
     let subscription_hub = subscriptions::SubscriptionHub::new();

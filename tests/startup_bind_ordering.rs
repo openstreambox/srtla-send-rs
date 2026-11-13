@@ -246,6 +246,11 @@ fn sighup_during_strict_startup_is_queued_and_first_document_is_pending() {
         "startup SIGHUP killed sender"
     );
     assert_eq!(first["disposition"]["state"], "pending_apply");
+    // Required mode always has a map, so its first document must not say
+    // `absent`: it reads like every later pending reload, with no identity.
+    assert_eq!(first["bind_map_status"]["state"], "active");
+    assert!(first.get("bind_map_applied").is_none());
+    assert!(first.get("bind_map_pending").is_none());
     let hash = srtla_send::bind_map::IpsFile::from_bytes(b"127.0.0.1")
         .unwrap()
         .sha256()
