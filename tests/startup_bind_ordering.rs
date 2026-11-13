@@ -195,3 +195,65 @@ fn listener_bind_precedes_every_uplink_of_a_multi_link_bond() {
          not hold the local listener closed; logs:\n{logs}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sighup_during_strict_startup_is_queued_and_first_document_is_pending() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("map");
+    let stats = dir.path().join("stats");
+    std::fs::write(&ips, "127.0.0.1").unwrap();
+    let sidecar = |generation, hash: &str| {
+        serde_json::json!({
+            "schema_version":1,"generation":generation,"ips_file_sha256":hash,
+            "links":[{"link_id":"path-a","ip":"127.0.0.1","iface":"lo"}]
+        })
+        .to_string()
+    };
+    std::fs::write(&map, sidecar(1, &"0".repeat(64))).unwrap();
+    for path in [&ips, &map] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut sender = SenderProc::spawn(&[
+        &free_udp_port().to_string(),
+        "127.0.0.1",
+        "9999",
+        ips.to_str().unwrap(),
+        "--bind-map",
+        map.to_str().unwrap(),
+        "--require-bind-map",
+        "--stats-file",
+        stats.to_str().unwrap(),
+        "--stats-file-interval",
+        "50",
+    ]);
+    assert!(sender.wait_for_log(LISTENING_LOG, START_TIMEOUT));
+    thread::sleep(Duration::from_millis(200));
+    let first: serde_json::Value = serde_json::from_slice(&std::fs::read(&stats).unwrap()).unwrap();
+    // Deliver while the mismatched startup pair is still retrying.
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &sender.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        sender.child.try_wait().unwrap().is_none(),
+        "startup SIGHUP killed sender"
+    );
+    assert_eq!(first["disposition"]["state"], "pending_apply");
+    let hash = srtla_send::bind_map::IpsFile::from_bytes(b"127.0.0.1")
+        .unwrap()
+        .sha256()
+        .to_string();
+    std::fs::write(&map, sidecar(2, &hash)).unwrap();
+    assert!(
+        sender.wait_for_log("connection changes applied successfully", START_TIMEOUT),
+        "queued signal lost: {}",
+        sender.logs()
+    );
+}

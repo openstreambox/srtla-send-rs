@@ -127,17 +127,7 @@ impl DeviceBinder {
         // `None` would clear the binding rather than set it.
         sock.bind_device(Some(self.ifname.as_bytes()))
             .with_context(|| format!("bind socket to device {}", self.ifname))?;
-        let mut addr = SocketAddr::new(ip, 0);
-        if checked
-            && let SocketAddr::V6(v6) = &mut addr
-            && v6.ip().is_unicast_link_local()
-        {
-            let name = std::ffi::CString::new(self.ifname.as_str())?;
-            // SAFETY: name is a valid terminated string.
-            let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-            anyhow::ensure!(index != 0, "device disappeared before bind");
-            v6.set_scope_id(index);
-        }
+        let addr = device_source_addr(ip, &self.ifname, checked)?;
         sock.bind(&addr.into())
             .with_context(|| format!("bind socket to {ip} on {}", self.ifname))?;
         if checked {
@@ -145,20 +135,73 @@ impl DeviceBinder {
                 .local_addr()?
                 .as_socket()
                 .context("local address is not IP")?;
-            anyhow::ensure!(
-                local.ip().to_canonical() == ip.to_canonical(),
-                "bound local address differs from mapped source"
-            );
-            if let (SocketAddr::V6(expected), SocketAddr::V6(actual)) = (addr, local)
-                && expected.ip().is_unicast_link_local()
-            {
-                anyhow::ensure!(
-                    expected.scope_id() == actual.scope_id(),
-                    "bound source scope differs"
-                );
-            }
+            verify_bound_source(addr, local)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn device_source_addr(ip: IpAddr, ifname: &str, checked: bool) -> Result<SocketAddr> {
+    let mut addr = SocketAddr::new(ip, 0);
+    if checked
+        && let SocketAddr::V6(v6) = &mut addr
+        && v6.ip().is_unicast_link_local()
+    {
+        let name = std::ffi::CString::new(ifname)?;
+        // SAFETY: name is a valid terminated string.
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        anyhow::ensure!(index != 0, "device disappeared before bind");
+        v6.set_scope_id(index);
+    }
+    Ok(addr)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_bound_source(expected: SocketAddr, actual: SocketAddr) -> Result<()> {
+    anyhow::ensure!(
+        actual.ip().to_canonical() == expected.ip().to_canonical(),
+        "bound local address differs from mapped source"
+    );
+    if let (SocketAddr::V6(expected), SocketAddr::V6(actual)) = (expected, actual)
+        && expected.ip().is_unicast_link_local()
+    {
+        anyhow::ensure!(
+            expected.scope_id() == actual.scope_id(),
+            "bound source scope differs"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod checked_source_tests {
+    use super::*;
+
+    #[test]
+    fn post_bind_check_refuses_wrong_source_and_scope() {
+        let expected = "127.0.0.1:0".parse().unwrap();
+        assert!(verify_bound_source(expected, "127.0.0.2:9000".parse().unwrap()).is_err());
+        assert!(verify_bound_source(expected, "[::ffff:127.0.0.1]:9000".parse().unwrap()).is_ok());
+        assert!(
+            verify_bound_source(
+                "[fe80::1%1]:0".parse().unwrap(),
+                "[fe80::1%2]:9000".parse().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn link_local_bind_address_carries_device_scope() {
+        let addr = device_source_addr("fe80::1".parse().unwrap(), "lo", true).unwrap();
+        let SocketAddr::V6(addr) = addr else {
+            panic!("IPv6 expected")
+        };
+        let index = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+        assert_ne!(index, 0);
+        assert_eq!(addr.scope_id(), index);
+        assert!(device_source_addr("fe80::1".parse().unwrap(), "missing0", true).is_err());
     }
 }
 

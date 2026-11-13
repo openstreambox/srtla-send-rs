@@ -55,13 +55,29 @@ pub async fn handle_housekeeping(
 
     // housekeeping: drive registration, send keepalives
     for (i, conn) in connections.iter_mut().enumerate() {
+        // Source assignment can change without an ifindex change. Required
+        // links must stop using the old socket before this tick sends anything.
+        if let Some(io) = conn_io.get(&conn.conn_id)
+            && io.binder.requires_checked_device()
+            && io.spec.iface.as_ref().is_none_or(|iface| {
+                crate::net::source::require_assigned_source(conn.local_ip, iface.as_str()).is_err()
+            })
+        {
+            warn!(
+                "{}: mapped source unavailable; link down until reload",
+                conn.label
+            );
+            super::uplink::retire_uplink(conn, conn_io, reader_handles, seq_tracker).await;
+            continue;
+        }
+
         // Re-resolve the egress interface by NAME and re-read the route
         // invariant before anything else touches this link's socket. A replug
         // leaves the socket holding an ifindex that no longer names the device,
         // and neither the liveness timeout nor a send error would report it in
         // time. Inert for an unmapped link.
-        if let Some(io) = conn_io.get_mut(&conn.conn_id)
-            && egress_tick::handle_egress(
+        let egress_flow = if let Some(io) = conn_io.get_mut(&conn.conn_id) {
+            egress_tick::handle_egress(
                 conn,
                 io,
                 reader_handles,
@@ -71,8 +87,13 @@ pub async fn handle_housekeeping(
                 current_ms,
             )
             .await
-                == egress_tick::TickFlow::Skip
-        {
+        } else {
+            egress_tick::TickFlow::Continue
+        };
+        if egress_flow == egress_tick::TickFlow::Retire {
+            super::uplink::retire_uplink(conn, conn_io, reader_handles, seq_tracker).await;
+        }
+        if egress_flow != egress_tick::TickFlow::Continue {
             continue;
         }
 
@@ -94,7 +115,16 @@ pub async fn handle_housekeeping(
                             reconnect_uplink(conn, io, receiver_host, seq_tracker, current_ms).await
                         {
                             warn!("{} failed to reconnect: {}", label, e);
-                            // Fall back to recovery if reconnect fails
+                            if io.binder.requires_checked_device() {
+                                super::uplink::retire_uplink(
+                                    conn,
+                                    conn_io,
+                                    reader_handles,
+                                    seq_tracker,
+                                )
+                                .await;
+                                continue;
+                            }
                             recover_connection(conn, seq_tracker);
                         } else {
                             restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx)
@@ -526,6 +556,54 @@ mod tests {
             remotes.sort();
             remotes.dedup();
             remotes
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn checked_source_loss_closes_socket_and_marks_link_down() {
+        for iface in ["missing0", "lo"] {
+            let mut f = RehomeFixture::new(remote(1)).await;
+            f.connections.truncate(1);
+            let id = f.connections[0].conn_id;
+            let io = f.conn_io.get_mut(&id).unwrap();
+            io.binder = std::sync::Arc::new(crate::net::RequiredBinding);
+            // Models an address that remains local but leaves the mapped device.
+            io.spec.iface = Some(crate::bind_map::IfaceName::parse(iface).unwrap());
+            let socket = std::sync::Arc::downgrade(&io.socket);
+            let (tx, _rx) = create_uplink_channel();
+            super::super::uplink::sync_readers(
+                &f.connections,
+                &f.conn_io,
+                &mut f.reader_handles,
+                &tx,
+            )
+            .await;
+            f.keep_all_uplinks_live(1_000_000);
+            if iface == "lo" {
+                recover_connection(&mut f.connections[0], &mut f.seq_tracker);
+                f.connections[0].reconnection.last_reconnect_attempt_ms = 0;
+            }
+            f.tick(&mut RehomeGate::new(false), 1_000_000)
+                .await
+                .unwrap();
+            assert!(!f.conn_io.contains_key(&id), "invalid socket retained");
+            assert!(!f.reader_handles.contains_key(&id));
+            assert!(
+                socket.upgrade().is_none(),
+                "reader still owns invalid socket"
+            );
+            assert!(!f.connections[0].connected);
+            let stats = crate::stats::SharedStats::new();
+            stats.update_with_bind_map(
+                &f.connections,
+                &crate::config::ConfigSnapshot::default(),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(stats.get().active_links, 0);
         }
     }
 

@@ -339,7 +339,12 @@ async fn rehome_bond(
                          reconnect path, which will now dial {new_remote}",
                         conn.label
                     );
-                    recover_connection(conn, seq_tracker);
+                    if io.binder.requires_checked_device() {
+                        super::uplink::retire_uplink(conn, conn_io, reader_handles, seq_tracker)
+                            .await;
+                    } else {
+                        recover_connection(conn, seq_tracker);
+                    }
                 }
             },
             None => {

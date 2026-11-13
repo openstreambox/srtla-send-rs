@@ -132,9 +132,10 @@ impl Survivors {
         let mut by_link_id = HashMap::new();
         let mut by_key = HashMap::new();
         for conn in std::mem::take(connections) {
-            let spec = conn_io
-                .get(&conn.conn_id)
-                .map_or_else(|| UplinkSpec::unmapped(conn.local_ip), |io| io.spec.clone());
+            let Some(io) = conn_io.get(&conn.conn_id) else {
+                continue; // A retired socket must be dialled again on reload.
+            };
+            let spec = io.spec.clone();
             let key = spec.socket_key();
             match spec.link_id {
                 Some(id) => {
