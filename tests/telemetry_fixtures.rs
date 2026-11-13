@@ -32,7 +32,8 @@
 use std::path::PathBuf;
 
 use srtla_send::bind_map::{
-    BindMapDisposition, BindMapReport, BindMapStatus, CollisionGroup, DegradedReason,
+    BindMapDisposition, BindMapIdentity, BindMapReport, BindMapStatus, CollisionGroup,
+    DegradedReason,
 };
 use srtla_send::telemetry_file::{TelemetryConn, TelemetryInputs, build_telemetry_json};
 
@@ -385,13 +386,33 @@ fn a_retired_required_link_keeps_its_identity_and_says_so() {
         binding_state: Some(srtla_send::stats::BindingState::Retired),
         ..conns[1].clone()
     };
-    let produced = document(&conns, &active());
+    // `binding_state` exists only in required mode, whose `mapped` documents
+    // always name the applied map (ADR-003 §9.5): generation 1 over the exact
+    // IP-file bytes of the twin-modem pair.
+    let ips = b"192.168.8.100\n192.168.8.100";
+    let mut report = active();
+    report.bind_map_applied = Some(BindMapIdentity {
+        generation: 1,
+        ips_file_sha256: srtla_send::bind_map::IpsFile::from_bytes(ips)
+            .unwrap()
+            .sha256()
+            .to_string(),
+    });
+    let produced = document(&conns, &report);
     assert_fixture("telemetry-required-retired", &produced);
 
     let doc = value(&produced);
     let rows = doc["connections"].as_array().unwrap();
     // The applied mapping is unchanged by one link being down.
     assert_eq!(doc["disposition"]["state"], "mapped");
+    assert_eq!(doc["bind_map_applied"]["generation"], 1);
+    assert_eq!(
+        doc["bind_map_applied"]["ips_file_sha256"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+    assert!(doc.get("bind_map_pending").is_none());
     assert!(rows[0].get("binding_state").is_none());
     assert_eq!(rows[1]["link_id"], "modem-b");
     assert_eq!(rows[1]["iface"], "wwan1");
