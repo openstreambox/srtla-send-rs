@@ -34,3 +34,6 @@ __pycache__/
 
 # Deterministic sidecar-read scheduling barrier used by Linux process tests.
 !tests/support/bind_map_read_gate.c
+# A receiver lookup that hangs like an unreachable resolver, for the start-up
+# signal tests.
+!tests/support/slow_resolver.c

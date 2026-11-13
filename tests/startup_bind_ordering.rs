@@ -256,4 +256,10 @@ fn sighup_during_strict_startup_is_queued_and_first_document_is_pending() {
         "queued signal lost: {}",
         sender.logs()
     );
+    assert_eq!(
+        sender.logs().matches("received SIGHUP").count(),
+        1,
+        "one start-up SIGHUP is one reload: {}",
+        sender.logs()
+    );
 }

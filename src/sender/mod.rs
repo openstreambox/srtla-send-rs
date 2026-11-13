@@ -150,6 +150,28 @@ pub async fn run_sender_with_config(
     let mut sigint = signal(SignalKind::interrupt())?;
     #[cfg(unix)]
     info!("sender ready for reload signals");
+    // Await one start-up step, unless a termination signal arrives first. Only
+    // SIGTERM/SIGINT are raced: a SIGHUP stays queued in its stream and becomes
+    // exactly one reload once the loop below starts.
+    #[cfg(unix)]
+    macro_rules! startup_step {
+        ($step:expr) => {
+            match until_terminated(&mut sigterm, &mut sigint, $step).await {
+                Ok(done) => done,
+                Err(signal) => {
+                    info!("received {signal} during start-up - shutting down");
+                    on_shutdown.run();
+                    return Ok(());
+                }
+            }
+        };
+    }
+    #[cfg(not(unix))]
+    macro_rules! startup_step {
+        ($step:expr) => {
+            $step.await
+        };
+    }
     let binder: std::sync::Arc<dyn crate::net::UplinkBinder> = if require_bind_map {
         std::sync::Arc::new(crate::net::RequiredBinding)
     } else {
@@ -193,7 +215,13 @@ pub async fn run_sender_with_config(
     // uplinks, start with an EMPTY pool, and wait for a SIGHUP reload. CeraUI
     // writes the IP file and signals the sender only once interfaces appear, so
     // exiting here would crash-loop the device before the first modem is up.
-    let links = match link_source.startup().await {
+    //
+    // Both start-up awaits (this read, and the dial below) are raced against
+    // SIGTERM/SIGINT: a strict pair read can retry for seconds and every uplink
+    // dial may wait on a resolver, and a supervisor that asked the process to
+    // stop must not be kept waiting for either.
+    let links = startup_step!(link_source.startup());
+    let links = match links {
         Ok(links) => links,
         Err(e) => {
             warn!("ips file unreadable at startup ({e:#}); starting with an empty uplink pool");
@@ -214,10 +242,14 @@ pub async fn run_sender_with_config(
 
     // Shell-owned I/O half of every connection, keyed by conn_id (never by
     // index — so no lockstep with the connections vec through add/remove).
-    let mut conn_io: ConnIoMap = std::collections::HashMap::new();
-    let mut connections =
-        create_connections_from_links(&links, receiver_host, receiver_port, &binder, &mut conn_io)
-            .await;
+    let mut conn_io = ConnIoMap::new();
+    let mut connections = startup_step!(create_connections_from_links(
+        &links,
+        receiver_host,
+        receiver_port,
+        &binder,
+        &mut conn_io
+    ));
 
     link_source.finish_apply();
     shared_stats.update_with_bind_map(
@@ -724,6 +756,24 @@ fn link_identities(
             ))
         })
         .collect()
+}
+
+/// Resolve one start-up step, unless SIGTERM or SIGINT arrives first.
+///
+/// Returns the signal's name when it won, and the step is then dropped where it
+/// stands: whatever sockets it had opened close with it.
+#[cfg(unix)]
+async fn until_terminated<T>(
+    sigterm: &mut tokio::signal::unix::Signal,
+    sigint: &mut tokio::signal::unix::Signal,
+    step: impl Future<Output = T>,
+) -> Result<T, &'static str> {
+    tokio::select! {
+        biased;
+        _ = sigterm.recv() => Err("SIGTERM"),
+        _ = sigint.recv() => Err("SIGINT"),
+        done = step => Ok(done),
+    }
 }
 
 pub async fn read_ip_list(path: &str) -> Result<SmallVec<IpAddr, 4>> {

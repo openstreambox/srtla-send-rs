@@ -30,9 +30,14 @@ struct SenderProc {
 
 impl SenderProc {
     fn spawn(args: &[&str]) -> Self {
+        Self::spawn_with_env(args, &[])
+    }
+
+    fn spawn_with_env(args: &[&str], vars: &[(&str, &str)]) -> Self {
         let mut child = Command::new(BIN)
             .args(args)
             .env("RUST_LOG", "info")
+            .envs(vars.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -179,4 +184,208 @@ fn sigterm_exits_cleanly_and_promptly() {
 #[test]
 fn sigint_exits_cleanly_and_promptly() {
     assert_signal_exits_cleanly("INT", 2);
+}
+
+/// Start-up can take seconds before the event loop exists: every uplink dial
+/// waits on the resolver, and a strict pair read retries a mismatched hash. A
+/// stop request must cut through both, run the shutdown hooks and exit 0.
+#[cfg(target_os = "linux")]
+mod during_startup {
+    use super::*;
+
+    const SLOW_HOST: &str = "slow-receiver.invalid";
+    /// Per-lookup hang. Two uplinks make start-up twice this long, far past
+    /// `PROMPT_EXIT`, so a signal that is only noticed afterwards fails.
+    const LOOKUP_HANG_MS: &str = "4000";
+
+    /// A sender whose two uplink dials each hang in the receiver lookup.
+    fn spawn_with_hanging_lookups(dir: &std::path::Path) -> (SenderProc, std::path::PathBuf) {
+        let library = dir.join("slow_resolver.so");
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-O2"])
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/support/slow_resolver.c"
+                ))
+                .args(["-ldl", "-o"])
+                .arg(&library)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let ips = dir.join("ips.txt");
+        let stats = dir.join("stats.json");
+        std::fs::write(&ips, "127.0.0.1\n127.0.0.2\n").expect("write ips file");
+        let proc = SenderProc::spawn_with_env(
+            &[
+                &free_udp_port().to_string(),
+                SLOW_HOST,
+                "9999",
+                ips.to_str().unwrap(),
+                "--stats-file",
+                stats.to_str().unwrap(),
+                "--stats-file-interval",
+                "50",
+            ],
+            &[
+                ("LD_PRELOAD", library.to_str().unwrap()),
+                ("SRTLA_TEST_SLOW_HOST", SLOW_HOST),
+                ("SRTLA_TEST_SLOW_MS", LOOKUP_HANG_MS),
+            ],
+        );
+        (proc, stats)
+    }
+
+    fn wait_for_file(path: &std::path::Path) {
+        let deadline = Instant::now() + START_TIMEOUT;
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_signal_cuts_through_the_dial(sig: &str, signum: u32) {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut proc, stats) = spawn_with_hanging_lookups(dir.path());
+        assert!(proc.wait_for_log("listening for SRT", START_TIMEOUT));
+        assert!(proc.wait_for_handler(signum, START_TIMEOUT));
+        wait_for_file(&stats);
+        // Now inside the first uplink's lookup.
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !proc.logs().contains("uplink"),
+            "the dial finished early; logs:\n{}",
+            proc.logs()
+        );
+
+        let t0 = Instant::now();
+        proc.signal(sig);
+        let code = proc.wait_exit(EXIT_TIMEOUT);
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            code,
+            Some(0),
+            "SIG{sig} must exit 0; logs:\n{}",
+            proc.logs()
+        );
+        assert!(
+            elapsed < PROMPT_EXIT,
+            "SIG{sig} during the start-up dial must exit promptly (< {PROMPT_EXIT:?}); took \
+             {elapsed:?}; logs:\n{}",
+            proc.logs()
+        );
+        assert!(
+            !stats.exists(),
+            "the shutdown hook must unlink the stats file"
+        );
+    }
+
+    #[test]
+    fn sigterm_during_the_startup_dial_exits_cleanly_and_promptly() {
+        assert_signal_cuts_through_the_dial("TERM", 15);
+    }
+
+    #[test]
+    fn sigint_during_the_startup_dial_exits_cleanly_and_promptly() {
+        assert_signal_cuts_through_the_dial("INT", 2);
+    }
+
+    /// The other start-up await: a strict pair read whose hash does not match
+    /// retries for two seconds.
+    #[test]
+    fn sigterm_during_the_strict_startup_read_exits_cleanly_and_promptly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ips = dir.path().join("ips");
+        let map = dir.path().join("map");
+        let stats = dir.path().join("stats.json");
+        std::fs::write(&ips, "127.0.0.1").unwrap();
+        std::fs::write(
+            &map,
+            serde_json::json!({
+                "schema_version":1,"generation":1,"ips_file_sha256":"0".repeat(64),
+                "links":[{"link_id":"path-a","ip":"127.0.0.1","iface":"lo"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for path in [&ips, &map] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut proc = SenderProc::spawn(&[
+            &free_udp_port().to_string(),
+            "127.0.0.1",
+            "9999",
+            ips.to_str().unwrap(),
+            "--bind-map",
+            map.to_str().unwrap(),
+            "--require-bind-map",
+            "--stats-file",
+            stats.to_str().unwrap(),
+            "--stats-file-interval",
+            "50",
+        ]);
+        assert!(proc.wait_for_log("listening for SRT", START_TIMEOUT));
+        assert!(proc.wait_for_handler(15, START_TIMEOUT));
+        wait_for_file(&stats);
+
+        let t0 = Instant::now();
+        proc.signal("TERM");
+        let code = proc.wait_exit(EXIT_TIMEOUT);
+        let elapsed = t0.elapsed();
+
+        assert_eq!(code, Some(0), "logs:\n{}", proc.logs());
+        // Half the retry budget: an exit that waited the read out is too late.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "SIGTERM during the strict start-up read took {elapsed:?}; logs:\n{}",
+            proc.logs()
+        );
+        assert!(
+            !proc.logs().contains("bind-map degraded"),
+            "the read was waited out; logs:\n{}",
+            proc.logs()
+        );
+        assert!(
+            !stats.exists(),
+            "the shutdown hook must unlink the stats file"
+        );
+    }
+
+    /// Racing the dial against termination must not cost a reload: a SIGHUP
+    /// that lands in the same window stays queued and is served exactly once.
+    #[test]
+    fn sighup_during_the_startup_dial_queues_exactly_one_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut proc, _stats) = spawn_with_hanging_lookups(dir.path());
+        assert!(proc.wait_for_log("listening for SRT", START_TIMEOUT));
+        assert!(proc.wait_for_handler(1, START_TIMEOUT));
+        thread::sleep(Duration::from_millis(300));
+        proc.signal("HUP");
+
+        // Both start-up dials hang first; the queued reload comes after them.
+        assert!(
+            proc.wait_for_log("received SIGHUP", Duration::from_secs(15)),
+            "queued SIGHUP lost; logs:\n{}",
+            proc.logs()
+        );
+        thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            proc.logs().matches("received SIGHUP").count(),
+            1,
+            "logs:\n{}",
+            proc.logs()
+        );
+        assert!(
+            matches!(proc.child.try_wait(), Ok(None)),
+            "sender died; logs:\n{}",
+            proc.logs()
+        );
+    }
 }

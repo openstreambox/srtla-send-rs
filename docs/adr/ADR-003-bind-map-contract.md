@@ -620,7 +620,10 @@ closes the old socket, joins its reader and marks the connection down until a
 reload can recreate it.
 
 Signal streams are registered before the first startup await. A startup
-SIGHUP queues a reload even while pair validation or dialling is in progress.
+SIGHUP queues exactly one reload even while pair validation or dialling is in
+progress. SIGTERM and SIGINT are honoured during both startup awaits, in every
+mode: the pending read or dial is abandoned, shutdown hooks run and the process
+exits 0 without waiting for a receiver lookup still in flight.
 Required-mode telemetry starts with `disposition.state = pending_apply` before
 the telemetry sink starts, including during the first pair read.
 

@@ -241,8 +241,22 @@ fn warn_if_not_loopback(what: &str, addr: std::net::SocketAddr) {
 }
 
 #[cfg(not(loom))]
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("start the async runtime")?;
+    let outcome = runtime.block_on(run());
+    // Dropping the runtime would wait for its blocking pool, and a receiver
+    // lookup stuck on an unreachable resolver sits there for seconds. Once the
+    // sender has returned, its shutdown hooks have run and nothing is left to
+    // wait for, so a stop request is honoured now rather than after the lookup.
+    runtime.shutdown_background();
+    outcome
+}
+
+#[cfg(not(loom))]
+async fn run() -> Result<()> {
     let matches = Cli::command().get_matches();
     let mut args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 

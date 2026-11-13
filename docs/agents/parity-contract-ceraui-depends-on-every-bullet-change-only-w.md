@@ -119,7 +119,9 @@
   immediately after spawn with no readiness handshake. Never move the bind below uplink
   setup. `tests/startup_bind_ordering.rs`.
 - **Clean shutdown (`SIGTERM`/`SIGINT`)** exits `0` well inside CeraUI's 10 s SIGKILL
-  window and unlinks the stats file. `tests/signal_parity.rs`.
+  window and unlinks the stats file. `tests/signal_parity.rs`. This holds during
+  start-up too: the pair read and the uplink dial are both raced against the two
+  signals, and exit does not wait for a receiver lookup. `tests/signal_shutdown.rs`.
 - **NAT-keepalive control padding.** Every control-plane send (keepalive, REG1/REG2)
   is zero-padded to at least `MIN_CONTROL_PKT_LEN = 32` bytes
   (`crates/srtla-protocol/src/constants.rs`, applied in `src/sender/uplink.rs`), parity
