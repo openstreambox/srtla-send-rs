@@ -362,6 +362,9 @@ async fn main() -> Result<()> {
 
     // Create shared stats for telemetry export
     let shared_stats = stats::SharedStats::new();
+    if args.require_bind_map {
+        shared_stats.begin_reload_request();
+    }
 
     let subscription_hub = subscriptions::SubscriptionHub::new();
 

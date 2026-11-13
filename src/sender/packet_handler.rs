@@ -231,6 +231,10 @@ pub async fn drain_packet_queue(
     while processed < MAX_DRAIN_PACKETS {
         match packet_rx.try_recv() {
             Ok(packet) => {
+                processed += 1;
+                if !conn_io.contains_key(&packet.conn_id) {
+                    continue;
+                }
                 handle_uplink_packet(
                     packet,
                     connections,
@@ -245,7 +249,6 @@ pub async fn drain_packet_queue(
                     config,
                 )
                 .await;
-                processed += 1;
             }
             Err(_) => break, // No more packets available
         }

@@ -210,6 +210,29 @@ pub async fn restart_reader_for(
     );
 }
 
+/// Strict apply drains even surviving readers before replacing any sockets.
+pub async fn drain_readers(readers: &mut HashMap<ConnectionId, ReaderHandle>) {
+    for (_, reader) in readers.drain() {
+        reader.handle.abort();
+        let _ = reader.handle.await;
+    }
+}
+
+/// Remove every owner of an unusable socket before any later send or snapshot.
+pub async fn retire_uplink(
+    conn: &mut SrtlaConnection,
+    conn_io: &mut ConnIoMap,
+    readers: &mut HashMap<ConnectionId, ReaderHandle>,
+    seq_tracker: &mut super::sequence::SequenceTracker,
+) {
+    super::connections::recover_connection(conn, seq_tracker);
+    conn_io.remove(&conn.conn_id);
+    if let Some(reader) = readers.remove(&conn.conn_id) {
+        reader.handle.abort();
+        let _ = reader.handle.await;
+    }
+}
+
 pub fn create_uplink_channel() -> (
     UnboundedSender<UplinkPacket>,
     UnboundedReceiver<UplinkPacket>,
@@ -222,21 +245,28 @@ mod reader_retirement_tests {
     use super::*;
     #[tokio::test]
     async fn removing_a_reader_joins_its_socket_owner_before_returning() {
-        use crate::net::{SourceIpBinder, UplinkBinder, create_uplink_socket};
-        let ip = "127.0.0.1".parse().unwrap();
-        let sock = create_uplink_socket(ip).unwrap();
-        SourceIpBinder.bind(&sock, ip).unwrap();
-        let socket = Arc::new(BatchUdpSocket::new(sock, "127.0.0.1:9".parse().unwrap()).unwrap());
-        let weak = Arc::downgrade(&socket);
-        let (tx, _rx) = create_uplink_channel();
-        let mut readers = HashMap::new();
-        readers.insert(1, spawn_reader(1, "path-a".into(), socket, tx.clone()));
-        tokio::task::yield_now().await;
-        sync_readers(&[], &HashMap::new(), &mut readers, &tx).await;
-        assert!(readers.is_empty());
-        assert!(
-            weak.upgrade().is_none(),
-            "cancelled reader still owns the socket"
-        );
+        for strict in [false, true] {
+            use crate::net::{SourceIpBinder, UplinkBinder, create_uplink_socket};
+            let ip = "127.0.0.1".parse().unwrap();
+            let sock = create_uplink_socket(ip).unwrap();
+            SourceIpBinder.bind(&sock, ip).unwrap();
+            let socket =
+                Arc::new(BatchUdpSocket::new(sock, "127.0.0.1:9".parse().unwrap()).unwrap());
+            let weak = Arc::downgrade(&socket);
+            let (tx, _rx) = create_uplink_channel();
+            let mut readers = HashMap::new();
+            readers.insert(1, spawn_reader(1, "path-a".into(), socket, tx.clone()));
+            tokio::task::yield_now().await;
+            if strict {
+                drain_readers(&mut readers).await;
+            } else {
+                sync_readers(&[], &HashMap::new(), &mut readers, &tx).await;
+            }
+            assert!(readers.is_empty());
+            assert!(
+                weak.upgrade().is_none(),
+                "cancelled reader still owns the socket"
+            );
+        }
     }
 }

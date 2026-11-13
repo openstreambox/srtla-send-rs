@@ -600,6 +600,9 @@ broadcast and multicast addresses are rejected, including IPv4-mapped IPv6
 spellings. Directed IPv4 broadcasts are rejected using the selected device's
 current address/netmask where available; /31 and /32 have no directed broadcast.
 IPv6 has no broadcast; its multicast addresses are rejected.
+Required-mode uniqueness uses `(canonical IP, device)`, so IPv4 and its
+IPv4-mapped IPv6 spelling cannot create two sockets on the same device.
+Published row spellings and the exact IP-file digest remain intact.
 
 Dry-run and socket creation also require the source to be assigned to the
 selected device. Private addresses, loopback and link-local unicast are allowed
@@ -611,7 +614,15 @@ and cannot prove runtime permissions or future interface state. Existing
 non-required binders keep their behavior. Required sends use a canonical IPv4
 sockaddr for an IPv4-mapped receiver address, at initial creation and socket
 rebuild; the original receiver identity is retained for DNS/re-home checks.
-Native IPv6 receiver addresses retain their scope.
+Native IPv6 receiver addresses retain their scope. Housekeeping checks source
+assignment before sending. A lost assignment or failed checked socket rebuild
+closes the old socket, joins its reader and marks the connection down until a
+reload can recreate it.
+
+Signal streams are registered before the first startup await. A startup
+SIGHUP queues a reload even while pair validation or dialling is in progress.
+Required-mode telemetry starts with `disposition.state = pending_apply` before
+the telemetry sink starts, including during the first pair read.
 
 A required-mode reload reports `disposition.state = pending_apply` until
 application completes. It is not a withdrawal acknowledgement, even when the

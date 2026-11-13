@@ -257,3 +257,22 @@ async fn a_freshly_serialized_old_snapshot_cannot_acknowledge_a_new_publication(
             .generation
     );
 }
+
+#[tokio::test]
+async fn strict_duplicate_check_uses_canonical_source_and_device() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path(), "127.0.0.1", 1);
+    let bytes = b"127.0.0.1\n::ffff:127.0.0.1";
+    std::fs::write(dir.path().join("ips"), bytes).unwrap();
+    let map = serde_json::json!({"schema_version":1,"generation":1,
+        "ips_file_sha256":IpsFile::from_bytes(bytes).unwrap().sha256(),
+        "links":[{"link_id":"a","ip":"127.0.0.1","iface":"lo"},
+                 {"link_id":"b","ip":"::ffff:127.0.0.1","iface":"lo"}]});
+    std::fs::write(dir.path().join("map"), map.to_string()).unwrap();
+    let pair = read(dir.path()).await;
+    assert!(
+        pair.map
+            .and_then(srtla_send::bind_map::validate_required_pool)
+            .is_err()
+    );
+}

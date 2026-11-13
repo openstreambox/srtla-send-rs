@@ -112,7 +112,15 @@ pub fn validate_required_pool(pool: MappedPool) -> Result<MappedPool, BindMapErr
             detail: "required binding needs a positive safe-integer generation".into(),
         });
     }
+    let mut sources = std::collections::HashSet::new();
     for (index, row) in pool.rows.iter().enumerate() {
+        if !sources.insert((row.ip.to_canonical(), row.iface.clone())) {
+            return Err(BindMapError::DuplicatePair {
+                index,
+                ip: row.ip,
+                iface: row.iface.as_str().to_string(),
+            });
+        }
         crate::net::source::validate_source(row.ip, row.iface.as_str()).map_err(|err| {
             BindMapError::InvalidRow {
                 index,

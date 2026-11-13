@@ -28,6 +28,7 @@ use crate::net::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickFlow {
     Continue,
+    Retire,
     /// The link was removed or rebound; keepalives and registration would act on
     /// a socket that is gone or brand new.
     Skip,
@@ -75,6 +76,9 @@ pub async fn handle_egress(
     if let Err(e) = reconnect_uplink(conn, io, receiver_host, seq_tracker, now_ms).await {
         warn!("{label}: failed to rebind after an egress fault: {e}");
         recover_connection(conn, seq_tracker);
+        if io.binder.requires_checked_device() {
+            return TickFlow::Retire;
+        }
     } else {
         restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx).await;
     }

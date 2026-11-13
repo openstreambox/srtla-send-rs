@@ -137,6 +137,19 @@ pub async fn run_sender_with_config(
     binder: std::sync::Arc<dyn crate::net::UplinkBinder>,
     mut on_shutdown: ShutdownHooks,
 ) -> Result<()> {
+    // Prepare SIGHUP stream (Unix only) or a never-completing future (non-Unix)
+    #[cfg(unix)]
+    let mut sighup = signal(SignalKind::hangup())?;
+    // SIGTERM/SIGINT drive a graceful `Ok(())` return so the process exits 0
+    // well inside CeraUI's 10s SIGKILL window and any registered shutdown hooks
+    // (the `--stats-file` unlink, a later port) run instead of being skipped by
+    // an abrupt default-action kill.
+    #[cfg(unix)]
+    let mut sigterm = signal(SignalKind::terminate())?;
+    #[cfg(unix)]
+    let mut sigint = signal(SignalKind::interrupt())?;
+    #[cfg(unix)]
+    info!("sender ready for reload signals");
     let binder: std::sync::Arc<dyn crate::net::UplinkBinder> = if require_bind_map {
         std::sync::Arc::new(crate::net::RequiredBinding)
     } else {
@@ -289,19 +302,6 @@ pub async fn run_sender_with_config(
     // multiplier and in-flight cap; `loss_degraded` feeds the loss gate.
     let mut link_cc_controller = srtla_core::selection::link_cc::LinkCcController::new();
 
-    // Prepare SIGHUP stream (Unix only) or a never-completing future (non-Unix)
-    #[cfg(unix)]
-    let mut sighup = signal(SignalKind::hangup())?;
-    // SIGTERM/SIGINT drive a graceful `Ok(())` return so the process exits 0
-    // well inside CeraUI's 10s SIGKILL window and any registered shutdown hooks
-    // (the `--stats-file` unlink, a later port) run instead of being skipped by
-    // an abrupt default-action kill.
-    #[cfg(unix)]
-    let mut sigterm = signal(SignalKind::terminate())?;
-    #[cfg(unix)]
-    let mut sigint = signal(SignalKind::interrupt())?;
-    #[cfg(unix)]
-    info!("sender ready for reload signals");
     // Answers from the off-loop ADR-003 pair read a SIGHUP spawns.
     #[cfg(unix)]
     let (bind_map_tx, mut bind_map_rx) =
@@ -387,6 +387,9 @@ pub async fn run_sender_with_config(
                     packet = packet_rx.recv() => {
                         let config_snap = config.snapshot();
                         if let Some(packet) = packet {
+                            if !conn_io.contains_key(&packet.conn_id) {
+                                continue;
+                            }
                             handle_uplink_packet(
                                 packet,
                                 &mut connections,
@@ -438,19 +441,15 @@ pub async fn run_sender_with_config(
 
                         let mut applied_bind_map_report = None;
                         let mut applied_bind_map_request = None;
-                        if let Some(changes) = pending_changes.take()
+                        if let Some(changes) = take_current_changes(&mut pending_changes, require_bind_map, pending_bind_map_request, &shared_stats)
                             && let Some(new_links) = changes.new_links
-                            && (!require_bind_map || pending_bind_map_request == Some(shared_stats.current_reload_request()))
                         {
                             shared_stats.observe_connection_bytes(&connections);
                             info!("applying queued connection changes: {} uplinks", new_links.len());
                             if require_bind_map {
                                 // Abort AND join: abort alone leaves reader-owned socket
                                 // Arcs alive until cancellation is polled.
-                                for (_, reader) in reader_handles.drain() {
-                                    reader.handle.abort();
-                                    let _ = reader.handle.await;
-                                }
+                                uplink::drain_readers(&mut reader_handles).await;
                             }
                             apply_connection_changes(
                                 &mut connections,
@@ -809,5 +808,51 @@ mod shutdown_hook_tests {
             1,
             "an explicit run drains the set, so Drop must not run the hook again"
         );
+    }
+}
+
+/// Discard a superseded queued apply before it can open or retire sockets.
+fn take_current_changes(
+    pending: &mut Option<PendingConnectionChanges>,
+    required: bool,
+    request: Option<u64>,
+    stats: &SharedStats,
+) -> Option<PendingConnectionChanges> {
+    let changes = pending.take()?;
+    if required && request != Some(stats.current_reload_request()) {
+        return None;
+    }
+    Some(changes)
+}
+
+#[cfg(test)]
+mod queued_apply_tests {
+    use super::*;
+
+    #[test]
+    fn superseded_apply_is_discarded_before_socket_changes() {
+        let stats = SharedStats::new();
+        let old = stats.begin_reload_request();
+        stats.begin_reload_request();
+        let queued = || {
+            Some(PendingConnectionChanges {
+                new_links: Some(SmallVec::new()),
+                receiver_host: "127.0.0.1".into(),
+                receiver_port: 9,
+            })
+        };
+        let mut pending = queued();
+        assert!(take_current_changes(&mut pending, true, Some(old), &stats).is_none());
+        assert!(pending.is_none());
+        assert!(
+            take_current_changes(
+                &mut queued(),
+                true,
+                Some(stats.current_reload_request()),
+                &stats
+            )
+            .is_some()
+        );
+        assert!(take_current_changes(&mut queued(), false, None, &stats).is_some());
     }
 }
