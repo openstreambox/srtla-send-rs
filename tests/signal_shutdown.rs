@@ -69,6 +69,17 @@ impl SenderProc {
         self.logs.lock().unwrap().clone()
     }
 
+    fn wait_for_log_count(&self, needle: &str, count: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.logs().matches(needle).count() >= count {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
     fn wait_for_log(&self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -184,6 +195,61 @@ fn sigterm_exits_cleanly_and_promptly() {
 #[test]
 fn sigint_exits_cleanly_and_promptly() {
     assert_signal_exits_cleanly("INT", 2);
+}
+
+/// A supervisor may signal a reload the moment it has spawned the sender, before
+/// the runtime has registered any handler. That SIGHUP must not kill it, and
+/// once start-up is done a SIGHUP is still served.
+///
+/// The window is held open deterministically: `--config` names a FIFO, and
+/// reading it blocks before any handler is registered until the test writes.
+#[test]
+fn a_sighup_before_the_handlers_exist_does_not_kill_the_sender() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips.txt");
+    std::fs::write(&ips, "127.0.0.1\n").expect("write ips file");
+    let config = dir.path().join("config.toml");
+    let fifo = std::ffi::CString::new(config.to_str().unwrap()).unwrap();
+    // SAFETY: a valid terminated path; mkfifo only creates the node.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+    let port = free_udp_port().to_string();
+    let mut proc = SenderProc::spawn(&[
+        port.as_str(),
+        "127.0.0.1",
+        "9999",
+        ips.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    // Blocked opening the FIFO: no reader handler exists yet.
+    thread::sleep(Duration::from_millis(300));
+    proc.signal("HUP");
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        matches!(proc.child.try_wait(), Ok(None)),
+        "a SIGHUP before the handlers were registered killed the sender; logs:\n{}",
+        proc.logs()
+    );
+
+    // Release start-up with an empty configuration.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&config)
+        .and_then(|mut f| f.write_all(b""))
+        .expect("write the FIFO");
+    assert!(proc.wait_for_log("sender ready for reload signals", START_TIMEOUT));
+    assert!(proc.wait_for_log("listening for SRT", START_TIMEOUT));
+    // The early signal preceded the start-up read, so it owes no reload.
+    assert_eq!(proc.logs().matches("received SIGHUP").count(), 0);
+    proc.signal("HUP");
+    assert!(
+        proc.wait_for_log_count("received SIGHUP", 1, START_TIMEOUT),
+        "a SIGHUP after start-up was not served; logs:\n{}",
+        proc.logs()
+    );
+    proc.signal("TERM");
+    assert_eq!(proc.wait_exit(EXIT_TIMEOUT), Some(0));
 }
 
 /// Start-up can take seconds before the event loop exists: every uplink dial

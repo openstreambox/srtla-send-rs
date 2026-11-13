@@ -240,6 +240,7 @@ The control dialect is upstream's JSON-RPC 2.0 exactly as documented in [docs/CO
 - A missing, empty, or all-invalid `BIND_IPS_FILE` at startup is not fatal: the sender starts with no uplinks and waits for a `SIGHUP`.
 - A `SIGHUP` reload that resolves to zero valid source IPs is refused with a specific log line and the existing links keep running.
 - `SIGTERM`/`SIGINT` exit `0` promptly and remove the stats file, including while start-up is still reading the bind-map or dialing uplinks.
+- A `SIGHUP` that arrives after `main` has started but before the sender has registered its handlers is ignored instead of killing it; start-up then reads the current files.
 - Control-plane frames (keepalive, REG1/REG2) are zero-padded to at least 32 bytes so carrier NATs do not drop them. Data is never padded.
 
 ### CI and packaging

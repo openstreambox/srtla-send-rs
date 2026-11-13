@@ -27,6 +27,8 @@ CI run does not prove the privileged topology. Run them only through
 gate: it needs only root and iproute2 (no `sudo`, no receiver binaries), builds
 two namespaces joined by veth pairs, and self-skips otherwise. Run it as root,
 for example in a privileged container; it takes about 30 s.
+`tests/signal_shutdown.rs` and `tests/signal_parity.rs` build small C shims
+with `cc` and load them through glibc `LD_PRELOAD`; those cases need both.
 
 `netns_stall_gate` injects sequenced SRT DATA at 2000 packets/s, continuing sequence
 numbers across its unchanged 2/3/8-second phases. Unsequenced payload cannot build

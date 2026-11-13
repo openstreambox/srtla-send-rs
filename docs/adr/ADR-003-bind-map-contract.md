@@ -639,9 +639,13 @@ without a reload. A reload that still lists a retired link keeps it and makes
 its next retry due at once; one that no longer lists it drops it. A whole-bond
 re-home repoints retired links with the rest.
 
-Signal streams are registered before the first startup await. A startup
-SIGHUP queues exactly one reload even while pair validation or dialling is in
-progress. SIGTERM and SIGINT are honoured during both startup awaits, in every
+SIGHUP is ignored from the first statement of `main` until the signal streams
+are registered, which happens before the first startup await. A SIGHUP in that
+early window is dropped rather than fatal: it precedes the startup read of the
+IP list and bind-map, which therefore sees files at least as new as the
+signal. Only the dynamic loader's time before `main` remains exposed. A
+SIGHUP after registration queues exactly one reload even while pair
+validation or dialling is in progress. SIGTERM and SIGINT are honoured during both startup awaits, in every
 mode: the pending read or dial is abandoned, shutdown hooks run and the process
 exits 0 without waiting for a receiver lookup still in flight.
 Required-mode telemetry starts with `disposition.state = pending_apply` before

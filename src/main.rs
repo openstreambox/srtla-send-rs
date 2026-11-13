@@ -242,6 +242,20 @@ fn warn_if_not_loopback(what: &str, addr: std::net::SocketAddr) {
 
 #[cfg(not(loom))]
 fn main() -> Result<()> {
+    // A supervisor may send SIGHUP the moment it has spawned the sender, before
+    // the runtime exists to register a handler, and the default action would
+    // kill the process. Ignore it until the sender registers its own handler,
+    // which replaces this disposition. Nothing is lost: every SIGHUP in that
+    // window precedes the start-up read of the IP list and bind-map, which runs
+    // after registration and so sees files at least as new as the signal.
+    // SIGHUP stays ignored for `--dry-run` and `--capabilities-json`, which
+    // never register a handler.
+    // SAFETY: called first, before any thread exists; SIG_IGN is a valid
+    // disposition and no handler code is installed.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

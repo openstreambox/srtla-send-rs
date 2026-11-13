@@ -122,6 +122,8 @@
   window and unlinks the stats file. `tests/signal_parity.rs`. This holds during
   start-up too: the pair read and the uplink dial are both raced against the two
   signals, and exit does not wait for a receiver lookup. `tests/signal_shutdown.rs`.
+  SIGHUP is ignored from the first statement of `main` until the handlers are
+  registered, so an early reload signal cannot kill the sender.
 - **NAT-keepalive control padding.** Every control-plane send (keepalive, REG1/REG2)
   is zero-padded to at least `MIN_CONTROL_PKT_LEN = 32` bytes
   (`crates/srtla-protocol/src/constants.rs`, applied in `src/sender/uplink.rs`), parity
