@@ -469,10 +469,15 @@ async fn run() -> Result<()> {
     .await
     .context("srtla_send failed");
 
-    // Dropping the writer joins its thread, which drains any pending snapshot
-    // and then unlinks the live file and its `.tmp` sibling. Holding it until
-    // here makes that the LAST filesystem action of the process, so the unlink
-    // cannot be undone by a publish that was already in flight.
+    // Closing the writer joins its thread, which drains any pending snapshot
+    // and then unlinks the live file and its `.tmp` sibling. Doing it here makes
+    // that the LAST filesystem action of the process, so the unlink cannot be
+    // undone by a publish that was already in flight. It is an explicit close,
+    // not a drop: the publisher task may hold the last reference at this
+    // moment, and `main` does not wait for runtime tasks once this returns.
+    if let Some(writer) = &telemetry {
+        writer.close();
+    }
     drop(telemetry);
     outcome
 }

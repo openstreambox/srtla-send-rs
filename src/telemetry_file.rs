@@ -139,7 +139,8 @@ fn writer_loop(
 pub struct TelemetryWriter {
     slot: Slot,
     shutdown: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    /// Taken by whichever [`close`](TelemetryWriter::close) runs first.
+    handle: Mutex<Option<JoinHandle<()>>>,
     period: Duration,
     path: PathBuf,
 }
@@ -174,7 +175,7 @@ impl TelemetryWriter {
         Ok(Self {
             slot,
             shutdown,
-            handle: Some(handle),
+            handle: Mutex::new(Some(handle)),
             period: Duration::from_millis(interval_ms.max(1)),
             path,
         })
@@ -206,22 +207,38 @@ impl TelemetryWriter {
         }
         cvar.notify_one();
     }
-}
 
-impl Drop for TelemetryWriter {
-    fn drop(&mut self) {
+    /// Stop the writer thread and wait for it: it drains a final snapshot and
+    /// unlinks the live file and its `.tmp` sibling before this returns.
+    ///
+    /// Callable from any owner, any number of times. The process calls it on
+    /// its way out rather than relying on the last `Arc` to drop, because that
+    /// last owner can be the publisher task, and a runtime that is shutting
+    /// down need not run that task to completion. Later publishes write nothing.
+    pub fn close(&self) {
         // Signal shutdown under the mutex so the writer thread can never miss the
         // wakeup (it re-checks the flag inside the same critical section it waits
-        // in), then join: the thread drains a final snapshot and unlinks the file.
+        // in), then join.
         let (lock, cvar) = &*self.slot;
         {
             let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
             self.shutdown.store(true, Ordering::SeqCst);
         }
         cvar.notify_one();
-        if let Some(handle) = self.handle.take() {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
             let _ = handle.join();
         }
+    }
+}
+
+impl Drop for TelemetryWriter {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -370,6 +387,36 @@ mod tests {
     }
 
     // ---- Opt-in + unlink-on-exit semantics -------------------------------
+
+    /// The publisher task briefly holds its own reference while it builds a
+    /// snapshot. If the process's reference goes first, cleanup must not wait
+    /// for that task, which a shutting-down runtime may never run again:
+    /// `close` finishes it from any owner, and later publishes write nothing.
+    #[test]
+    fn close_unlinks_the_file_while_another_owner_still_holds_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats.json");
+        let writer = Arc::new(TelemetryWriter::new(&path, 1).unwrap());
+        writer.publish_prebuilt(&doc(1, &[sample_conn()]));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "first snapshot never written");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let publisher = writer.clone();
+
+        writer.close();
+
+        assert!(!path.exists(), "close must unlink the live file");
+        assert!(!tmp_path(&path).exists());
+        publisher.publish_prebuilt(&doc(2, &[sample_conn()]));
+        thread::sleep(Duration::from_millis(20));
+        assert!(!path.exists(), "a publish after close recreated the file");
+        writer.close();
+        drop(writer);
+        drop(publisher);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn constructing_writer_creates_no_file() -> anyhow::Result<()> {
