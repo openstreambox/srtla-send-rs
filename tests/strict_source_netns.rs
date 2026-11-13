@@ -534,3 +534,41 @@ fn a_required_link_goes_down_with_its_source_and_returns_with_it() {
         "sender died:\n{logs}"
     );
 }
+
+/// The same loss, but before the map is applied: link a's address is missing
+/// when the sender starts. It must be reported under its identity, send
+/// nothing, and come up by itself when the address appears.
+#[test]
+fn a_required_link_whose_source_is_missing_at_start_up_comes_up_with_it() {
+    let _serial = serial();
+    if !can_build_namespaces() {
+        eprintln!("Skipping: needs root and iproute2 to build network namespaces");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let topology = Topology::build();
+    let receiver = Receiver::start(&topology.receiver);
+    topology.unassign(0, "v0");
+    let mut sender = Sender::start(&topology.sender, dir.path());
+    sender.wait("link b registered", Duration::from_secs(20), |sender| {
+        sender.carries_traffic("b")
+    });
+    assert_retired_and_silent(
+        &topology,
+        &receiver,
+        &sender,
+        "missing at start-up",
+        Duration::from_secs(3),
+    );
+    topology.assign(0, "v0");
+    assert_returns(&receiver, &sender, "missing at start-up");
+    let logs = sender.logs();
+    assert!(
+        !logs.contains("received SIGHUP"),
+        "no reload was sent:\n{logs}"
+    );
+    assert!(
+        matches!(sender.child.try_wait(), Ok(None)),
+        "sender died:\n{logs}"
+    );
+}

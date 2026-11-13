@@ -132,6 +132,13 @@ impl ConnIoMap {
         true
     }
 
+    /// Park a link that never had a socket: a required row whose first checked
+    /// bind was refused. It is then retried like any retired link.
+    pub fn park(&mut self, conn_id: ConnectionId, uplink: RetiredUplink) {
+        self.live.remove(&conn_id);
+        self.retired.insert(conn_id, uplink);
+    }
+
     #[must_use]
     pub fn is_retired(&self, conn_id: ConnectionId) -> bool {
         self.retired.contains_key(&conn_id)

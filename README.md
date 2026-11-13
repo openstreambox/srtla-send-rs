@@ -533,10 +533,11 @@ Required sources must be assigned unicast addresses on the selected device;
 broadcast/multicast sources are refused, including mapped representations.
 During required reload application, `pending_apply` is not a withdrawal receipt.
 Empty `active` / `mapped` is published only after owned uplink sockets close.
-A required link whose source leaves its device is retired within 200 ms: no
-socket, nothing sent, and its telemetry row keeps `link_id`/`iface` and adds
-`binding_state: "retired"`. It returns by itself once the source is back on
-that device; no `SIGHUP` is needed. See ADR-003 §9.4.
+A required link whose source is not on its device is retired within 200 ms,
+including a row whose source is missing when the map is applied: no socket,
+nothing sent, and its telemetry row keeps `link_id`/`iface` and adds
+`binding_state: "retired"`. It comes up by itself once the source is on that
+device; no `SIGHUP` is needed. See ADR-003 §9.4.
 
 To rely on assigned-unicast sources and completed teardown acknowledgements,
 also require integer `capabilities.bind_map_contract >= 2`. Earlier binaries

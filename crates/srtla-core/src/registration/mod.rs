@@ -482,6 +482,36 @@ impl SrtlaRegistrationManager {
         None
     }
 
+    /// Keep the group registration off links that cannot transmit.
+    ///
+    /// The shell owns the sockets, so it says which link indices can send. A
+    /// REG1 aimed at one that cannot (a required link parked without a socket)
+    /// never leaves the host: it would hold the single handshake slot for
+    /// `REG2_TIMEOUT` and then clear the target, leaving registration waiting
+    /// for a REG_NGP that may never come. Such a pending REG1 is released, and
+    /// the target moves to the first link that can send. With none, the target
+    /// stays put so the link gets its REG1 as soon as it has a socket again.
+    /// Inert once any link is registered, and when every link can send.
+    pub fn retarget_reg1(&mut self, connection_count: usize, can_send: impl Fn(usize) -> bool) {
+        if self.active_connections > 0 {
+            return;
+        }
+        if self.pending_reg2_idx.is_some_and(|idx| !can_send(idx)) {
+            self.pending_reg2_idx = None;
+            self.pending_timeout_at_ms = 0;
+        }
+        if self.reg1_target_idx.is_some_and(|idx| !can_send(idx))
+            && let Some(idx) = (0..connection_count).find(|&idx| can_send(idx))
+        {
+            debug!(
+                "REG1 target moved to uplink #{} (previous target has no socket)",
+                idx
+            );
+            self.reg1_target_idx = Some(idx);
+            self.reg1_next_send_at_ms = 0;
+        }
+    }
+
     pub fn get_selected_connection_idx(&self) -> Option<usize> {
         self.reg1_target_idx
     }

@@ -35,8 +35,11 @@ pub async fn handle_housekeeping(
     packet_tx: &UnboundedSender<UplinkPacket>,
     rehome: &mut RehomeGate,
 ) -> Result<()> {
-    // If we're waiting on a REG2 response past the timeout, proactively retry REG1
+    // If we're waiting on a REG2 response past the timeout, proactively retry REG1.
+    // A REG1 "sent" to a link without a socket never left, so it is released
+    // first rather than timed out: the timeout would drop the target entirely.
     let current_ms = now_ms;
+    retarget_reg1(reg, connections, conn_io);
     let _ = reg.clear_pending_if_timed_out(current_ms);
 
     if reg.is_probing() {
@@ -210,7 +213,9 @@ pub async fn handle_housekeeping(
     // C code resets active_connections=0 then counts non-timed-out connections
     reg.update_active_connections(connections);
 
-    // drive registration (send REG1/REG2 as needed)
+    // drive registration (send REG1/REG2 as needed), never through a link
+    // that has no socket to send it on
+    retarget_reg1(reg, connections, conn_io);
     let sends = reg.reg_driver_pending_sends(connections.len(), current_ms);
     if let Some((idx, pkt)) = sends.reg1
         && let Some(conn) = connections.get_mut(idx)
@@ -369,6 +374,19 @@ pub async fn retire_unverified_sources(
         }
     }
     retired
+}
+
+/// Keep the group registration on links that own a socket.
+fn retarget_reg1(
+    reg: &mut SrtlaRegistrationManager,
+    connections: &[SrtlaConnection],
+    conn_io: &ConnIoMap,
+) {
+    reg.retarget_reg1(connections.len(), |idx| {
+        connections
+            .get(idx)
+            .is_some_and(|conn| conn_io.contains_key(&conn.conn_id))
+    });
 }
 
 /// Put a link that just got a new socket back in front of the receiver: REG1
@@ -901,6 +919,79 @@ mod tests {
         );
         assert!(!check(&mut f).await, "nothing left to retire");
         drop(assigned);
+    }
+
+    /// Registration must not wait on a link that has no socket: if the REG1
+    /// target (the probing fallback is always the first link) is parked, the
+    /// REG1 goes out on a link that can send. With no such link the target
+    /// stays, so the parked one registers as soon as it is back.
+    #[tokio::test]
+    async fn the_group_registers_through_a_link_that_has_a_socket() {
+        let now = now_ms();
+        let mut f = RehomeFixture::new(remote(1)).await;
+        f.reg.has_connected = false;
+        super::super::uplink::retire_uplink(
+            &mut f.connections[0],
+            &mut f.conn_io,
+            &mut f.reader_handles,
+            &mut f.seq_tracker,
+        )
+        .await;
+        f.connections[0].reconnection.last_reconnect_attempt_ms = now;
+        let live = &mut f.connections[1];
+        live.connected = false;
+        live.last_received = None;
+        live.reconnection.connection_established_ms = 0;
+        live.reconnection.startup_grace_deadline_ms = now + STARTUP_GRACE_MS;
+        f.reg.set_reg1_target_idx(Some(0));
+
+        f.tick(&mut RehomeGate::new(false), now).await.unwrap();
+        assert_eq!(
+            f.reg.pending_reg2_idx(),
+            Some(1),
+            "REG1 must go out on the link with a socket"
+        );
+
+        // The target loses its source during this very tick: the REG1 still
+        // goes out on the link that can send, not one tick later.
+        let (mut h, required, _assigned) = required_link(remote(1), true).await;
+        h.reg.has_connected = false;
+        h.conn_io.get_mut(&required).unwrap().spec.iface =
+            Some(crate::bind_map::IfaceName::parse("missing0").unwrap());
+        h.connections.push(create_test_connection().await);
+        let other = h.connections[1].conn_id;
+        h.conn_io
+            .insert(other, crate::test_helpers::create_test_conn_io());
+        for conn in h.connections.iter_mut() {
+            conn.connected = false;
+            conn.last_received = None;
+            conn.reconnection.connection_established_ms = 0;
+            conn.reconnection.startup_grace_deadline_ms = now + STARTUP_GRACE_MS;
+        }
+        h.reg.set_reg1_target_idx(Some(0));
+        h.tick(&mut RehomeGate::new(false), now).await.unwrap();
+        assert!(h.conn_io.is_retired(required));
+        assert_eq!(h.reg.pending_reg2_idx(), Some(1));
+
+        // Nothing can send: the target is kept for the parked link.
+        let mut g = RehomeFixture::new(remote(1)).await;
+        g.connections.truncate(1);
+        g.reg.has_connected = false;
+        super::super::uplink::retire_uplink(
+            &mut g.connections[0],
+            &mut g.conn_io,
+            &mut g.reader_handles,
+            &mut g.seq_tracker,
+        )
+        .await;
+        g.connections[0].reconnection.last_reconnect_attempt_ms = now + 60_000;
+        g.reg.set_reg1_target_idx(Some(0));
+        // Past the REG2 timeout: a REG1 that never left must not cost the target.
+        for at in [now, now + 5_000] {
+            g.tick(&mut RehomeGate::new(false), at).await.unwrap();
+        }
+        assert_eq!(g.reg.get_selected_connection_idx(), Some(0));
+        assert!(g.conn_io.is_retired(g.connections[0].conn_id));
     }
 
     fn remote(last: u8) -> SocketAddr {

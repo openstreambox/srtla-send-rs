@@ -538,9 +538,13 @@ Required-mode dry-run uses the same canonical-address validation and Linux
 platform guard as runtime. Default dry-run behavior is unchanged.
 Every accepted link uses the existing device-first, source-second binder.
 Failure of either operation refuses that socket and logs the failure; it never
-retries with a source-only binder. Existing bound reconnect and interface
-staleness handling remain in force. A valid map status describes validation,
-not proof that every socket connected; consumers also inspect connections.
+retries with a source-only binder. Once the receiver has resolved, a refused
+row is kept as a retired link (§9.4) rather than dropped, at startup and when a
+reload adds it, so it comes up by itself when its source appears on its device.
+A row whose receiver lookup fails is still dropped. Existing bound reconnect
+and interface staleness handling remain in force. A valid map status describes
+validation, not proof that every socket connected; consumers also inspect
+connections and their `binding_state`.
 
 A degraded reload after a valid pair retains the last valid mapped pool and
 reports `retained_last_valid`, exactly as §6.2. This is **not withdrawal**:
@@ -619,10 +623,11 @@ checked every 200 ms between housekeeping ticks and again before each tick
 sends, each time against one reading of the host's addresses. A socket bound
 before its address moved can therefore send for at most that interval; those
 datagrams still leave through the mapped device (`SO_BINDTODEVICE`), only their
-source address is stale. A lost assignment or a failed checked socket
-rebuild retires the link: it holds no socket and no reader, so
+source address is stale. A lost assignment, a refused first bind or a failed
+checked socket rebuild retires the link: it holds no socket and no reader, so
 nothing is sent from it. A reading that fails proves nothing and retires the
-link the same way; the log names the inspection, not the address.
+link the same way; the log names the inspection, not the address. Group
+registration is never aimed at a retired link while another link can send.
 
 A retired link stays in the pool under its mapped identity. Its telemetry row
 keeps `link_id` and `iface`, reports `weight_percent` 0 and carries the

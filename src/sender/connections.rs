@@ -10,7 +10,7 @@ use srtla_core::utils::now_ms;
 use tracing::{debug, info, warn};
 
 use super::sequence::SequenceTracker;
-use super::uplink::{ConnIo, ConnIoMap};
+use super::uplink::{ConnIo, ConnIoMap, RetiredUplink};
 use crate::bind_map::EffectiveLink;
 use crate::net::{
     BatchUdpSocket, EgressLifecycle, RouteHealth, SocketKey, SystemIfaceResolver, UplinkBinder,
@@ -253,10 +253,11 @@ async fn create_missing(
     created
         .into_iter()
         .map(|conn| {
-            let key = conn_io
-                .get(&conn.conn_id)
-                .map_or_else(|| UplinkSpec::unmapped(conn.local_ip), |io| io.spec.clone())
-                .socket_key();
+            let key = match (conn_io.get(&conn.conn_id), conn_io.retired(conn.conn_id)) {
+                (Some(io), _) => io.spec.socket_key(),
+                (None, Some(parked)) => parked.spec.socket_key(),
+                (None, None) => UplinkSpec::unmapped(conn.local_ip).socket_key(),
+            };
             (key, conn)
         })
         .collect()
@@ -290,10 +291,22 @@ pub async fn create_connections_from_links(
     let mut connections = SmallVec::new();
     for spec in links {
         match connect_uplink(spec, receiver_host, receiver_port, binder).await {
-            Ok((mut conn, io)) => {
+            Ok(Dialled::Live(mut conn, io)) => {
                 conn.link_weight = spec.weight;
                 info!("added uplink {} (weight {})", conn.label, conn.link_weight);
                 conn_io.insert(conn.conn_id, io);
+                connections.push(conn);
+            }
+            Ok(Dialled::Parked(mut conn, uplink, e)) => {
+                conn.link_weight = spec.weight;
+                warn!(
+                    "uplink {}: first bind refused ({e:#}); parked without a socket, retrying \
+                     until its source is verified on its device",
+                    conn.label
+                );
+                // Owns no socket, so it must never count as a live link.
+                conn.mark_for_recovery();
+                conn_io.park(conn.conn_id, uplink);
                 connections.push(conn);
             }
             Err(e) => warn!(
@@ -308,48 +321,69 @@ pub async fn create_connections_from_links(
     connections
 }
 
+/// What dialling one uplink produced.
+enum Dialled {
+    /// A bound socket, ready to register.
+    Live(SrtlaConnection, ConnIo),
+    /// A required link whose checked bind was refused after the receiver had
+    /// resolved. Its source is not (verifiably) on its device yet; that is the
+    /// same transient loss as one that happens after the apply, so it is parked
+    /// and retried rather than dropped.
+    Parked(SrtlaConnection, RetiredUplink, anyhow::Error),
+}
+
 /// Open a UDP socket for `spec`, steered onto its egress, and pair it with a
 /// fresh socket-free [`SrtlaConnection`]. The connection and its [`ConnIo`]
 /// share a `conn_id` so the shell can key the I/O map by it.
+///
+/// A receiver that does not resolve is an error for every link: there is
+/// nothing to retry against. A refused bind is an error only outside required
+/// mode, where a link has always been dropped when it cannot bind.
 async fn connect_uplink(
     spec: &UplinkSpec,
     receiver_host: &str,
     receiver_port: u16,
     binder: &Arc<dyn UplinkBinder>,
-) -> Result<(SrtlaConnection, ConnIo)> {
+) -> Result<Dialled> {
     use rand::RngCore;
 
     let remote = resolve_remote(receiver_host, receiver_port).await?;
     let mut egress = EgressLifecycle::for_spec(spec.iface.as_ref());
-    // Re-resolve the interface by NAME before every socket creation: a replug
-    // leaves the old ifindex describing nothing, and SO_BINDTODEVICE freezes
-    // whatever index it is handed at setsockopt time.
-    egress
-        .resolve_for_bind(&SystemIfaceResolver)
-        .map_err(|fault| anyhow::anyhow!("egress unavailable ({})", fault.as_str()))?;
     let link_binder = link_binder_for(spec, binder);
-
-    let sock = create_uplink_socket(spec.ip)?;
-    link_binder.bind(&sock, spec.ip)?;
-    sock.set_nonblocking(true)?;
-    let socket = Arc::new(BatchUdpSocket::new(
-        sock,
-        send_peer(remote, link_binder.as_ref()),
-    )?);
-
     let conn_id = rand::rng().next_u64();
     let label = spec.label(receiver_host, receiver_port);
     let conn = SrtlaConnection::new_registering(conn_id, label, spec.ip, now_ms());
-    let route_health = observe_route_for(spec);
-    let io = ConnIo {
-        socket,
-        binder: link_binder,
-        remote,
-        spec: spec.clone(),
-        egress,
-        route_health,
-    };
-    Ok((conn, io))
+    // Re-resolve the interface by NAME before every socket creation: a replug
+    // leaves the old ifindex describing nothing, and SO_BINDTODEVICE freezes
+    // whatever index it is handed at setsockopt time.
+    let socket = egress
+        .resolve_for_bind(&SystemIfaceResolver)
+        .map_err(|fault| anyhow::anyhow!("egress unavailable ({})", fault.as_str()))
+        .and_then(|_| open_bound_socket(spec.ip, link_binder.as_ref(), remote));
+    match socket {
+        Ok(socket) => {
+            let route_health = observe_route_for(spec);
+            let io = ConnIo {
+                socket,
+                binder: link_binder,
+                remote,
+                spec: spec.clone(),
+                egress,
+                route_health,
+            };
+            Ok(Dialled::Live(conn, io))
+        }
+        Err(e) if link_binder.requires_checked_device() => {
+            let uplink = RetiredUplink {
+                binder: link_binder,
+                remote,
+                spec: spec.clone(),
+                egress,
+            };
+            Ok(Dialled::Parked(conn, uplink, e))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// IPv4-mapped receiver literals name IPv4 destinations. Required sockets must
@@ -733,6 +767,103 @@ mod retired_reload_tests {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+mod refused_first_bind_tests {
+    use super::*;
+
+    fn required_spec(ip: &str, link_id: &str) -> UplinkSpec {
+        UplinkSpec {
+            iface: Some(crate::bind_map::IfaceName::parse("lo").unwrap()),
+            link_id: Some(crate::bind_map::LinkId::parse(link_id).unwrap()),
+            ..UplinkSpec::unmapped(ip.parse().unwrap())
+        }
+    }
+
+    /// A required row whose source is not on its device when the map is
+    /// applied is the same transient loss as one that leaves later: it is
+    /// parked under its identity, without a socket, and retried like any
+    /// retired link — at start-up and when a reload adds it.
+    #[tokio::test]
+    async fn a_required_row_refused_at_its_first_bind_is_parked_not_dropped() {
+        let required: Arc<dyn UplinkBinder> = Arc::new(crate::net::RequiredBinding);
+        let mut conn_io = ConnIoMap::new();
+        // TEST-NET-1 is never assigned to `lo`.
+        let unassigned = required_spec("192.0.2.1", "path-a");
+        let mut connections = create_connections_from_links(
+            std::slice::from_ref(&unassigned),
+            "127.0.0.1",
+            9,
+            &required,
+            &mut conn_io,
+        )
+        .await;
+        assert_eq!(connections.len(), 1, "the refused row was dropped");
+        let id = connections[0].conn_id;
+        assert!(!conn_io.contains_key(&id), "a refused row owns a socket");
+        assert_eq!(conn_io.retired(id).map(|r| &r.spec), Some(&unassigned));
+        assert!(
+            connections[0].is_timed_out(now_ms()),
+            "a parked row must not count as a live link"
+        );
+        assert!(connections[0].should_attempt_reconnect(now_ms()));
+
+        // A reload adding a second refused row next to it keeps both.
+        let added = required_spec("192.0.2.2", "path-b");
+        apply_connection_changes(
+            &mut connections,
+            &mut conn_io,
+            &[unassigned.clone(), added.clone()],
+            "127.0.0.1",
+            9,
+            &mut None,
+            &mut SequenceTracker::new(),
+            &required,
+        )
+        .await;
+        assert_eq!(
+            connections.len(),
+            2,
+            "the row added by the reload was dropped"
+        );
+        assert_eq!(connections[0].conn_id, id, "the parked row was replaced");
+        assert_eq!(
+            conn_io.retired(connections[1].conn_id).map(|r| &r.spec),
+            Some(&added)
+        );
+        assert!(conn_io.is_empty());
+    }
+
+    /// Without a receiver address there is nothing to retry against, and a
+    /// default run keeps dropping a row it cannot bind, as it always has.
+    #[tokio::test]
+    async fn rows_are_still_dropped_on_lookup_failure_and_outside_required_mode() {
+        let required: Arc<dyn UplinkBinder> = Arc::new(crate::net::RequiredBinding);
+        let mut conn_io = ConnIoMap::new();
+        let unresolvable = create_connections_from_links(
+            &[required_spec("127.0.0.1", "path-a")],
+            "receiver.invalid",
+            9,
+            &required,
+            &mut conn_io,
+        )
+        .await;
+        assert!(unresolvable.is_empty());
+
+        let default: Arc<dyn UplinkBinder> = Arc::new(crate::net::SourceIpBinder);
+        for spec in [
+            UplinkSpec::unmapped("192.0.2.1".parse().unwrap()),
+            required_spec("192.0.2.1", "path-a"),
+        ] {
+            let dropped =
+                create_connections_from_links(&[spec], "127.0.0.1", 9, &default, &mut conn_io)
+                    .await;
+            assert!(dropped.is_empty(), "a default run parked a row");
+        }
+        assert!(conn_io.is_empty());
+        assert!(!conn_io.is_retired(0));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod required_receiver_tests {
     use super::*;
 
@@ -749,9 +880,13 @@ mod required_receiver_tests {
             link_id: Some(crate::bind_map::LinkId::parse("path-a").unwrap()),
             ..UplinkSpec::unmapped("127.0.0.1".parse().unwrap())
         };
-        let (mut conn, mut io) = connect_uplink(&spec, "::ffff:127.0.0.1", remote.port(), &binder)
-            .await
-            .unwrap();
+        let Dialled::Live(mut conn, mut io) =
+            connect_uplink(&spec, "::ffff:127.0.0.1", remote.port(), &binder)
+                .await
+                .unwrap()
+        else {
+            panic!("a loopback source on lo must bind")
+        };
         assert_eq!(io.remote, remote);
         assert_eq!(
             send_peer(remote, &crate::net::SourceIpBinder),
