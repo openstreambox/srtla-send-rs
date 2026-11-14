@@ -147,9 +147,9 @@ pub fn create_uplink_socket(domain_for: IpAddr) -> Result<Socket> {
 
 /// Every address the receiver's hostname currently answers with.
 ///
-/// [`resolve_remote`] picks the first of these to dial. The full set matters
-/// only to the reconnect path, which compares the address an uplink is pinned
-/// to against a fresh answer to detect that the receiver's DNS has drifted (see
+/// [`resolve_remote_for_source`] picks the first compatible address to dial.
+/// The reconnect and whole-bond re-home paths compare pinned addresses against
+/// this fresh answer set to detect receiver DNS drift (see
 /// `sender::connections`).
 pub async fn resolve_remote_all(host: &str, port: u16) -> Result<SmallVec<SocketAddr, 4>> {
     let addrs = tokio::net::lookup_host((host, port))
@@ -164,4 +164,64 @@ pub async fn resolve_remote(host: &str, port: u16) -> Result<SocketAddr> {
         .first()
         .copied()
         .ok_or_else(|| anyhow::anyhow!("no DNS result for {}", host))
+}
+
+/// Select the first answer compatible with the source socket's address family.
+/// A missing family is an unavailable uplink, never a cross-family send attempt.
+pub fn select_remote_for_source(addrs: &[SocketAddr], source: IpAddr) -> Result<SocketAddr> {
+    addrs
+        .iter()
+        .copied()
+        .find(|addr| addr.is_ipv4() == source.is_ipv4())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "receiver offers no {} destination; skipping source {}",
+                if source.is_ipv4() { "IPv4" } else { "IPv6" },
+                source
+            )
+        })
+}
+
+pub async fn resolve_remote_for_source(
+    host: &str,
+    port: u16,
+    source: IpAddr,
+) -> Result<SocketAddr> {
+    select_remote_for_source(&resolve_remote_all(host, port).await?, source)
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    #[test]
+    fn resolution_selects_each_source_family_in_answer_order() {
+        let v4: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let v6: SocketAddr = "[::1]:9000".parse().unwrap();
+        let answers = [v6, v4];
+        assert_eq!(select_remote_for_source(&answers, v4.ip()).unwrap(), v4);
+        assert_eq!(select_remote_for_source(&answers, v6.ip()).unwrap(), v6);
+        assert!(select_remote_for_source(&[v6], v4.ip()).is_err());
+        assert!(select_remote_for_source(&[v4], v6.ip()).is_err());
+        assert!(select_remote_for_source(&[], v4.ip()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv4_socket_reproduces_eafnosupport_then_sends_to_matching_answer() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let v4 = receiver.local_addr().unwrap();
+        let v6 = SocketAddr::new("::1".parse().unwrap(), v4.port());
+        let sock = create_uplink_socket(v4.ip()).unwrap();
+        SourceIpBinder.bind(&sock, v4.ip()).unwrap();
+        let error = sock.send_to(b"family", &v6.into()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EAFNOSUPPORT));
+        let remote = select_remote_for_source(&[v6, v4], v4.ip()).unwrap();
+        sock.send_to(b"family", &remote.into()).unwrap();
+        let mut bytes = [0; 16];
+        assert_eq!(receiver.recv(&mut bytes).unwrap(), 6);
+    }
 }

@@ -445,6 +445,7 @@ pub async fn run_sender_with_config(
                             && let Some(new_links) = changes.new_links
                         {
                             info!("applying queued connection changes: {} uplinks", new_links.len());
+                            let previous_ids: Vec<u64> = connections.iter().map(|c| c.conn_id).collect();
                             apply_connection_changes(
                                 &mut connections,
                                 &mut conn_io,
@@ -457,13 +458,11 @@ pub async fn run_sender_with_config(
                             ).await;
                             info!("connection changes applied successfully");
                             sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
-                            // Bootstrap registration when a reload populated an
-                            // empty pool. `start_probing` self-guards (no-op once
-                            // probing has begun), so this only fires on the
-                            // empty-pool -> first-uplinks transition and never
-                            // disturbs an established bond's reload.
-                            if !connections.is_empty() {
-                                let probes = reg.start_probing(
+                            // Reload can replace or reorder the sockets the registration
+                            // manager indexes. Reconcile before any queued reply is handled.
+                            {
+                                let probes = reg.reload_connections(
+                                    &previous_ids,
                                     &mut connections,
                                     srtla_core::utils::now_ms(),
                                 );

@@ -86,6 +86,7 @@ Five Miri filters, cross-channel/OS lanes, privileged netns prerequisites, stall
 - Refuse zero-valid-IP reload while keeping live links; clean SIGTERM/SIGINT exits 0 within the device's 10 s window.
 - Control frames are padded to at least 32 bytes; DATA is never padded.
 - Only classic/enhanced scheduling; never restore retired experimental modes or selectors.
+- Match receiver destinations to each source socket family at startup, reload, reconnect and whole-bond re-home; log and skip unavailable families. Preserve surviving registrations on reload and register replacement sockets.
 - Keep CONN_TIMEOUT = 5 s; CeraUI supplies --conn-timeout-ms 15000. Never bake 15 s into the binary.
 - No bindings directory, npm package or binding tag namespace here; the TypeScript helper lives and is tested in CeraUI.
 - Package is srtla, artifact srtla_<ver>_<arch>.deb; tags match Cargo.toml; release builds stay Bookworm with GLIBC_2.36 ceiling.

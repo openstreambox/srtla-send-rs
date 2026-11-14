@@ -34,6 +34,7 @@ pub use socket::CallbackBinder;
 pub use socket::DeviceBinder;
 pub use socket::{
     SourceIpBinder, UplinkBinder, create_uplink_socket, resolve_remote, resolve_remote_all,
+    resolve_remote_for_source, select_remote_for_source,
 };
 pub use spec::{SocketKey, UplinkSpec};
 use srtla_core::connection::BATCH_SEND_SIZE;

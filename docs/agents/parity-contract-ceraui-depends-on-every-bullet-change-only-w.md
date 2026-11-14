@@ -93,6 +93,13 @@
 - **A `SIGHUP` with `--bind-map` runs the sidecar read off the forwarding loop**
   (`src/sender/links.rs`), because a retried mismatch could otherwise stall forwarding
   for up to 2 s. Without `--bind-map`, SIGHUP is upstream's reload plus the guard below.
+- **Receiver address family.** Source sockets use only matching-family receiver
+  destinations. Startup and reload skip unavailable families with a warning.
+  Reconnect keeps the compatible cached receiver identity; whole-bond re-home
+  selects per family from one fresh answer set and excludes unsupported sources
+  until a later reload. Replacing the entire source pool restarts registration;
+  reordering survivors remaps pending handshake indices without re-registering
+  established sockets.
 - **IP-list reload (`SIGHUP`)** keeps surviving uplinks' sockets and registrations (no
   re-handshake) and rebuilds the pool in file order. A reload resolving to zero valid
   source IPs is refused with a specific log and the stream keeps running on the

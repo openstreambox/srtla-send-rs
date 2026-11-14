@@ -40,8 +40,8 @@
 //! Re-home rebuilds whatever uplinks the bond currently has, so it always runs
 //! against the local-IP set that the last accepted reload installed. In the
 //! other direction, a reload that lands *after* a re-home dials any newly added
-//! uplink through [`crate::net::resolve_remote`], which picks the first answer —
-//! the same deterministic pick this module makes — so the added link joins the
+//! uplink through [`crate::net::resolve_remote_for_source`], which picks the first
+//! answer in the source socket's family, just as this module does, so it joins the
 //! bond at the address the bond just moved to. Neither order can leave uplinks
 //! split across two receivers.
 
@@ -61,7 +61,7 @@ use tracing::{debug, warn};
 use super::connections::{rebuild_uplink_socket, receiver_moved, recover_connection};
 use super::sequence::SequenceTracker;
 use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for};
-use crate::net::resolve_remote_all;
+use crate::net::{resolve_remote_all, select_remote_for_source};
 
 /// At most one re-home *attempt* per minute, process-wide. The limit covers the
 /// DNS probe as well as the migration: housekeeping runs every second, and a
@@ -274,12 +274,16 @@ pub(super) async fn try_rehome(
         return false;
     }
 
-    // Deterministic pick, matching `resolve_remote`: the first answer.
-    let new_remote = fresh[0];
+    // Use one answer set for the whole bond, selecting per source family.
+    let answers = fresh
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     warn!(
         "re-homing the whole bond: {receiver_host} no longer resolves to {pinned} and every \
-         uplink has been down for {dead_for_ms}ms; moving {} uplink(s) from {pinned} to \
-         {new_remote} and re-registering from scratch",
+         uplink has been down for {dead_for_ms}ms; moving {} uplink(s) using compatible \
+         destinations from [{answers}] and re-registering from scratch",
         connections.len()
     );
 
@@ -290,7 +294,7 @@ pub(super) async fn try_rehome(
         seq_tracker,
         reader_handles,
         packet_tx,
-        new_remote,
+        &fresh,
         now,
     )
     .await;
@@ -298,7 +302,7 @@ pub(super) async fn try_rehome(
     true
 }
 
-/// Repoint every uplink at `new_remote` and restart registration.
+/// Repoint compatible uplinks from one DNS answer set and restart registration.
 ///
 /// All-or-nothing in the sense that matters: the remote swap happens for the
 /// whole bond in one pass, before any socket is rebuilt, so an uplink whose
@@ -314,13 +318,27 @@ async fn rehome_bond(
     seq_tracker: &mut SequenceTracker,
     reader_handles: &mut HashMap<ConnectionId, ReaderHandle>,
     packet_tx: &UnboundedSender<UplinkPacket>,
-    new_remote: SocketAddr,
+    new_remotes: &[SocketAddr],
     now: u64,
 ) {
-    // Pass 1 — the atomic part. Nothing here can fail.
-    for conn in connections.iter() {
-        if let Some(io) = conn_io.get_mut(&conn.conn_id) {
-            io.remote = new_remote;
+    // Select each source's family from the same DNS snapshot before rebuilding
+    // any socket. Excluded sources have no I/O entry and cannot send to the old
+    // receiver; a later source-list reload can recreate them.
+    for conn in connections.iter_mut() {
+        match select_remote_for_source(new_remotes, conn.local_ip) {
+            Ok(remote) => {
+                if let Some(io) = conn_io.get_mut(&conn.conn_id) {
+                    io.remote = remote;
+                }
+            }
+            Err(error) => {
+                warn!("{}: {error}", conn.label);
+                conn_io.remove(&conn.conn_id);
+                if let Some(reader) = reader_handles.remove(&conn.conn_id) {
+                    reader.handle.abort();
+                }
+                recover_connection(conn, seq_tracker);
+            }
         }
     }
 
@@ -334,7 +352,7 @@ async fn rehome_bond(
                 Err(e) => {
                     warn!(
                         "{}: failed to rebuild socket for re-home ({e}); leaving it to the \
-                         reconnect path, which will now dial {new_remote}",
+                         reconnect path, which will use the compatible receiver address",
                         conn.label
                     );
                     recover_connection(conn, seq_tracker);
@@ -436,6 +454,81 @@ mod tests {
             now,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn rehome_selects_matching_family_even_when_ipv6_is_first() {
+        let mut bond = Bond::new(addr(1)).await;
+        let v6 = "[::1]:5000".parse().unwrap();
+        let resolver = StubResolver::new(vec![Some(vec![v6, addr(2)])]);
+        let mut gate = RehomeGate::with_resolver(true, resolver);
+        assert!(run_try_rehome(&mut bond, &mut gate, 100_000).await);
+        assert_eq!(bond.remotes(), vec![addr(2)]);
+        for conn in &bond.connections {
+            let io = &bond.conn_io[&conn.conn_id];
+            assert_eq!(conn.local_ip.is_ipv4(), io.remote.is_ipv4());
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_rehome_excludes_unsupported_sources_and_reload_can_restore_them() {
+        use super::super::connections::{
+            apply_connection_changes, create_connections_from_ips, specs_from_ips,
+        };
+        use crate::net::{SourceIpBinder, UplinkBinder};
+        let binder: Arc<dyn UplinkBinder> = Arc::new(SourceIpBinder);
+        let mut bond = Bond::new(addr(1)).await;
+        let ipv6: IpAddr = "::1".parse().unwrap();
+        let added =
+            create_connections_from_ips(&[ipv6], &[], "::1", 5000, &binder, &mut bond.conn_io)
+                .await;
+        assert_eq!(added.len(), 1);
+        let ipv6_id = added[0].conn_id;
+        bond.connections.extend(added);
+        let fresh_v6: SocketAddr = "[::1]:6000".parse().unwrap();
+        let resolver = StubResolver::new(vec![Some(vec![fresh_v6, addr(2)]), Some(vec![addr(3)])]);
+        let mut gate = RehomeGate::with_resolver(true, resolver);
+        assert!(run_try_rehome(&mut bond, &mut gate, 100_000).await);
+        assert_eq!(bond.conn_io[&ipv6_id].remote, fresh_v6);
+        for conn in &bond.connections {
+            assert_eq!(
+                conn.local_ip.is_ipv4(),
+                bond.conn_io[&conn.conn_id].remote.is_ipv4()
+            );
+        }
+        assert!(run_try_rehome(&mut bond, &mut gate, 200_000).await);
+        assert!(!bond.conn_io.contains_key(&ipv6_id));
+        assert!(!bond.reader_handles.contains_key(&ipv6_id));
+        assert!(
+            !bond
+                .connections
+                .iter()
+                .find(|c| c.conn_id == ipv6_id)
+                .unwrap()
+                .connected
+        );
+        // The excluded socket must be recreated, rather than claimed as a survivor.
+        let mut connections = SmallVec::from_vec(bond.connections);
+        apply_connection_changes(
+            &mut connections,
+            &mut bond.conn_io,
+            &specs_from_ips(&[ipv6], &[]),
+            "::1",
+            5000,
+            &mut None,
+            &mut bond.seq_tracker,
+            &binder,
+        )
+        .await;
+        assert_eq!(connections.len(), 1);
+        assert_ne!(connections[0].conn_id, ipv6_id);
+        assert_eq!(
+            bond.conn_io[&connections[0].conn_id].remote,
+            "[::1]:5000".parse().unwrap()
+        );
+        for reader in bond.reader_handles.values() {
+            reader.handle.abort();
+        }
     }
 
     #[test]

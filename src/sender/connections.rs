@@ -14,7 +14,7 @@ use super::uplink::{ConnIo, ConnIoMap};
 use crate::bind_map::EffectiveLink;
 use crate::net::{
     BatchUdpSocket, EgressLifecycle, RouteHealth, SocketKey, SystemIfaceResolver, UplinkBinder,
-    UplinkSpec, create_uplink_socket, resolve_remote, resolve_remote_all,
+    UplinkSpec, create_uplink_socket, resolve_remote_all, resolve_remote_for_source,
 };
 
 pub struct PendingConnectionChanges {
@@ -155,6 +155,9 @@ impl Survivors {
         let mut by_link_id = HashMap::new();
         let mut by_key = HashMap::new();
         for conn in std::mem::take(connections) {
+            if !conn_io.contains_key(&conn.conn_id) {
+                continue;
+            }
             let spec = conn_io
                 .get(&conn.conn_id)
                 .map_or_else(|| UplinkSpec::unmapped(conn.local_ip), |io| io.spec.clone());
@@ -307,7 +310,7 @@ async fn connect_uplink(
 ) -> Result<(SrtlaConnection, ConnIo)> {
     use rand::RngCore;
 
-    let remote = resolve_remote(receiver_host, receiver_port).await?;
+    let remote = resolve_remote_for_source(receiver_host, receiver_port, spec.ip).await?;
     let mut egress = EgressLifecycle::for_spec(spec.iface.as_ref());
     // Re-resolve the interface by NAME before every socket creation: a replug
     // leaves the old ifindex describing nothing, and SO_BINDTODEVICE freezes
@@ -406,6 +409,11 @@ pub(super) fn rebuild_uplink_socket(
     seq_tracker: &mut SequenceTracker,
     now: u64,
 ) -> Result<()> {
+    anyhow::ensure!(
+        conn.local_ip.is_ipv4() == io.remote.is_ipv4(),
+        "receiver destination does not match source family; skipping {}",
+        conn.local_ip
+    );
     // The interface is re-resolved by NAME here, never carried over: the socket
     // being replaced may be holding an ifindex that stopped describing the
     // device, which is the one failure `SO_BINDTODEVICE` cannot recover from.
@@ -565,5 +573,73 @@ mod tests {
             claim_dns_drift_warning(base + DNS_DRIFT_WARN_INTERVAL_MS),
             "the warning is due again once the window has passed"
         );
+    }
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+    use crate::net::SourceIpBinder;
+
+    #[tokio::test]
+    async fn startup_skips_sources_without_a_receiver_family() {
+        let binder: Arc<dyn UplinkBinder> = Arc::new(SourceIpBinder);
+        for (host, expected) in [("127.0.0.1", "127.0.0.1"), ("::1", "::1")] {
+            let mut io = ConnIoMap::new();
+            let connections = create_connections_from_ips(
+                &["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()],
+                &[],
+                host,
+                9000,
+                &binder,
+                &mut io,
+            )
+            .await;
+            assert_eq!(connections.len(), 1);
+            assert_eq!(connections[0].local_ip, expected.parse::<IpAddr>().unwrap());
+            assert_eq!(io.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn source_family_changes_and_reconnect_keep_destinations_in_source_family() {
+        let binder: Arc<dyn UplinkBinder> = Arc::new(SourceIpBinder);
+        let mut io = ConnIoMap::new();
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: IpAddr = "::1".parse().unwrap();
+        let mut connections =
+            create_connections_from_ips(&[v6], &[], "::1", 9000, &binder, &mut io).await;
+        connections.extend(
+            create_connections_from_ips(&[v4], &[], "127.0.0.1", 9000, &binder, &mut io).await,
+        );
+        assert_eq!(connections.len(), 2);
+        let mut selected = None;
+        let mut tracker = SequenceTracker::new();
+        for sources in [vec![v4], vec![v6], vec![v4, v6]] {
+            let host = if sources[0].is_ipv4() {
+                "127.0.0.1"
+            } else {
+                "::1"
+            };
+            apply_connection_changes(
+                &mut connections,
+                &mut io,
+                &specs_from_ips(&sources, &[]),
+                host,
+                9000,
+                &mut selected,
+                &mut tracker,
+                &binder,
+            )
+            .await;
+            assert_eq!(connections.len(), sources.len());
+            for conn in &mut connections {
+                let entry = io.get_mut(&conn.conn_id).unwrap();
+                reconnect_uplink(conn, entry, host, &mut tracker, 10_000)
+                    .await
+                    .unwrap();
+                assert_eq!(conn.local_ip.is_ipv4(), entry.remote.is_ipv4());
+            }
+        }
     }
 }
