@@ -58,8 +58,16 @@ const OBSERVE_AFTER: Duration = Duration::from_secs(20);
 /// Bytes per sample that count as "carrying stream data" on one link. Control
 /// traffic (keepalives, registration) stays far below it.
 const DATA_BYTES_PER_SAMPLE: u64 = 4_000;
-/// The bound the follow result is held to.
-const RECOVERY_LIMIT: Duration = Duration::from_secs(5);
+/// The bound the follow result is held to: the settle time (1.5 s) plus the
+/// re-join, with room for a loaded machine. On a single-link bond this is also
+/// how long the receiver hears nothing from the bond, so it must stay well
+/// inside the strictest receiver's 4 s connection and group timeout.
+const RECOVERY_LIMIT: Duration = Duration::from_millis(2_500);
+/// After a link rejoins with a fresh window, the scheduler has been seen to
+/// send everything over it for up to 1.5 s, on the unchanged sender too
+/// (after any reconnect, not only a followed one). The other link keeps its
+/// socket and registration throughout; only this quiet window is allowed.
+const OTHER_LINK_MAX_QUIET_MS: u64 = 2_000;
 
 /// The harness names veth pairs by process id, and the measurements are timing
 /// based, so the scenarios in this file must never overlap.
@@ -600,7 +608,7 @@ fn a_renumbered_link_rebinds_live_without_a_hup() {
     assert_eq!(r.b_retries_after, 0, "{r:?}");
     assert_eq!(r.new_address_joined_same_group, Some(true), "{r:?}");
     assert_session_survived(&r);
-    assert_other_link_untouched(&r, 2 * SAMPLE_MS);
+    assert_other_link_untouched(&r, OTHER_LINK_MAX_QUIET_MS);
     assert_stream_continuous(&r);
 }
 
@@ -626,10 +634,7 @@ fn a_link_left_without_an_address_waits_quietly_then_follows() {
     );
     assert_eq!(r.new_address_joined_same_group, Some(true), "{r:?}");
     assert_session_survived(&r);
-    // After six seconds on one link, the returning link rejoins with a fresh
-    // window and the scheduler has been seen to send everything over it for
-    // up to 1.5 s. Link a keeps its socket and registration throughout.
-    assert_other_link_untouched(&r, 2_000);
+    assert_other_link_untouched(&r, OTHER_LINK_MAX_QUIET_MS);
     assert_stream_continuous(&r);
 }
 
@@ -677,4 +682,7 @@ fn a_single_link_bond_survives_its_only_link_being_renumbered() {
     assert_eq!(r.b_retries_after, 0, "{r:?}");
     assert_eq!(r.new_address_joined_same_group, Some(true), "{r:?}");
     assert_session_survived(&r);
+    // With no other link to carry the stream, the SRT buffer is all that
+    // covers the outage: the far end must not see a stall.
+    assert_stream_continuous(&r);
 }

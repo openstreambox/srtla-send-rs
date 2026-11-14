@@ -97,7 +97,9 @@
   interface (privacy for privacy); the link keeps its `link_id` and `conn_id`, its
   socket is re-created and it re-joins with REG2 under the existing group ID. No
   replacement: the link is held out of service, not reconnected, until an address
-  returns. Repeated re-binds back off 2 s → 30 s. Unmapped links never move.
+  returns. Repeated re-binds back off 2 s → 30 s, back to 2 s after 60 s without
+  one. A link whose interface is removed is left to the egress lifecycle, and with
+  no readable address table nothing is held down. Unmapped links never move.
   `--no-follow-address` opts out. `src/net/local_addrs.rs`,
   `src/sender/address_follow.rs`.
 - **A `SIGHUP` with `--bind-map` runs the sidecar read off the forwarding loop**

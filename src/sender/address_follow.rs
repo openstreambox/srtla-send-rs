@@ -39,6 +39,7 @@ use super::connections::{rebuild_uplink_socket, recover_connection};
 use super::housekeeping::{RejoinSend, send_rejoin};
 use super::sequence::SequenceTracker;
 use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for};
+use crate::bind_map::IfaceName;
 use crate::net::{AddrFlags, AddrTable, IfaceResolver, LocalAddr, SystemIfaceResolver};
 
 /// How long a bound address must stay missing before the link acts on it.
@@ -48,12 +49,20 @@ use crate::net::{AddrFlags, AddrTable, IfaceResolver, LocalAddr, SystemIfaceReso
 pub const ADDRESS_SETTLE_MS: u64 = 1_500;
 
 /// Hold-down after a re-bind before the same link may re-bind again. Doubles for
-/// every further re-bind inside [`FLAP_WINDOW_MS`], up to
-/// [`REBIND_HOLD_MAX_MS`], so an address that keeps changing cannot make the
-/// link churn its registration.
+/// every re-bind that comes less than [`FLAP_WINDOW_MS`] after the previous one,
+/// up to [`REBIND_HOLD_MAX_MS`], so an address that keeps changing cannot make
+/// the link churn its registration.
 pub const REBIND_HOLD_BASE_MS: u64 = 2_000;
 pub const REBIND_HOLD_MAX_MS: u64 = 30_000;
+/// A link that has gone this long without a re-bind starts again from
+/// [`REBIND_HOLD_BASE_MS`]. It is measured from the previous re-bind, not over
+/// a sliding count, so a link flapping at the cap stays at the cap.
 pub const FLAP_WINDOW_MS: u64 = 60_000;
+
+// A link waiting out the longest hold-down re-binds well inside the window
+// (with room for a late round), so sustained flapping never ages the back-off
+// out.
+const _: () = assert!(FLAP_WINDOW_MS >= REBIND_HOLD_MAX_MS + ADDRESS_SETTLE_MS + 10_000);
 
 /// What the interface says about a link's bound address right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +77,9 @@ pub enum Observation {
 
 /// Compare a link's bound address with its interface's current addresses.
 ///
-/// `claimed` lists the addresses other links are bound to (or are about to be),
-/// so two links on one interface never pick the same replacement.
+/// `claimed` lists the addresses other links on this interface (and unmapped
+/// links) are bound to or are about to be, so two links on one interface never
+/// pick the same replacement.
 /// `was_temporary` is whether the bound address was last seen as an IPv6
 /// privacy address; the replacement keeps the same kind when one exists.
 #[must_use]
@@ -144,7 +154,10 @@ pub struct LinkFollow {
     missing_since: Option<u64>,
     down: bool,
     was_temporary: bool,
-    recent_rebinds: SmallVec<u64, 4>,
+    /// How many times the hold-down has doubled: re-binds in a row, each less
+    /// than [`FLAP_WINDOW_MS`] after the one before.
+    flap_level: u32,
+    last_rebind: Option<u64>,
     hold_until: u64,
 }
 
@@ -165,6 +178,23 @@ impl LinkFollow {
     #[must_use]
     pub fn was_temporary(&self) -> bool {
         self.was_temporary
+    }
+
+    /// When this link next needs a look even if the address table does not
+    /// change: the end of its settle time, or of the hold-down it waits out.
+    /// `None` when only a table change can move it.
+    #[must_use]
+    pub fn wake_at(&self, now: u64) -> Option<u64> {
+        let settle = self
+            .missing_since
+            .filter(|_| !self.down)
+            .map(|since| since + ADDRESS_SETTLE_MS);
+        let hold = (self.down || self.missing_since.is_some()).then_some(self.hold_until);
+        [settle, hold]
+            .into_iter()
+            .flatten()
+            .filter(|at| *at > now)
+            .min()
     }
 
     /// Forget everything if the link is now bound somewhere this state did not
@@ -217,12 +247,17 @@ impl LinkFollow {
     }
 
     fn note_rebind(&mut self, to: IpAddr, now: u64) {
-        self.recent_rebinds
-            .retain(|at| now.saturating_sub(*at) < FLAP_WINDOW_MS);
-        self.recent_rebinds.push(now);
-        let doublings = (self.recent_rebinds.len() - 1).min(16) as u32;
+        let flapping = self
+            .last_rebind
+            .is_some_and(|at| now.saturating_sub(at) < FLAP_WINDOW_MS);
+        self.flap_level = if flapping {
+            (self.flap_level + 1).min(16)
+        } else {
+            0
+        };
+        self.last_rebind = Some(now);
         let hold = REBIND_HOLD_BASE_MS
-            .saturating_mul(1 << doublings)
+            .saturating_mul(1 << self.flap_level)
             .min(REBIND_HOLD_MAX_MS);
         self.hold_until = now + hold;
         self.bound = Some(to);
@@ -230,9 +265,12 @@ impl LinkFollow {
         self.down = false;
     }
 
-    /// The re-bind the caller attempted failed: the link stays down until the
-    /// next observation says otherwise.
-    fn rebind_failed(&mut self) {
+    /// The re-bind the caller attempted failed, so the link is still bound to
+    /// `bound`. It stays down until the next observation says otherwise, and
+    /// the attempt still counts towards the back-off, so a bind that keeps
+    /// failing is retried less and less often.
+    fn rebind_failed(&mut self, bound: IpAddr) {
+        self.bound = Some(bound);
         self.down = true;
     }
 }
@@ -253,6 +291,21 @@ impl AddressFollower {
     /// Adopt the latest address table from the watcher.
     pub fn set_table(&mut self, table: std::sync::Arc<AddrTable>) {
         self.table = Some(table);
+    }
+
+    /// The watcher is gone: with no table the follower lets go of every link
+    /// on its next round, rather than keep acting on facts it can no longer
+    /// refresh.
+    pub fn clear_table(&mut self) {
+        self.table = None;
+    }
+
+    /// The earliest time any link needs a look without a table change, so the
+    /// caller can wake for a settle time ending between housekeeping ticks.
+    #[must_use]
+    pub fn next_wake(&self, now: u64) -> Option<u64> {
+        self.table.as_ref()?;
+        self.links.values().filter_map(|l| l.wake_at(now)).min()
     }
 
     #[must_use]
@@ -307,34 +360,51 @@ pub(crate) async fn follow_addresses_with(
         .links
         .retain(|conn_id, _| connections.iter().any(|c| c.conn_id == *conn_id));
     let Some(table) = follower.table.clone() else {
+        // No table (following is off, or the watcher ended): nothing here may
+        // keep a link out of service.
+        follower.links.clear();
+        for io in conn_io.values_mut() {
+            io.source_down = false;
+        }
         return;
     };
 
-    // Every address a link is bound to. A re-bind below adds its new address,
-    // so two links renumbered in the same round never pick the same one.
-    let mut claimed: SmallVec<IpAddr, 8> = connections.iter().map(|c| c.local_ip).collect();
+    // Every address a link is bound to, with the interface it is pinned to. A
+    // re-bind below adds its new address, so two links renumbered in the same
+    // round never pick the same one.
+    let mut claimed: SmallVec<Claim, 8> = connections
+        .iter()
+        .map(|c| Claim {
+            iface: conn_io
+                .get(&c.conn_id)
+                .and_then(|io| io.egress.iface().cloned()),
+            ip: c.local_ip,
+        })
+        .collect();
 
     for (idx, conn) in connections.iter_mut().enumerate() {
         let Some(io) = conn_io.get_mut(&conn.conn_id) else {
             continue;
         };
         // Only a mapped link has an interface to follow, and a link whose
-        // interface is gone belongs to the egress lifecycle, not to us.
-        let Some(iface) = io.egress.iface().cloned() else {
-            continue;
+        // interface is gone belongs to the egress lifecycle, not to us. Handing
+        // it back means letting go entirely: housekeeping skips a link held
+        // `source_down`, and housekeeping is what brings `Removed` back.
+        let iface = match io.egress.iface().cloned() {
+            Some(iface) if !io.egress.is_removed() => iface,
+            _ => {
+                release(follower, conn.conn_id, io);
+                continue;
+            }
         };
-        if io.egress.is_removed() {
-            follower.links.remove(&conn.conn_id);
-            continue;
-        }
         let Some(ifindex) = resolver.ifindex(iface.as_str()) else {
+            release(follower, conn.conn_id, io);
             continue;
         };
 
         let bound = conn.local_ip;
         let state = follower.links.entry(conn.conn_id).or_default();
-        let others: SmallVec<IpAddr, 8> =
-            claimed.iter().copied().filter(|ip| *ip != bound).collect();
+        let others = claimed_on(&claimed, &iface, bound);
         let observation = observe(bound, ifindex, &table, &others, state.was_temporary());
 
         let action = state.step(bound, observation, now);
@@ -355,6 +425,8 @@ pub(crate) async fn follow_addresses_with(
             }
             FollowAction::Rebind { to } => {
                 let old_label = conn.label.clone();
+                // The rebuild binds `conn.local_ip`, so the link points at the
+                // new address for the attempt and is put back if it fails.
                 conn.local_ip = to;
                 io.spec.ip = to;
                 conn.label = io.spec.label(receiver_host, io.remote.port());
@@ -382,10 +454,19 @@ pub(crate) async fn follow_addresses_with(
                                 conn.label
                             );
                         }
-                        claimed.retain(|ip| *ip != bound);
-                        claimed.push(to);
+                        claimed.retain(|c| !c.is(&iface, bound));
+                        claimed.push(Claim {
+                            iface: Some(iface.clone()),
+                            ip: to,
+                        });
                     }
                     Err(e) => {
+                        // The socket is still the old one, so the link must
+                        // keep describing it: telemetry and the reload key
+                        // report the address it is really bound to.
+                        conn.local_ip = bound;
+                        io.spec.ip = bound;
+                        conn.label = old_label;
                         warn!(
                             "{}: could not re-bind to {to} on {}: {e}; link is down until the \
                              address settles",
@@ -394,12 +475,46 @@ pub(crate) async fn follow_addresses_with(
                         );
                         recover_connection(conn, seq_tracker);
                         io.source_down = true;
-                        state.rebind_failed();
+                        state.rebind_failed(bound);
                     }
                 }
             }
         }
     }
+}
+
+/// Stop holding a link: forget its follow state and let housekeeping (and the
+/// egress lifecycle in it) look after it again.
+fn release(follower: &mut AddressFollower, conn_id: ConnectionId, io: &mut super::uplink::ConnIo) {
+    follower.links.remove(&conn_id);
+    io.source_down = false;
+}
+
+/// One link's bound address and the interface it is pinned to (`None` for an
+/// unmapped link, whose socket is not tied to any one interface).
+#[derive(Debug, Clone)]
+struct Claim {
+    iface: Option<IfaceName>,
+    ip: IpAddr,
+}
+
+impl Claim {
+    fn is(&self, iface: &IfaceName, ip: IpAddr) -> bool {
+        self.ip == ip && self.iface.as_ref() == Some(iface)
+    }
+}
+
+/// The addresses a link on `iface`, bound to `bound`, must not move to: those
+/// other links hold on the same interface, and any an unmapped link holds.
+/// Twin modems may share one address on two interfaces, so a claim on another
+/// interface does not block it here.
+fn claimed_on(claimed: &[Claim], iface: &IfaceName, bound: IpAddr) -> SmallVec<IpAddr, 8> {
+    claimed
+        .iter()
+        .filter(|c| !c.is(iface, bound))
+        .filter(|c| c.iface.as_ref().is_none_or(|i| i == iface))
+        .map(|c| c.ip)
+        .collect()
 }
 
 #[cfg(test)]
@@ -745,6 +860,171 @@ mod tests {
         assert!(s.hold_until <= 1_900 + REBIND_HOLD_MAX_MS);
     }
 
+    /// Re-bind times for a link whose address moves again as soon as it may,
+    /// stepped every 250 ms for `until` ms.
+    fn sustained_flap(until: u64) -> Vec<u64> {
+        let mut s = LinkFollow::default();
+        let mut bound = v4(10);
+        let mut rebinds = Vec::new();
+        let mut t = 0;
+        while t < until {
+            let other = if bound == v4(10) { v4(11) } else { v4(10) };
+            if let FollowAction::Rebind { to } = s.step(bound, Observation::Moved(other), t) {
+                rebinds.push(t);
+                bound = to;
+            }
+            t += 250;
+        }
+        rebinds
+    }
+
+    #[test]
+    fn sustained_flapping_stays_at_the_cap_instead_of_resetting() {
+        // Given: an address that keeps moving for five minutes.
+        let rebinds = sustained_flap(300_000);
+
+        // Then: the hold-down grows to the cap and stays there; it never
+        // drops back to the base while the flapping goes on.
+        let gaps: Vec<u64> = rebinds.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.windows(2).all(|w| w[1] >= w[0]),
+            "hold-down must not shrink while flapping: {gaps:?}"
+        );
+        let at_cap: Vec<u64> = gaps.iter().copied().skip(4).collect();
+        assert!(!at_cap.is_empty());
+        assert!(
+            at_cap.iter().all(|gap| *gap >= REBIND_HOLD_MAX_MS),
+            "{gaps:?}"
+        );
+        // 1.5, 3.5, 7.5, 15.5, 31.5 s, then every 30 s.
+        assert!(rebinds.len() <= 14, "{rebinds:?}");
+    }
+
+    #[test]
+    fn a_link_that_stays_put_for_the_flap_window_starts_again_from_the_base() {
+        let mut s = LinkFollow::default();
+        for i in 0..6 {
+            s.note_rebind(v4(10), i * 1_000);
+        }
+        assert_eq!(s.hold_until, 5_000 + REBIND_HOLD_MAX_MS);
+        // A minute without a move: the next move is held only briefly.
+        s.note_rebind(v4(11), 5_000 + FLAP_WINDOW_MS);
+        assert_eq!(s.hold_until, 5_000 + FLAP_WINDOW_MS + REBIND_HOLD_BASE_MS);
+    }
+
+    #[test]
+    fn a_settling_link_asks_to_be_woken_when_its_settle_time_ends() {
+        let mut s = LinkFollow::default();
+        assert_eq!(s.wake_at(0), None, "nothing pending");
+        let _ = s.step(v4(10), Observation::Moved(v4(11)), 1_000);
+        assert_eq!(s.wake_at(1_000), Some(1_000 + ADDRESS_SETTLE_MS));
+        let _ = s.step(v4(10), Observation::Gone, 1_200);
+        assert_eq!(s.wake_at(1_200), Some(1_000 + ADDRESS_SETTLE_MS));
+    }
+
+    #[test]
+    fn a_held_move_asks_to_be_woken_when_the_hold_down_ends() {
+        // Given: a link that just re-bound, whose new address moves at once.
+        let mut s = LinkFollow::default();
+        s.note_rebind(v4(11), 0);
+        s.note_rebind(v4(11), 10);
+        let hold = s.hold_until;
+        assert!(hold > ADDRESS_SETTLE_MS);
+        let _ = s.step(v4(11), Observation::Moved(v4(12)), 20);
+
+        // Then: it wakes at the settle time, and once that passed, at the
+        // end of the hold-down, where the move happens.
+        assert_eq!(s.wake_at(20), Some(20 + ADDRESS_SETTLE_MS));
+        assert_eq!(
+            s.step(v4(11), Observation::Moved(v4(12)), 20 + ADDRESS_SETTLE_MS),
+            FollowAction::None
+        );
+        assert_eq!(s.wake_at(20 + ADDRESS_SETTLE_MS), Some(hold));
+        assert_eq!(
+            s.step(v4(11), Observation::Moved(v4(12)), hold),
+            FollowAction::Rebind { to: v4(12) }
+        );
+    }
+
+    #[test]
+    fn a_link_marked_down_waits_for_a_table_change_not_a_timer() {
+        let mut s = LinkFollow::default();
+        let _ = s.step(v4(10), Observation::Gone, 0);
+        let _ = s.step(v4(10), Observation::Gone, ADDRESS_SETTLE_MS);
+        assert!(s.is_down());
+        assert_eq!(s.wake_at(ADDRESS_SETTLE_MS), None);
+    }
+
+    #[test]
+    fn a_failed_rebind_keeps_the_old_address_and_still_backs_off() {
+        // Given: a move whose bind failed, so the link is still on .10.
+        let mut s = LinkFollow::default();
+        let moved = Observation::Moved(v4(11));
+        let _ = s.step(v4(10), moved, 0);
+        assert_eq!(
+            s.step(v4(10), moved, ADDRESS_SETTLE_MS),
+            FollowAction::Rebind { to: v4(11) }
+        );
+        s.rebind_failed(v4(10));
+        assert!(s.is_down());
+
+        // When: the next rounds still see .10 bound and .11 on offer.
+        // Then: the state was not reset by `track`, so the next attempt waits
+        // out a longer hold-down than the first.
+        let first_hold = s.hold_until;
+        let mut retry = None;
+        for t in (ADDRESS_SETTLE_MS..60_000).step_by(250) {
+            if let FollowAction::Rebind { .. } = s.step(v4(10), moved, t) {
+                retry = Some(t);
+                break;
+            }
+        }
+        let retry = retry.expect("a later retry");
+        assert_eq!(retry, first_hold, "retried once the hold-down ended");
+        s.rebind_failed(v4(10));
+        assert_eq!(s.hold_until - retry, 2 * REBIND_HOLD_BASE_MS, "doubled");
+    }
+
+    #[test]
+    fn twin_links_on_two_interfaces_may_share_one_address() {
+        // Given: twin A on wwan0 bound to .100, twin B on wwan1 bound to .101;
+        // A's interface is renumbered to .101 as well.
+        let wwan0 = IfaceName::parse("wwan0").unwrap();
+        let wwan1 = IfaceName::parse("wwan1").unwrap();
+        let claimed = [
+            Claim {
+                iface: Some(wwan0.clone()),
+                ip: v4(100),
+            },
+            Claim {
+                iface: Some(wwan1.clone()),
+                ip: v4(101),
+            },
+        ];
+        let t = table(&[addr(WWAN0, v4(101)), addr(WWAN1, v4(101))]);
+
+        // Then: B's claim is on another interface, so A follows to .101.
+        let others = claimed_on(&claimed, &wwan0, v4(100));
+        assert!(others.is_empty(), "{others:?}");
+        assert_eq!(
+            observe(v4(100), WWAN0, &t, &others, false),
+            Observation::Moved(v4(101))
+        );
+
+        // And: on one interface, and for an unmapped link anywhere, a claim
+        // still blocks the address.
+        let same_iface = [Claim {
+            iface: Some(wwan0.clone()),
+            ip: v4(101),
+        }];
+        assert_eq!(&claimed_on(&same_iface, &wwan0, v4(100))[..], &[v4(101)]);
+        let unmapped = [Claim {
+            iface: None,
+            ip: v4(101),
+        }];
+        assert_eq!(&claimed_on(&unmapped, &wwan0, v4(100))[..], &[v4(101)]);
+    }
+
     #[test]
     fn a_link_reloaded_onto_another_address_starts_fresh() {
         let mut s = LinkFollow::default();
@@ -877,9 +1157,18 @@ mod tests {
             }
 
             async fn follow(&mut self, follower: &mut AddressFollower, now: u64) {
+                self.follow_via(follower, &Lo, now).await;
+            }
+
+            async fn follow_via(
+                &mut self,
+                follower: &mut AddressFollower,
+                resolver: &dyn IfaceResolver,
+                now: u64,
+            ) {
                 follow_addresses_with(
                     follower,
-                    &Lo,
+                    resolver,
                     &mut self.connections,
                     &mut self.conn_io,
                     &mut self.reg,
@@ -968,6 +1257,133 @@ mod tests {
             // Then: the link comes back on it.
             assert!(!pool.conn_io[&1].source_down);
             assert_eq!(pool.connections[0].local_ip, lo_ip(4));
+        }
+
+        /// One housekeeping round as far as the egress lifecycle is concerned:
+        /// housekeeping re-resolves a link's interface only while the follower
+        /// is not holding it (`source_down`), and that re-resolve is the only
+        /// way out of `Removed` short of a reload.
+        fn egress_tick(pool: &mut Pool) {
+            for io in pool.conn_io.values_mut() {
+                if !io.source_down {
+                    let _ = io.egress.poll(&Lo);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_link_whose_interface_vanishes_while_settling_is_not_parked_for_good() {
+            // Given: link 1's address has just gone missing, so the follower
+            // holds it in the settle window.
+            let mut pool = Pool::new();
+            let mut follower = follower_with(&[lo_ip(3)]);
+            pool.follow(&mut follower, 0).await;
+            assert!(pool.conn_io[&1].source_down, "settling");
+
+            // When: a send fails with ENODEV (the modem re-enumerated), and
+            // then the interface and the address come back.
+            let enodev = std::io::Error::from_raw_os_error(libc::ENODEV);
+            let _ = pool
+                .conn_io
+                .get_mut(&1)
+                .unwrap()
+                .egress
+                .note_send_error(&enodev);
+            assert!(pool.conn_io[&1].egress.is_removed());
+            follower.set_table(Arc::new(AddrTable::new(vec![
+                addr(LO, lo_ip(1)),
+                addr(LO, lo_ip(3)),
+            ])));
+            for round in 1..30 {
+                pool.follow(&mut follower, round * 1_000).await;
+                egress_tick(&mut pool);
+            }
+
+            // Then: the link went back to the egress lifecycle, which brought
+            // it back to active, instead of both sides waiting on each other.
+            assert!(!pool.conn_io[&1].source_down);
+            assert!(!pool.conn_io[&1].egress.is_removed());
+        }
+
+        /// An interface name that no longer resolves (the device vanished).
+        struct NoIface;
+        impl IfaceResolver for NoIface {
+            fn ifindex(&self, _iface: &str) -> Option<u32> {
+                None
+            }
+        }
+
+        #[tokio::test]
+        async fn a_link_whose_interface_stops_resolving_is_handed_back() {
+            // Given: link 1 is held in the settle window.
+            let mut pool = Pool::new();
+            let mut follower = follower_with(&[lo_ip(3)]);
+            pool.follow(&mut follower, 0).await;
+            assert!(pool.conn_io[&1].source_down);
+
+            // When: its interface name stops resolving before the egress
+            // lifecycle has noticed.
+            pool.follow_via(&mut follower, &NoIface, 500).await;
+
+            // Then: the follower lets go, so housekeeping's egress check runs
+            // for it again.
+            assert!(!pool.conn_io[&1].source_down);
+            assert!(follower.link(1).is_none());
+        }
+
+        #[tokio::test]
+        async fn a_stopped_watcher_lets_go_of_every_link() {
+            // Given: link 1 is marked down on the last table the watcher sent.
+            let mut pool = Pool::new();
+            let mut follower = follower_with(&[lo_ip(3)]);
+            pool.follow(&mut follower, 0).await;
+            pool.follow(&mut follower, ADDRESS_SETTLE_MS).await;
+            assert!(pool.conn_io[&1].source_down);
+
+            // When: the watcher ends, so that table can never be refreshed.
+            follower.clear_table();
+            pool.follow(&mut follower, ADDRESS_SETTLE_MS + 100).await;
+
+            // Then: nothing holds the link any more, and no wake-up is pending.
+            assert!(!pool.conn_io[&1].source_down);
+            assert!(follower.link(1).is_none());
+            assert_eq!(follower.next_wake(ADDRESS_SETTLE_MS + 100), None);
+        }
+
+        /// A binder that refuses every bind, so a rebuild fails after the
+        /// interface resolved.
+        struct RefuseBind;
+        impl crate::net::UplinkBinder for RefuseBind {
+            fn bind(&self, _sock: &Socket, ip: IpAddr) -> anyhow::Result<()> {
+                anyhow::bail!("refused bind to {ip}")
+            }
+        }
+
+        #[tokio::test]
+        async fn a_failed_rebind_leaves_the_link_describing_the_socket_it_still_has() {
+            // Given: link 1's address is replaced, but binding the new one fails.
+            let mut pool = Pool::new();
+            pool.conn_io.get_mut(&1).unwrap().binder = Arc::new(RefuseBind);
+            let old_label = pool.connections[0].label.clone();
+            let old_socket = Arc::clone(&pool.conn_io[&1].socket);
+            let mut follower = follower_with(&[lo_ip(2), lo_ip(3)]);
+
+            pool.follow(&mut follower, 0).await;
+            pool.follow(&mut follower, ADDRESS_SETTLE_MS).await;
+
+            // Then: the link still reports the address its socket is bound to.
+            let io = &pool.conn_io[&1];
+            assert!(Arc::ptr_eq(&old_socket, &io.socket));
+            assert_eq!(pool.connections[0].local_ip, lo_ip(1));
+            assert_eq!(io.spec.ip, lo_ip(1));
+            assert_eq!(pool.connections[0].label, old_label);
+            assert!(io.source_down);
+
+            // And: the follower keeps its back-off for that address instead
+            // of starting over as if a reload had moved the link.
+            pool.follow(&mut follower, ADDRESS_SETTLE_MS + 250).await;
+            assert!(follower.link(1).unwrap().is_down());
+            assert!(pool.conn_io[&1].source_down);
         }
 
         #[tokio::test]

@@ -129,6 +129,27 @@ impl Drop for ShutdownHooks {
     }
 }
 
+/// Slack added to the follower's wake-up so it never lands a millisecond before
+/// the deadline it waits for (`now_ms` and the timer round differently).
+const FOLLOW_WAKE_SLACK_MS: u64 = 5;
+
+/// Point the follower's timer at its next deadline. Returns whether one is
+/// pending; without one only a table change or a housekeeping tick wakes it.
+fn rearm_follow_wake(
+    timer: std::pin::Pin<&mut time::Sleep>,
+    follower: &address_follow::AddressFollower,
+) -> bool {
+    let now = srtla_core::utils::now_ms();
+    match follower.next_wake(now) {
+        Some(at) => {
+            let wait = at.saturating_sub(now) + FOLLOW_WAKE_SLACK_MS;
+            timer.reset(Instant::now() + Duration::from_millis(wait));
+            true
+        }
+        None => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sender_with_config(
     local_srt_port: u16,
@@ -330,6 +351,30 @@ pub async fn run_sender_with_config(
         }
     }
 
+    // One address-follower round, then re-arm its own wake-up: a settle time
+    // ending between housekeeping ticks is acted on when it ends, not up to a
+    // tick later, which is what keeps a single-link bond's gap short.
+    let follow_wake = time::sleep(Duration::ZERO);
+    tokio::pin!(follow_wake);
+    let mut follow_armed = false;
+    macro_rules! follow_round {
+        () => {{
+            address_follow::follow_addresses(
+                &mut follower,
+                &mut connections,
+                &mut conn_io,
+                &mut reg,
+                &mut seq_tracker,
+                &mut reader_handles,
+                &packet_tx,
+                receiver_host,
+                srtla_core::utils::now_ms(),
+            )
+            .await;
+            follow_armed = rearm_follow_wake(follow_wake.as_mut(), &follower);
+        }};
+    }
+
     // Use a macro to avoid duplicating the event loop for Unix/non-Unix
     // The only difference is SIGHUP handling on Unix
     macro_rules! event_loop {
@@ -407,40 +452,26 @@ pub async fn run_sender_with_config(
                         }
                     } => {
                         match changed {
-                            Ok(table) => {
-                                follower.set_table(table);
-                                address_follow::follow_addresses(
-                                    &mut follower,
-                                    &mut connections,
-                                    &mut conn_io,
-                                    &mut reg,
-                                    &mut seq_tracker,
-                                    &mut reader_handles,
-                                    &packet_tx,
-                                    receiver_host,
-                                    srtla_core::utils::now_ms(),
-                                ).await;
+                            Ok(table) => follower.set_table(table),
+                            // The watcher ended, so the table can no longer be
+                            // refreshed: drop it, and the follower lets go of
+                            // every link (behaviour as without following).
+                            Err(_) => {
+                                addr_watch = None;
+                                follower.clear_table();
                             }
-                            // The watcher task ended; keep the last table and
-                            // carry on with housekeeping-driven checks only.
-                            Err(_) => addr_watch = None,
                         }
+                        follow_round!();
+                    }
+                    () = &mut follow_wake, if follow_armed => {
+                        // A settle time or hold-down ended between ticks.
+                        follow_round!();
                     }
                     _ = housekeeping_timer.tick() => {
                         // Before housekeeping, so a link whose address just
                         // vanished is taken down instead of being reconnected
                         // onto an address the host no longer owns.
-                        address_follow::follow_addresses(
-                            &mut follower,
-                            &mut connections,
-                            &mut conn_io,
-                            &mut reg,
-                            &mut seq_tracker,
-                            &mut reader_handles,
-                            &packet_tx,
-                            receiver_host,
-                            srtla_core::utils::now_ms(),
-                        ).await;
+                        follow_round!();
                         let classic = config.mode().is_classic();
                         if let Err(err) = handle_housekeeping(
                             &mut connections,

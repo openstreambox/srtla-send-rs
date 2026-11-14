@@ -51,7 +51,9 @@ real SRT session streams, with stale files and no SIGHUP: one of two links (stra
 replacement, and a 6 s window with no address), and the only link of a single-link
 bond. It reads the result from the receiver side (veth counters, the UDP sink after
 the SRT listener, the receiver's group log) and includes a `--no-follow-address`
-control in which the link must stay dead. Its scenarios run one at a time and get
+control in which the link must stay dead. A followed link must carry again within
+2.5 s, and the single-link bond must show no far-end stall, which keeps the bond's
+silence inside a 4 s receiver timeout. Its scenarios run one at a time and get
 240 s via `NETNS_ADDRESS_FOLLOW_TEST_TIMEOUT_SECONDS`.
 
 **`tests/netns_twin.rs`** (8 scenarios) is the only target that reproduces two uplinks

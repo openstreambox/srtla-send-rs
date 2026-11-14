@@ -32,6 +32,10 @@ pub const ADDRESS_POLL_INTERVAL_MS: u64 = 2_000;
 /// an add within a few milliseconds.
 pub const ADDRESS_EVENT_COALESCE_MS: u64 = 100;
 
+/// Consecutive failed table reads (about ten seconds' worth at the poll
+/// interval) after which the watcher gives up and following stops.
+pub const ADDRESS_DUMP_FAILURES_MAX: u32 = 5;
+
 /// The per-address state bits the follower needs.
 ///
 /// The kernel's `IFA_F_SECONDARY` (IPv4) and `IFA_F_TEMPORARY` (IPv6) share one
@@ -199,7 +203,8 @@ mod linux {
     use tracing::{debug, info};
 
     use super::{
-        ADDRESS_EVENT_COALESCE_MS, ADDRESS_POLL_INTERVAL_MS, AddrFlags, AddrTable, LocalAddr,
+        ADDRESS_DUMP_FAILURES_MAX, ADDRESS_EVENT_COALESCE_MS, ADDRESS_POLL_INTERVAL_MS, AddrFlags,
+        AddrTable, LocalAddr,
     };
 
     const NLMSG_HDRLEN: usize = 16;
@@ -210,6 +215,8 @@ mod linux {
     const RTM_GETADDR: u16 = 22;
     const NLM_F_REQUEST: u16 = 0x01;
     const NLM_F_DUMP: u16 = 0x300;
+    /// Set on a dump message when the table changed while it was being read.
+    const NLM_F_DUMP_INTR: u16 = 0x10;
     const IFA_ADDRESS: u16 = 1;
     const IFA_LOCAL: u16 = 2;
     const IFA_FLAGS: u16 = 8;
@@ -253,11 +260,27 @@ mod linux {
         Ok(fd)
     }
 
+    /// A dump the kernel marked as interrupted is re-read this many times
+    /// before it counts as a failure.
+    const DUMP_ATTEMPTS: usize = 3;
+
     /// Read every local address the kernel holds right now.
     ///
     /// Blocking, bounded by a one-second receive timeout so a misbehaving
-    /// kernel answer can never wedge the caller.
+    /// kernel answer can never wedge the caller. A dump that raced a change
+    /// (`NLM_F_DUMP_INTR`) may be inconsistent, so it is read again.
     pub fn dump_addresses() -> io::Result<AddrTable> {
+        let mut last = None;
+        for _ in 0..DUMP_ATTEMPTS {
+            match dump_once() {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => last = Some(e),
+                other => return other,
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::Interrupted)))
+    }
+
+    fn dump_once() -> io::Result<AddrTable> {
         let fd = open_route_socket(0, false)?;
         let timeout = libc::timeval {
             tv_sec: 1,
@@ -300,6 +323,7 @@ mod linux {
 
         let mut addrs = Vec::new();
         let mut buf = vec![0u8; RECV_BUF_LEN];
+        let mut interrupted = false;
         loop {
             // SAFETY: `buf` is a valid writable buffer of the given length.
             let n = unsafe {
@@ -319,7 +343,13 @@ mod linux {
                     "netlink dump ended without NLMSG_DONE",
                 ));
             }
-            match parse_messages(&buf[..n as usize], &mut addrs)? {
+            match parse_messages(&buf[..n as usize], &mut addrs, &mut interrupted)? {
+                DumpProgress::Done if interrupted => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "address table changed during the dump",
+                    ));
+                }
                 DumpProgress::Done => return Ok(AddrTable::new(addrs)),
                 DumpProgress::More => {}
             }
@@ -333,13 +363,17 @@ mod linux {
     }
 
     /// Parse one datagram of netlink messages, appending every address found.
+    /// `interrupted` is set when any message says the dump raced a change.
     pub(super) fn parse_messages(
         mut buf: &[u8],
         out: &mut Vec<LocalAddr>,
+        interrupted: &mut bool,
     ) -> io::Result<DumpProgress> {
         while buf.len() >= NLMSG_HDRLEN {
             let len = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
             let kind = u16::from_ne_bytes(buf[4..6].try_into().unwrap());
+            let flags = u16::from_ne_bytes(buf[6..8].try_into().unwrap());
+            *interrupted |= flags & NLM_F_DUMP_INTR != 0;
             if len < NLMSG_HDRLEN || len > buf.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -484,17 +518,11 @@ mod linux {
         }
     }
 
-    async fn read_table() -> Option<AddrTable> {
+    async fn read_table() -> Result<AddrTable, String> {
         match tokio::task::spawn_blocking(dump_addresses).await {
-            Ok(Ok(table)) => Some(table),
-            Ok(Err(e)) => {
-                debug!("local address dump failed: {e}");
-                None
-            }
-            Err(e) => {
-                debug!("local address dump task failed: {e}");
-                None
-            }
+            Ok(Ok(table)) => Ok(table),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(e) => Err(format!("dump task failed: {e}")),
         }
     }
 
@@ -525,6 +553,7 @@ mod linux {
     }
 
     async fn watch_loop(tx: watch::Sender<Arc<AddrTable>>, mut events: Option<AddrEvents>) {
+        let mut failures = 0u32;
         let mut poll = tokio::time::interval(Duration::from_millis(ADDRESS_POLL_INTERVAL_MS));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -550,15 +579,34 @@ mod linux {
             if tx.is_closed() {
                 return;
             }
-            if let Some(table) = read_table().await {
-                tx.send_if_modified(|current| {
-                    if **current == table {
-                        false
-                    } else {
-                        *current = Arc::new(table);
-                        true
+            match read_table().await {
+                Ok(table) => {
+                    failures = 0;
+                    tx.send_if_modified(|current| {
+                        if **current == table {
+                            false
+                        } else {
+                            *current = Arc::new(table);
+                            true
+                        }
+                    });
+                }
+                Err(e) => {
+                    failures += 1;
+                    if failures < ADDRESS_DUMP_FAILURES_MAX {
+                        debug!("local address dump failed ({failures} in a row): {e}");
+                        continue;
                     }
-                });
+                    // Acting on an address table that can no longer be
+                    // refreshed would hold links down on stale facts. Ending
+                    // the watcher makes the follower let go of every link,
+                    // which is the behaviour without address following.
+                    info!(
+                        "source-address follow stopped: local addresses could not be read \
+                         {failures} times in a row ({e})"
+                    );
+                    return;
+                }
             }
         }
     }
@@ -605,7 +653,7 @@ mod linux {
 
             // When: the datagram is parsed.
             let mut out = Vec::new();
-            let progress = parse_messages(&msg, &mut out).unwrap();
+            let progress = parse_messages(&msg, &mut out, &mut false).unwrap();
 
             // Then: our own address is the one recorded.
             assert_eq!(progress, DumpProgress::More);
@@ -628,7 +676,7 @@ mod linux {
             msg.extend(nlmsg(NLMSG_DONE, &[0, 0, 0, 0]));
 
             let mut out = Vec::new();
-            let progress = parse_messages(&msg, &mut out).unwrap();
+            let progress = parse_messages(&msg, &mut out, &mut false).unwrap();
 
             assert_eq!(progress, DumpProgress::Done);
             let flags = out[0].flags();
@@ -640,8 +688,29 @@ mod linux {
         fn a_netlink_error_reply_is_reported_not_swallowed() {
             let msg = nlmsg(NLMSG_ERROR, &(-libc::EPERM).to_ne_bytes());
             let mut out = Vec::new();
-            let err = parse_messages(&msg, &mut out).unwrap_err();
+            let err = parse_messages(&msg, &mut out, &mut false).unwrap_err();
             assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        }
+
+        #[test]
+        fn a_dump_that_raced_a_change_is_flagged_as_interrupted() {
+            // Given: a dump whose messages carry NLM_F_DUMP_INTR.
+            let mut msg = nlmsg(RTM_NEWADDR, &ifaddrmsg(libc::AF_INET as u8, 0, 1));
+            msg[6..8].copy_from_slice(&NLM_F_DUMP_INTR.to_ne_bytes());
+            msg.extend(nlmsg(NLMSG_DONE, &[0, 0, 0, 0]));
+
+            let mut out = Vec::new();
+            let mut interrupted = false;
+            let progress = parse_messages(&msg, &mut out, &mut interrupted).unwrap();
+
+            // Then: the caller learns it must read the table again.
+            assert_eq!(progress, DumpProgress::Done);
+            assert!(interrupted);
+
+            let clean = nlmsg(NLMSG_DONE, &[0, 0, 0, 0]);
+            let mut interrupted = false;
+            let _ = parse_messages(&clean, &mut Vec::new(), &mut interrupted).unwrap();
+            assert!(!interrupted);
         }
 
         #[test]
@@ -649,7 +718,7 @@ mod linux {
             let mut msg = nlmsg(RTM_NEWADDR, &ifaddrmsg(libc::AF_INET as u8, 0, 1));
             msg[0..4].copy_from_slice(&999u32.to_ne_bytes());
             let mut out = Vec::new();
-            assert!(parse_messages(&msg, &mut out).is_err());
+            assert!(parse_messages(&msg, &mut out, &mut false).is_err());
         }
 
         #[test]
