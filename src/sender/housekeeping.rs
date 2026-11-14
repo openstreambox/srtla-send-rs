@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
+use smallvec::SmallVec;
 use srtla_core::connection::{STARTUP_GRACE_MS, SrtlaConnection};
 use srtla_core::registration::SrtlaRegistrationManager;
 use tokio::sync::mpsc::UnboundedSender;
@@ -13,6 +14,56 @@ use super::sequence::SequenceTracker;
 use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for};
 
 pub const GLOBAL_TIMEOUT_MS: u64 = 10_000;
+
+/// Which registration frame [`send_rejoin`] put on the wire, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejoinSend {
+    /// This uplink was the one awaiting REG2, so it restarts from REG1.
+    Reg1,
+    /// The group exists: REG2 with its id re-admits this uplink.
+    Reg2,
+    /// Another uplink is mid-handshake; this one waits for the broadcast REG2.
+    Deferred,
+}
+
+/// Re-join a freshly re-created uplink socket to the bond's group.
+///
+/// Shared by the timeout reconnect below and the source-address follower, so a
+/// link that comes back on a new socket always takes the same path: REG2 with
+/// the existing group id when nothing else is registering, REG1 if this uplink
+/// was itself the pending one, and nothing while another uplink is mid-handshake
+/// (the REG2 broadcast that follows its REG3 reaches this uplink too).
+pub(super) async fn send_rejoin(
+    reg: &mut SrtlaRegistrationManager,
+    idx: usize,
+    conn: &mut SrtlaConnection,
+    io: &super::uplink::ConnIo,
+    now_ms: u64,
+) -> RejoinSend {
+    let (kind, pkt): (RejoinSend, SmallVec<u8, 64>) = match reg.pending_reg2_idx() {
+        Some(pending) if pending == idx => (
+            RejoinSend::Reg1,
+            SmallVec::from_slice_copy(&reg.build_reg1_for(idx, now_ms)),
+        ),
+        Some(_) => return RejoinSend::Deferred,
+        None => (
+            RejoinSend::Reg2,
+            SmallVec::from_slice_copy(&reg.build_reg2(idx)),
+        ),
+    };
+    match io.send_control_padded(&pkt).await {
+        Ok(_) => conn.note_sent(now_ms),
+        Err(e) => {
+            let name = if kind == RejoinSend::Reg1 {
+                "REG1"
+            } else {
+                "REG2"
+            };
+            warn!("Failed to send {name} to uplink #{idx}: {e:?}");
+        }
+    }
+    kind
+}
 
 /// Handle periodic housekeeping tasks.
 ///
@@ -55,6 +106,14 @@ pub async fn handle_housekeeping(
 
     // housekeeping: drive registration, send keepalives
     for (i, conn) in connections.iter_mut().enumerate() {
+        // A link whose bound source address is not on its interface has no
+        // address to send from. Reconnecting it would only retry a bind that
+        // cannot succeed; the address follower re-binds it once an address is
+        // there (see `super::address_follow`).
+        if conn_io.get(&conn.conn_id).is_some_and(|io| io.source_down) {
+            continue;
+        }
+
         // Re-resolve the egress interface by NAME and re-read the route
         // invariant before anything else touches this link's socket. A replug
         // leaves the socket holding an ifindex that no longer names the device,
@@ -109,13 +168,6 @@ pub async fn handle_housekeeping(
                 match reg.pending_reg2_idx() {
                     Some(idx) if idx == i => {
                         info!("{} marked for recovery; re-sending REG1", label);
-                        let pkt = reg.build_reg1_for(i, current_ms);
-                        if let Some(io) = conn_io.get(&conn.conn_id) {
-                            match io.send_control_padded(&pkt).await {
-                                Ok(_) => conn.note_sent(current_ms),
-                                Err(e) => warn!("Failed to send REG1 to uplink #{i}: {e:?}"),
-                            }
-                        }
                     }
                     Some(_) => {
                         debug!(
@@ -125,14 +177,10 @@ pub async fn handle_housekeeping(
                     }
                     None => {
                         info!("{} marked for recovery; re-sending REG2", label);
-                        let pkt = reg.build_reg2(i);
-                        if let Some(io) = conn_io.get(&conn.conn_id) {
-                            match io.send_control_padded(&pkt).await {
-                                Ok(_) => conn.note_sent(current_ms),
-                                Err(e) => warn!("Failed to send REG2 to uplink #{i}: {e:?}"),
-                            }
-                        }
                     }
+                }
+                if let Some(io) = conn_io.get(&conn.conn_id) {
+                    send_rejoin(reg, i, conn, io, current_ms).await;
                 }
             } else {
                 debug!("{} timed out but in retry interval", conn.label);

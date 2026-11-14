@@ -191,6 +191,7 @@ The fork is based on upstream `df0b3938791ff24eced4aed8b29e3d49d0efb639` (v4.0.1
 - `--stats-file-interval <MS>`: publish cadence for `--stats-file` (default `1000`).
 - `--bind-map <PATH>`: an optional sidecar that adds interface binding and stable link identity to `BIND_IPS_FILE`, described below.
 - `--capabilities-json`: print one line of JSON describing what this build supports and exit `0`, before logging starts and without binding anything.
+- `--no-follow-address`: turn off source-address following for mapped links (described under the bind-map sidecar below). On by default.
 
 Two upstream defaults matter to the device integration and are left as upstream ships them: whole-bond re-home and stalled-link deselect are **on** (`--no-rehome`, `--no-stall-deselect` to opt out), and the per-link liveness timeout defaults to 5 s. CeraUI passes `--conn-timeout-ms 15000` on the command line to match the bonding receiver's own timeout; the binary does not bake that value in.
 
@@ -218,6 +219,8 @@ If the OS cannot create the telemetry writer thread, startup exits non-zero with
 `BIND_IPS_FILE` identifies an uplink by source IP alone, which cannot tell two identical USB modems apart when both present the same address. `--bind-map <PATH>` names a separate JSON file that describes the IP list **positionally**: the Nth row describes the Nth accepted IP line and carries `{link_id, ip, iface, id_path?}`, under a header of `{schema_version, generation, ips_file_sha256}`. The IP list itself is byte-unchanged, and without the flag the sender behaves exactly as upstream does.
 
 With a mapping in place, a link's socket is bound to its interface with `SO_BINDTODEVICE` **and** to its source address, so egress leaves the named interface and the wire source is deterministic. `link_id` is the stable identity across reloads, reconnects, and interface changes. The interface is re-resolved by name every housekeeping tick (a replugged modem gets a fresh socket; a vanished one waits for a reload), and each interface's default route is observed read-only and reported on its own axis in the status log. The sidecar must name the exact IP-list bytes it describes; a mismatch is retried briefly and then fails open in a duplicate-safe way (at startup, one representative of a same-IP collision group is kept and the rest reported excluded; on a reload, the last valid mapped pool is retained). Full contract: [ADR-003](docs/adr/ADR-003-bind-map-contract.md).
+
+**Source-address following.** A mapped link also follows its interface's address. When the carrier gives the interface a new source address (a session reset, a new DHCP lease, an IPv6 prefix change, a privacy-address rotation), the old socket would keep sending from an address the host no longer owns. The sender notices on its own, from netlink address notifications backed by a local-address check every 2 s. Once the bound address has been missing for 1.5 s, it re-creates just that link's socket on the new address and sends REG2 with the bond's existing group ID. The receiver keeps one session, the other links are untouched, and no SIGHUP or restart is needed. The replacement must be on the same interface, of the same family and scope, usable (not tentative, deprecated or failed DAD), and not already bound by another link. An IPv6 privacy address is replaced by the next privacy address, a stable one by a stable one. If the address disappears with nothing to replace it, the link is taken out of service and not reconnected until an address returns, so it does not keep retrying a bind that cannot succeed. A link whose address keeps changing waits longer before each re-bind (2 s, doubling to 30 s within a minute). A later SIGHUP that names the new address keeps the link as it is. Unmapped links are never moved, because their source IP *is* their identity. `--no-follow-address` restores waiting for a reload.
 
 ### Capability probe
 
@@ -380,6 +383,8 @@ kill -HUP <pid_of_srtla_send>
 ```
 
 On Windows this arm is disabled; restart the process after editing the IP list.
+
+A mapped link whose interface is renumbered does not need a reload: see source-address following under [Bind-map sidecar](#bind-map-sidecar).
 
 ## How It Works
 

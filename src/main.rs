@@ -175,6 +175,17 @@ struct Cli {
     #[arg(long = "no-rehome")]
     no_rehome: bool,
 
+    /// Disable source-address following (on by default). When a mapped link's
+    /// source address disappears from its interface (a carrier session reset,
+    /// a new DHCP lease, an IPv6 prefix change or privacy-address rotation),
+    /// the sender re-binds just that link to the interface's new address and
+    /// re-joins the existing group, without waiting for a SIGHUP. A link whose
+    /// address vanished with no replacement is held down until one returns.
+    /// Links without a --bind-map row are never moved. Pass this to keep the
+    /// behaviour of waiting for a reload.
+    #[arg(long = "no-follow-address")]
+    no_follow_address: bool,
+
     /// UDP bind address for the keyframe priority sidecar. The encoder
     /// front-end sends 5-byte datagrams here to open a critical routing
     /// window. Unauthenticated same-device IPC: bind loopback. Omit to
@@ -332,6 +343,7 @@ async fn main() -> Result<()> {
         args.conn_timeout_ms,
         args.no_rehome,
     );
+    config.set_follow_source_address(!args.no_follow_address);
 
     // Create shared stats for telemetry export
     let shared_stats = stats::SharedStats::new();

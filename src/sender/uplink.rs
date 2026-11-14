@@ -37,6 +37,11 @@ pub struct ConnIo {
     /// Last observed per-interface default-route invariant. Distinct from ACK
     /// liveness: a link can be ACK-live and route-blackholed at the same time.
     pub route_health: RouteHealth,
+    /// The link's bound source address is not on its interface (settling, or
+    /// gone with nothing to replace it). Housekeeping neither reconnects nor
+    /// keeps it alive until the address follower re-binds it
+    /// (`sender::address_follow`).
+    pub source_down: bool,
 }
 
 impl ConnIo {
@@ -58,6 +63,7 @@ impl ConnIo {
             spec: UplinkSpec::unmapped(ip),
             egress: EgressLifecycle::unmapped(),
             route_health: RouteHealth::Unknown,
+            source_down: false,
         }
     }
 

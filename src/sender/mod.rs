@@ -1,3 +1,4 @@
+mod address_follow;
 mod client_dedup;
 mod connections;
 mod egress_tick;
@@ -17,6 +18,12 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
+// Source-address following: the pure diff/debounce half is public so tests
+// can drive it without a real interface being renumbered.
+#[allow(unused_imports)]
+pub use address_follow::{
+    ADDRESS_SETTLE_MS, AddressFollower, FollowAction, LinkFollow, Observation, observe,
+};
 use anyhow::{Context, Result};
 pub(crate) use client_dedup::ClientDedup;
 // Re-export connection management functions for tests
@@ -286,6 +293,20 @@ pub async fn run_sender_with_config(
     let (bind_map_tx, mut bind_map_rx) =
         tokio::sync::mpsc::unbounded_channel::<links::PairReadResult>();
 
+    // Follow each mapped link's source address so a renumbered interface does
+    // not need a reload. The watcher runs off the forwarding loop and only
+    // hands over a new table when something changed.
+    let mut addr_watch = if config.follow_source_address() {
+        crate::net::spawn_address_watch()
+    } else {
+        info!("source-address follow disabled (--no-follow-address)");
+        None
+    };
+    let mut follower = address_follow::AddressFollower::new();
+    if let Some(rx) = addr_watch.as_mut() {
+        follower.set_table(rx.borrow_and_update().clone());
+    }
+
     // Main loop - run housekeeping frequently like C version
     // Run housekeeping once before entering the main event loop so we start in a clean state.
     {
@@ -379,7 +400,47 @@ pub async fn run_sender_with_config(
                             return Ok(());
                         }
                     }
+                    changed = async {
+                        match addr_watch.as_mut() {
+                            Some(rx) => rx.changed().await.map(|()| rx.borrow_and_update().clone()),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match changed {
+                            Ok(table) => {
+                                follower.set_table(table);
+                                address_follow::follow_addresses(
+                                    &mut follower,
+                                    &mut connections,
+                                    &mut conn_io,
+                                    &mut reg,
+                                    &mut seq_tracker,
+                                    &mut reader_handles,
+                                    &packet_tx,
+                                    receiver_host,
+                                    srtla_core::utils::now_ms(),
+                                ).await;
+                            }
+                            // The watcher task ended; keep the last table and
+                            // carry on with housekeeping-driven checks only.
+                            Err(_) => addr_watch = None,
+                        }
+                    }
                     _ = housekeeping_timer.tick() => {
+                        // Before housekeeping, so a link whose address just
+                        // vanished is taken down instead of being reconnected
+                        // onto an address the host no longer owns.
+                        address_follow::follow_addresses(
+                            &mut follower,
+                            &mut connections,
+                            &mut conn_io,
+                            &mut reg,
+                            &mut seq_tracker,
+                            &mut reader_handles,
+                            &packet_tx,
+                            receiver_host,
+                            srtla_core::utils::now_ms(),
+                        ).await;
                         let classic = config.mode().is_classic();
                         if let Err(err) = handle_housekeeping(
                             &mut connections,

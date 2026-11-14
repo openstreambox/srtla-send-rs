@@ -81,6 +81,7 @@ Five Miri filters, cross-channel/OS lanes, privileged netns prerequisites, stall
 - Capability probe keys are frozen; nonzero exit, malformed output or timeout means no support, regardless of error wording.
 - --bind-map stays optional; IP-list bytes stay unchanged; degraded reload retains the last valid mapped pool.
 - Stable identity is link_id, not IP or (ip, iface); mapped sockets bind both interface and source IP.
+- A mapped link follows its interface's new source address in place (same link_id, REG2 into the existing group); unmapped links never move.
 - Never install policy routes or silently source-filter upstream's unconnected uplink sockets.
 - Bind the local listener before reading the IP list or dialing uplinks; empty startup waits for SIGHUP, never crash-loops.
 - Refuse zero-valid-IP reload while keeping live links; clean SIGTERM/SIGINT exits 0 within the device's 10 s window.
