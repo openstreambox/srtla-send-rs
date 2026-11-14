@@ -47,6 +47,7 @@ pub struct SrtlaRegistrationManager {
     pub(crate) pending_timeout_at_ms: u64,
     pub(crate) active_connections: usize,
     pub has_connected: bool,
+    group_id_issued: bool,
     broadcast_reg2_pending: bool,
     pub(crate) reg1_target_idx: Option<usize>,
     pub(crate) reg1_next_send_at_ms: u64,
@@ -86,6 +87,7 @@ impl SrtlaRegistrationManager {
             pending_timeout_at_ms: 0,
             active_connections: 0,
             has_connected: false,
+            group_id_issued: false,
             broadcast_reg2_pending: false,
             reg1_target_idx: None,
             reg1_next_send_at_ms: 0,
@@ -120,8 +122,10 @@ impl SrtlaRegistrationManager {
     /// broadcast flag, the connected snapshot and the RTT probing state machine
     /// — is cleared, so the next housekeeping tick re-probes and re-registers
     /// over the plain REG1/REG2/REG3 flow. `has_connected` survives: it records
-    /// that this *process* has streamed before, which only drives log wording.
+    /// that this *process* has streamed before. `group_id_issued` separately
+    /// tracks whether the current id can be used to rejoin a receiver group.
     pub fn reset_for_rehome(&mut self) {
+        self.group_id_issued = false;
         rand::rng().fill_bytes(&mut self.srtla_id[SRTLA_ID_LEN / 2..]);
         self.pending_reg2_idx = None;
         self.pending_timeout_at_ms = 0;
@@ -136,6 +140,58 @@ impl SrtlaRegistrationManager {
         self.probing_state = default_probing_state();
         self.probe_id = new_probe_id();
         self.probe_results = new_probe_results();
+    }
+
+    /// Reconcile positional handshake state after a source-list reload.
+    /// Surviving socket identities retain their grants and registration. New
+    /// sockets rejoin the live group with REG2, even when every source changed.
+    /// Without an established, issued id, a replacement pool probes again.
+    pub fn reload_connections(
+        &mut self,
+        previous_ids: &[u64],
+        connections: &mut [SrtlaConnection],
+        now: u64,
+    ) -> SmallVec<(usize, [u8; SRTLA_TYPE_REG2_LEN]), 4> {
+        let remap = |idx: usize| {
+            previous_ids
+                .get(idx)
+                .and_then(|id| connections.iter().position(|conn| conn.conn_id == *id))
+        };
+        let any_survivor = previous_ids
+            .iter()
+            .any(|id| connections.iter().any(|conn| conn.conn_id == *id));
+        if !any_survivor && !(self.has_connected && self.group_id_issued) {
+            self.reset_for_rehome();
+            return if connections.is_empty() {
+                SmallVec::new()
+            } else {
+                self.start_probing(connections, now)
+            };
+        }
+        self.pending_reg2_idx = self.pending_reg2_idx.and_then(remap);
+        self.reg1_target_idx = self.reg1_target_idx.and_then(remap);
+        self.awaiting_reg3 = self
+            .awaiting_reg3
+            .iter()
+            .filter_map(|&idx| remap(idx))
+            .collect();
+        self.probe_results.retain_mut(|probe| {
+            if let Some(idx) = remap(probe.conn_idx) {
+                probe.conn_idx = idx;
+                true
+            } else {
+                false
+            }
+        });
+        self.update_active_connections(connections);
+        let mut sends = SmallVec::new();
+        for (idx, conn) in connections.iter_mut().enumerate() {
+            if !previous_ids.contains(&conn.conn_id) {
+                let packet = self.build_reg2(idx);
+                sends.push((idx, packet));
+            }
+        }
+        sends
     }
 
     /// Arm the one-shot REG3 grant for `conn_idx`.
@@ -320,6 +376,7 @@ impl SrtlaRegistrationManager {
         if self.pending_reg2_idx == Some(conn_idx) {
             // server returns full id starting at byte 2
             self.srtla_id.copy_from_slice(&buf[2..2 + SRTLA_ID_LEN]);
+            self.group_id_issued = true;
             debug!(
                 "REG2 from uplink #{} accepted; broadcasting to peers",
                 conn_idx
@@ -560,5 +617,88 @@ impl SrtlaRegistrationManager {
     /// want to start from "a REG2 is in flight on this uplink".
     pub fn arm_reg3_gate(&mut self, conn_idx: usize) {
         self.arm_reg3_grant(conn_idx);
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    fn connection(id: u64) -> SrtlaConnection {
+        SrtlaConnection::new_registering(id, "test".into(), "127.0.0.1".parse().unwrap(), 1)
+    }
+
+    #[test]
+    fn ipv4_modem_new_ip_rejoins_live_group_without_restarting_session() {
+        let mut reg = SrtlaRegistrationManager::new();
+        reg.probing_state = ProbingState::Complete;
+        reg.build_reg1_for(0, 1);
+        let issued_id = [42; SRTLA_ID_LEN];
+        reg.handle_reg2(0, &create_reg2_packet(&issued_id), 2);
+        reg.build_reg2(0);
+        assert!(reg.handle_reg3(0));
+        let mut replacement = [SrtlaConnection::new_registering(
+            20,
+            "modem".into(),
+            "127.0.0.2".parse().unwrap(),
+            1,
+        )];
+        let sends = reg.reload_connections(&[10], &mut replacement, 100);
+        assert_eq!(
+            reg.srtla_id, issued_id,
+            "live receiver group must survive an IP change"
+        );
+        assert!(!reg.is_probing());
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0], (0, create_reg2_packet(&issued_id)));
+        assert!(reg.handle_reg3(0));
+        assert!(reg.reg_driver_pending_sends(1, 101).reg1.is_none());
+        // A receiver that lost the group may still request the normal REG1 fallback.
+        reg.handle_reg_ngp(0, 102);
+        assert!(reg.reg_driver_pending_sends(1, 102).reg1.is_some());
+    }
+
+    #[test]
+    fn replacement_pool_restarts_probing_after_family_change() {
+        let mut reg = SrtlaRegistrationManager::new();
+        let mut old = [connection(10)];
+        reg.start_probing(&mut old, 1);
+        reg.probing_state = ProbingState::Complete;
+        let mut new = [connection(20)];
+        let probes = reg.reload_connections(&[10], &mut new, 100);
+        assert_eq!(probes.len(), 1);
+        assert!(reg.is_probing());
+        assert_eq!(reg.probe_results[0].conn_idx, 0);
+    }
+
+    #[test]
+    fn replacement_after_rehome_does_not_rejoin_an_unissued_group() {
+        let mut reg = SrtlaRegistrationManager::new();
+        reg.has_connected = true;
+        reg.group_id_issued = true;
+        reg.reset_for_rehome();
+        let mut new = [connection(20)];
+        let probes = reg.reload_connections(&[10], &mut new, 100);
+        assert_eq!(probes.len(), 1);
+        assert!(reg.is_probing());
+        assert!(!reg.group_id_issued);
+    }
+
+    #[test]
+    fn reload_remaps_survivor_handshakes_and_registers_new_links() {
+        let mut reg = SrtlaRegistrationManager::new();
+        reg.probing_state = ProbingState::Complete;
+        reg.build_reg1_for(1, 10);
+        reg.build_reg2(0);
+        let mut new = [connection(20), connection(30), connection(10)];
+        let id = reg.srtla_id;
+        let sends = reg.reload_connections(&[10, 20], &mut new, 20);
+        assert_eq!(reg.pending_reg2_idx, Some(0));
+        assert_eq!(reg.reg1_target_idx, Some(0));
+        assert!(reg.awaiting_reg3.contains(&2));
+        assert!(reg.awaiting_reg3.contains(&1));
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].0, 1);
+        assert_eq!(reg.srtla_id, id);
     }
 }

@@ -445,36 +445,12 @@ pub async fn run_sender_with_config(
                             && let Some(new_links) = changes.new_links
                         {
                             info!("applying queued connection changes: {} uplinks", new_links.len());
-                            apply_connection_changes(
-                                &mut connections,
-                                &mut conn_io,
-                                &new_links,
-                                &changes.receiver_host,
-                                changes.receiver_port,
-                                &mut last_selected_idx,
-                                &mut seq_tracker,
-                                &binder,
+                            apply_queued_connection_changes(
+                                &mut connections, &mut conn_io, &new_links,
+                                &changes.receiver_host, changes.receiver_port,
+                                &mut last_selected_idx, &mut seq_tracker, &binder,
+                                &mut reader_handles, &packet_tx, &mut reg,
                             ).await;
-                            info!("connection changes applied successfully");
-                            sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
-                            // Bootstrap registration when a reload populated an
-                            // empty pool. `start_probing` self-guards (no-op once
-                            // probing has begun), so this only fires on the
-                            // empty-pool -> first-uplinks transition and never
-                            // disturbs an established bond's reload.
-                            if !connections.is_empty() {
-                                let probes = reg.start_probing(
-                                    &mut connections,
-                                    srtla_core::utils::now_ms(),
-                                );
-                                for (idx, pkt) in probes {
-                                    if let Some(conn) = connections.get(idx)
-                                        && let Some(io) = conn_io.get(&conn.conn_id)
-                                    {
-                                        let _ = io.send_control_padded(&pkt).await;
-                                    }
-                                }
-                            }
                         }
 
                         status_elapsed_ms = status_elapsed_ms.saturating_add(HOUSEKEEPING_INTERVAL_MS);
@@ -673,6 +649,49 @@ pub async fn read_weighted_ip_list(path: &str) -> Result<(SmallVec<IpAddr, 4>, S
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn apply_queued_connection_changes(
+    connections: &mut SmallVec<srtla_core::connection::SrtlaConnection, 4>,
+    conn_io: &mut ConnIoMap,
+    new_links: &[crate::net::UplinkSpec],
+    receiver_host: &str,
+    receiver_port: u16,
+    last_selected_idx: &mut Option<usize>,
+    seq_tracker: &mut SequenceTracker,
+    binder: &Arc<dyn crate::net::UplinkBinder>,
+    reader_handles: &mut HashMap<ConnectionId, ReaderHandle>,
+    packet_tx: &tokio::sync::mpsc::UnboundedSender<uplink::UplinkPacket>,
+    reg: &mut SrtlaRegistrationManager,
+) {
+    let previous_ids: Vec<u64> = connections.iter().map(|c| c.conn_id).collect();
+    apply_connection_changes(
+        connections,
+        conn_io,
+        new_links,
+        receiver_host,
+        receiver_port,
+        last_selected_idx,
+        seq_tracker,
+        binder,
+    )
+    .await;
+    info!("connection changes applied successfully");
+    sync_readers(connections, conn_io, reader_handles, packet_tx);
+    // Reload can replace or reorder the sockets the registration
+    // manager indexes. Reconcile before any queued reply is handled.
+    {
+        let probes =
+            reg.reload_connections(&previous_ids, connections, srtla_core::utils::now_ms());
+        for (idx, pkt) in probes {
+            if let Some(conn) = connections.get(idx)
+                && let Some(io) = conn_io.get(&conn.conn_id)
+            {
+                let _ = io.send_control_padded(&pkt).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod shutdown_hook_tests {
     use std::sync::Arc;
@@ -709,5 +728,95 @@ mod shutdown_hook_tests {
             1,
             "an explicit run drains the set, so Drop must not run the hook again"
         );
+    }
+}
+
+#[cfg(test)]
+mod reload_wiring_tests {
+    use srtla_protocol::*;
+
+    use super::*;
+    use crate::net::{SourceIpBinder, UplinkBinder, UplinkSpec};
+
+    #[derive(Default)]
+    struct LoopbackBinder(std::sync::Mutex<HashMap<IpAddr, SocketAddr>>);
+
+    impl UplinkBinder for LoopbackBinder {
+        fn bind(&self, socket: &socket2::Socket, ip: IpAddr) -> anyhow::Result<()> {
+            // Keep the fixture portable: model distinct sources with separate
+            // real sockets bound to the single loopback address every OS owns.
+            SourceIpBinder.bind(socket, "127.0.0.1".parse().unwrap())?;
+            self.0
+                .lock()
+                .unwrap()
+                .insert(ip, socket.local_addr()?.as_socket().unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_reload_remaps_handshake_and_sends_reg2_on_new_socket() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        let recorded = Arc::new(LoopbackBinder::default());
+        let binder: Arc<dyn UplinkBinder> = recorded.clone();
+        let mut connections = SmallVec::new();
+        let mut io = ConnIoMap::new();
+        let mut selected = None;
+        let mut tracker = SequenceTracker::new();
+        let mut readers = HashMap::new();
+        let (tx, _rx) = create_uplink_channel();
+        let mut reg = SrtlaRegistrationManager::new();
+        let a = UplinkSpec::unmapped("127.0.0.1".parse().unwrap());
+        let b = UplinkSpec::unmapped("127.0.0.2".parse().unwrap());
+        apply_connection_changes(
+            &mut connections,
+            &mut io,
+            &[a.clone(), b.clone()],
+            "127.0.0.1",
+            port,
+            &mut selected,
+            &mut tracker,
+            &binder,
+        )
+        .await;
+        assert_eq!(connections.len(), 2);
+        let survivor = connections[1].conn_id;
+        // A pending handshake on the second socket must follow it to index 0.
+        reg.build_reg1_for(1, srtla_core::utils::now_ms());
+        let id = *reg.srtla_id();
+        let c = UplinkSpec::unmapped("127.0.0.3".parse().unwrap());
+        apply_queued_connection_changes(
+            &mut connections,
+            &mut io,
+            &[b, c],
+            "127.0.0.1",
+            port,
+            &mut selected,
+            &mut tracker,
+            &binder,
+            &mut readers,
+            &tx,
+            &mut reg,
+        )
+        .await;
+        assert_eq!(connections[0].conn_id, survivor);
+        assert_eq!(reg.pending_reg2_idx(), Some(0));
+        let mut packet = [0; 512];
+        let (len, from) = time::timeout(Duration::from_secs(1), receiver.recv_from(&mut packet))
+            .await
+            .expect("new socket must send without the grace-period retry")
+            .unwrap();
+        assert_eq!(
+            from,
+            recorded.0.lock().unwrap()[&"127.0.0.3".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(&packet[..len], &create_reg2_packet(&id));
+        assert!(reg.is_awaiting_reg3(1));
+        assert!(readers.contains_key(&survivor));
+        assert_eq!(readers.len(), 2);
+        for (_, reader) in readers {
+            reader.handle.abort();
+        }
     }
 }
