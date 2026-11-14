@@ -117,8 +117,39 @@ while True:
     sender.terminate();sender.wait()
     # Tear down the CLAT destination route before restoring native IPv4.
     run('ip','route','del','192.0.2.2/32','dev',tun)
+    # Reload must retain forwarding when the selected source family changes.
+    path={'ip':'fd51::1','mode':'ipv6'}
+    sender=start(path)
+    packets('family-change-before',path,sender)
     run('ip','addr','add','192.0.2.1/24','dev','wan0')
     run(*P('ip','addr','add','192.0.2.2/24','dev','srv0'))
+    # A second synthetic IPv6 uplink keeps the host genuinely mixed when wan0
+    # loses IPv6. No physical device is moved or used.
+    run('ip','link','add','backup0','type','veth','peer','name','backup-peer')
+    run('ip','link','set','backup-peer','netns',str(peer.pid))
+    run('ip','link','set','backup0','up');run(*P('ip','link','set','backup-peer','up'))
+    run('ip','addr','add','fd52::1/64','dev','backup0','nodad')
+    run(*P('ip','addr','add','fd52::2/64','dev','backup-peer','nodad'))
+    run('ip','-6','route','add','fd51::2/128','via','fd52::2','dev','backup0')
+    run('ip','addr','del','fd51::1/64','dev','wan0')
+    time.sleep(10.2)
+    path={'ip':'192.0.2.1','mode':'ipv4'}
+    publish(path);sender.send_signal(signal.SIGHUP);time.sleep(3)
+    (R/'results.json').write_text(json.dumps(results,indent=2))
+    packets('family-change-after',path,sender)
+    (R/'results.json').write_text(json.dumps(results,indent=2))
+    # Exercise mixed reload/startup and reverse/repeated transitions.
+    run('ip','addr','add','fd51::1/64','dev','wan0','nodad')
+    run('ip','-6','route','del','fd51::2/128','via','fd52::2','dev','backup0')
+    (R/'ips').write_text('192.0.2.1\nfd51::1\n')
+    sender.send_signal(signal.SIGHUP);time.sleep(3)
+    packets('mixed-reload', {'families':['ipv4','ipv6']}, sender)
+    # Retain only IPv6, then return to IPv4 in this very same process.
+    publish({'ip':'fd51::1'});sender.send_signal(signal.SIGHUP);time.sleep(3)
+    packets('reverse-family-change', {'ip':'fd51::1'}, sender)
+    publish({'ip':'192.0.2.1'});sender.send_signal(signal.SIGHUP);time.sleep(3)
+    packets('repeat-family-change', {'ip':'192.0.2.1'}, sender)
+    sender.terminate();sender.wait()
     # Family selection alone recovers through the existing five-second grace
     # retry. Keep this eventual-recovery case independent of prompt reconciliation.
     sender=start({'ip':'fd51::1'})
@@ -137,6 +168,19 @@ while True:
     log=(R/'sender-mixed-start.log').read_text()
     assert 'REG3 from uplink #0' in log and 'REG3 from uplink #1' in log
     assert 'Address family not supported' not in log
+    # A sole IPv4 modem returns with another address while its receiver group lives.
+    sender=start({'ip':'192.0.2.1'},'aonly.test')
+    packets('ipv4-modem-before', {'ip':'192.0.2.1'}, sender)
+    previous_peer=(R/'received.txt').read_text().splitlines()[-1]
+    log_path=R/f'sender-{len(results)-1}.log'
+    before_reload=len(log_path.read_text())
+    run('ip','addr','add','192.0.2.3/24','dev','wan0')
+    run('ip','addr','del','192.0.2.1/24','dev','wan0')
+    publish({'ip':'192.0.2.3'});sender.send_signal(signal.SIGHUP);time.sleep(3)
+    packets('ipv4-modem-new-ip', {'ip':'192.0.2.3'}, sender)
+    assert (R/'received.txt').read_text().splitlines()[-1] == previous_peer, 'upstream SRT peer changed'
+    assert 'REG1 →' not in log_path.read_text()[before_reload:], 'live group restarted'
+    sender.terminate();sender.wait()
     (R/'results.json').write_text(json.dumps(results,indent=2))
 
 finally:

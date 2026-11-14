@@ -7,7 +7,7 @@
 use std::process::Command;
 
 #[test]
-fn native_and_mixed_family_destinations() {
+fn family_transitions_and_live_ipv4_group_rejoin() {
     if !cfg!(target_os = "linux") {
         eprintln!("Skipping: Linux namespaces required");
         return;
