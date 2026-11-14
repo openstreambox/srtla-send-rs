@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Run as root in fresh mount/PID/network namespaces. Synthetic links only.
+
+SRTLA_SEND, SRTLA_RECEIVER (dual-stack), SRTLA_IPV4_RECEIVER, TAYGA_BIN,
+and PROOF_OUTPUT are explicit binary/output paths. All interfaces and TUN nodes
+are created privately; no service or host device is passed into the lab.
+"""
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import struct
+import subprocess as sp
+import time
+
+R = Path(os.environ['PROOF_OUTPUT']); R.mkdir(parents=True, exist_ok=True)
+TAYGA = os.environ['TAYGA_BIN']
+processes = []
+def run(*args):
+    return sp.check_output(args, text=True, stderr=sp.STDOUT)
+def spawn(args, name, **kw):
+    p = sp.Popen(args, stdout=open(R / (name + '.log'), 'w'), stderr=sp.STDOUT, **kw)
+    processes.append(p); return p
+try:
+    assert {x['ifname'] for x in json.loads(run('ip','-j','link'))} == {'lo'}
+    run('mount','--make-rprivate','/')
+    run('mount','-t','tmpfs','-o','mode=755','tmpfs','/dev')
+    for name,minor in [('null',3),('zero',5),('random',8),('urandom',9)]:
+        run('mknod','-m','666','/dev/'+name,'c','1',str(minor))
+    run('mkdir','/dev/net')
+    run('mknod','-m','666','/dev/net/tun','c','10','200')
+    run('mount','-t','sysfs','sysfs','/sys')
+    run('ip','link','set','lo','up')
+    peer = spawn(['unshare','-n','sleep','180'], 'peer'); time.sleep(.2)
+    def P(*a): return ['nsenter','-t',str(peer.pid),'-n','--',*a]
+    run(*P('ip','link','set','lo','up'))
+    run('ip','link','add','wan0','type','veth','peer','name','srv0')
+    run('ip','link','set','srv0','netns',str(peer.pid))
+    for prefix,dev,addr in [([], 'wan0','fd51::1/64'),(P(), 'srv0','fd51::2/64')]:
+        run(*prefix,'ip','link','set',dev,'up')
+        run(*prefix,'ip','addr','add',addr,'dev',dev,'nodad')
+    run(*P('ip','addr','add','192.0.2.2/32','dev','lo'))
+    # DNS fixture supplies an A/AAAA pair for mixed.test, A alone for aonly.test.
+    dns = '''import socket,struct
+s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind(('fd51::2',53))
+while True:
+ b,a=s.recvfrom(4096);q=b[12:];t=struct.unpack('!H',q[-4:-2])[0];answer=b''
+ if t==1: answer=socket.inet_aton('192.0.2.2')
+ if t==28 and b'mixed' in q: answer=socket.inet_pton(socket.AF_INET6,'fd51::2')
+ s.sendto(b[:2]+struct.pack('!HHHHH',0x8180,1,int(bool(answer)),0,0)+q+(b'\\xc0\\x0c'+struct.pack('!HHIH',t,1,30,len(answer))+answer if answer else b''),a)
+'''
+    dns = dns.replace('while True:', f"open({str(R/'dns-ready')!r},'w').close()\nwhile True:", 1)
+    spawn(P('python3','-u','-c',dns),'dns')
+    deadline = time.monotonic() + 3
+    while not (R/'dns-ready').exists():
+        assert time.monotonic() < deadline, 'DNS fixture did not bind'
+        time.sleep(.01)
+    (R/'resolv.conf').write_text('nameserver fd51::2\noptions timeout:1 attempts:1\n')
+    run('mount','--bind',str(R/'resolv.conf'),'/etc/resolv.conf')
+    sink = '''import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('192.0.2.2',9002))
+while True:
+ b,a=s.recvfrom(65535)
+ if b.endswith(b'family-proof'):open(%r,'a').write('packet '+str(a)+'\\n')
+''' % str(R/'received.txt')
+    (R/'received.txt').write_text('')
+    spawn(P('python3','-u','-c',sink),'sink')
+    spawn(P(os.environ['SRTLA_RECEIVER'],'--srtla_port','9000','--srt_hostname','192.0.2.2','--srt_port','9002'),'receiver6')
+    spawn(P(os.environ['SRTLA_IPV4_RECEIVER'],'9003','192.0.2.2','9002'),'receiver4')
+    def publish(path):
+        (R/'ips').write_text((path['ip']+'\n') if path else '')
+    results=[]
+    def start(path,dest='mixed.test',port='9000'):
+        publish(path)
+        p=spawn([os.environ['SRTLA_SEND'],'--verbose','9001',dest,port,str(R/'ips')],f'sender-{len(results)}')
+        time.sleep(3)
+        warm=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);warm.sendto(struct.pack('!IIII',0,0,0,1)+b'warmup',('127.0.0.1',9001));warm.close();time.sleep(1);return p
+    def packets(name,path,p):
+        before=(R/'received.txt').read_text().count('packet')
+        u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        for i in range(30):
+            u.sendto(struct.pack('!IIII',i,0,0,1)+b'family-proof',('127.0.0.1',9001));time.sleep(.02)
+        u.close();time.sleep(.4)
+        count=(R/'received.txt').read_text().count('packet')-before
+        assert count==30,(name,count)
+        results.append(dict(case=name,path=path,forwarded=count,sender_pid=p.pid));print('PASS',name,count,flush=True)
+    path={'ip':'fd51::1','mode':'ipv6'}
+    sender=start(path);packets('native-ipv6',path,sender);sender.terminate();sender.wait()
+    run('ip','addr','add','192.0.2.1/24','dev','wan0')
+    run(*P('ip','addr','add','192.0.2.2/24','dev','srv0'))
+    path={'ip':'192.0.2.1','mode':'ipv4'}
+    sender=start(path,'aonly.test');packets('dual-stack',path,sender)
+    sender.terminate();sender.wait()
+    run('ip','addr','del','192.0.2.1/24','dev','wan0')
+    run(*P('ip','addr','del','192.0.2.2/24','dev','srv0'))
+    # Real tayga pair: local CLAT (IPv4 source) -> IPv6-only veth -> PLAT -> IPv4 receiver.
+    run('sysctl','-qw','net.ipv6.conf.all.forwarding=1')
+    run(*P('sysctl','-qw','net.ipv6.conf.all.forwarding=1'))
+    run(*P('sysctl','-qw','net.ipv4.ip_forward=1'))
+    cfg=R/'plat.conf';cfg.write_text('tun-device plat\nipv4-addr 192.0.2.254\nipv6-addr fd51::64\nprefix fd64:51::/96\ndynamic-pool 192.168.255.0/24\n')
+    run(*P(TAYGA,'-c',str(cfg),'--mktun'));run(*P('ip','link','set','plat','up'))
+    run(*P('ip','-6','route','add','fd64:51::/96','dev','plat'))
+    run(*P('ip','route','add','192.168.255.0/24','dev','plat'))
+    spawn(P(TAYGA,'-c',str(cfg),'-d'),'plat')
+    index=socket.if_nametoindex('wan0');tun=f'clat{index}';ip=f'10.254.{index//256}.{index%256}';mapping=f'fd46:4:4::{index:x}'
+    cfg=R/'clat.conf';cfg.write_text(f'tun-device {tun}\nipv4-addr 192.0.0.2\nipv6-addr fd46:4:ffff::{index:x}\nprefix fd64:51::/96\nmap {ip} {mapping}\n')
+    run(TAYGA,'-c',str(cfg),'--mktun');run('ip','link','set',tun,'up');run('ip','addr','add',ip+'/32','dev',tun)
+    run('ip','route','add','192.0.2.2/32','dev',tun)
+    run('ip','-6','route','add',mapping+'/128','dev',tun)
+    run('ip','-6','route','add','fd64:51::/96','via','fd51::2')
+    run('nft','add','table','ip6','proof');run('nft','add','chain','ip6','proof','post','{ type nat hook postrouting priority 100; }')
+    run('nft','add','rule','ip6','proof','post','ip6','saddr',mapping,'oifname','wan0','snat','to','fd51::1')
+    spawn([TAYGA,'-c',str(cfg),'-d'],'clat');time.sleep(.3)
+    path={'ip':ip,'mode':'clat'}
+    sender=start(path,'aonly.test','9003');packets('ipv6-only-clat-nat64',path,sender)
+    sender.terminate();sender.wait()
+    # Tear down the CLAT destination route before restoring native IPv4.
+    run('ip','route','del','192.0.2.2/32','dev',tun)
+    run('ip','addr','add','192.0.2.1/24','dev','wan0')
+    run(*P('ip','addr','add','192.0.2.2/24','dev','srv0'))
+    # Family selection alone recovers through the existing five-second grace
+    # retry. Keep this eventual-recovery case independent of prompt reconciliation.
+    sender=start({'ip':'fd51::1'})
+    packets('reload-family-before', {'ip':'fd51::1'}, sender)
+    publish({'ip':'192.0.2.1'})
+    sender.send_signal(signal.SIGHUP)
+    time.sleep(8)
+    packets('reload-family-after', {'ip':'192.0.2.1'}, sender)
+    sender.terminate();sender.wait()
+    # Both sources at startup against dual DNS, with IPv6 first in the answer.
+    (R/'ips').write_text('192.0.2.1\nfd51::1\n')
+    sender=spawn([os.environ['SRTLA_SEND'],'--verbose','9001','mixed.test','9000',str(R/'ips')], 'sender-mixed-start')
+    time.sleep(4)
+    packets('mixed-start', {'families':['ipv4','ipv6']}, sender)
+    sender.terminate();sender.wait()
+    log=(R/'sender-mixed-start.log').read_text()
+    assert 'REG3 from uplink #0' in log and 'REG3 from uplink #1' in log
+    assert 'Address family not supported' not in log
+    (R/'results.json').write_text(json.dumps(results,indent=2))
+
+finally:
+    for p in reversed(processes):
+        if p.poll() is None:p.terminate()
+    for p in processes:
+        try:p.wait(timeout=3)
+        except sp.TimeoutExpired:p.kill();p.wait()

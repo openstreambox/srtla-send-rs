@@ -15,6 +15,7 @@ done
 
 ALL_TARGETS=(
   netns_basic
+  netns_family
   netns_failure
   netns_impairment
   netns_scenario
@@ -56,6 +57,7 @@ fi
 
 budget_for() {
   case "$1" in
+    netns_family) echo "180" ;;
     netns_twin) echo "${TWIN_TIMEOUT_SECONDS}" ;;
     *) echo "${TIMEOUT_SECONDS}" ;;
   esac
@@ -63,9 +65,15 @@ budget_for() {
 
 for TARGET in "${TARGETS[@]}"; do
   BUDGET="$(budget_for "${TARGET}")"
+  CARGO_ARGS=()
+  TEST_ARGS=(--nocapture)
+  if [[ "${TARGET}" == netns_family ]]; then
+    CARGO_ARGS=(-j1)
+    TEST_ARGS+=(--test-threads=1)
+  fi
   set +e
   timeout --foreground --kill-after=10s "${BUDGET}s" \
-    cargo test --all-features --test "${TARGET}" -- --nocapture
+    cargo test "${CARGO_ARGS[@]}" --all-features --test "${TARGET}" -- "${TEST_ARGS[@]}"
   STATUS=$?
   set -e
   if [[ "${STATUS}" -eq 124 ]]; then
