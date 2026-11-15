@@ -729,6 +729,7 @@ mod tests {
                 },
                 egress: EgressLifecycle::for_spec(iface.as_ref()),
                 route_health: RouteHealth::Unknown,
+                source_down: false,
             }
         }
 

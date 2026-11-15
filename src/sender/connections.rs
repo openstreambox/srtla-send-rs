@@ -333,6 +333,7 @@ async fn connect_uplink(
         spec: spec.clone(),
         egress,
         route_health,
+        source_down: false,
     };
     Ok((conn, io))
 }

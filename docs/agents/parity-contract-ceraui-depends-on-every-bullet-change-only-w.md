@@ -90,6 +90,18 @@
   its own axis (a lost route is a `WARN`, a regained one an `INFO`; `Unknown` crossings
   are silent). No policy routing is ever installed. `src/net/egress.rs`,
   `src/net/route.rs`, `src/sender/egress_tick.rs`.
+- **A mapped link follows its interface's source address without a reload.** The
+  local address table is watched (netlink `RTM_NEWADDR`/`RTM_DELADDR`, re-read in full
+  every 2 s as a fallback). A bound address missing from its interface for 1.5 s is
+  replaced by a usable unclaimed address of the same family and scope on that
+  interface (privacy for privacy); the link keeps its `link_id` and `conn_id`, its
+  socket is re-created and it re-joins with REG2 under the existing group ID. No
+  replacement: the link is held out of service, not reconnected, until an address
+  returns. Repeated re-binds back off 2 s → 30 s, back to 2 s after 60 s without
+  one. A link whose interface is removed is left to the egress lifecycle, and with
+  no readable address table nothing is held down. Unmapped links never move.
+  `--no-follow-address` opts out. `src/net/local_addrs.rs`,
+  `src/sender/address_follow.rs`.
 - **A `SIGHUP` with `--bind-map` runs the sidecar read off the forwarding loop**
   (`src/sender/links.rs`), because a retried mismatch could otherwise stall forwarding
   for up to 2 s. Without `--bind-map`, SIGHUP is upstream's reload plus the guard below.

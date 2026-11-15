@@ -14,6 +14,9 @@ pub mod batch_recv;
 // route invariant it is deliberately distinct from, and the identity/socket-key
 // split the bind-map introduces.
 pub mod egress;
+// The host's local address table and the watcher that follows it, so a mapped
+// link can move to its interface's new source address without a reload.
+pub mod local_addrs;
 pub mod route;
 mod socket;
 mod spec;
@@ -24,6 +27,7 @@ pub use batch_recv::{BatchUdpSocket, RecvMmsgBuffer};
 pub use egress::{
     EgressFault, EgressLifecycle, EgressPoll, IfaceResolver, LinkState, SystemIfaceResolver,
 };
+pub use local_addrs::{AddrFlags, AddrTable, LocalAddr, spawn_address_watch};
 pub use route::{RouteHealth, RouteTransition, classify_route_transition, observe_default_route};
 // Host-side binder for platforms that steer egress by network handle (Android).
 // Exported for library consumers; the CLI binary does not construct it. Unix

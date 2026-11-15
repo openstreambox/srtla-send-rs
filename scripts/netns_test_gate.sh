@@ -6,7 +6,10 @@ TIMEOUT_SECONDS="${NETNS_TEST_TIMEOUT_SECONDS:-90}"
 # the 15s ACK liveness timeout and the 30s status-log interval — so they cannot
 # share the default budget.
 TWIN_TIMEOUT_SECONDS="${NETNS_TWIN_TEST_TIMEOUT_SECONDS:-420}"
-for BUDGET in "${TIMEOUT_SECONDS}" "${TWIN_TIMEOUT_SECONDS}"; do
+# The address-follow scenarios each stream for about half a minute around a
+# renumbering, three times over.
+ADDRESS_FOLLOW_TIMEOUT_SECONDS="${NETNS_ADDRESS_FOLLOW_TEST_TIMEOUT_SECONDS:-240}"
+for BUDGET in "${TIMEOUT_SECONDS}" "${TWIN_TIMEOUT_SECONDS}" "${ADDRESS_FOLLOW_TIMEOUT_SECONDS}"; do
   [[ "${BUDGET}" =~ ^[1-9][0-9]*$ ]] || {
     echo "netns-test-gate: timeout budgets must be positive integers" >&2
     exit 2
@@ -14,6 +17,7 @@ for BUDGET in "${TIMEOUT_SECONDS}" "${TWIN_TIMEOUT_SECONDS}"; do
 done
 
 ALL_TARGETS=(
+  netns_address_follow
   netns_basic
   netns_failure
   netns_impairment
@@ -57,6 +61,7 @@ fi
 budget_for() {
   case "$1" in
     netns_twin) echo "${TWIN_TIMEOUT_SECONDS}" ;;
+    netns_address_follow) echo "${ADDRESS_FOLLOW_TIMEOUT_SECONDS}" ;;
     *) echo "${TIMEOUT_SECONDS}" ;;
   esac
 }
@@ -75,4 +80,4 @@ for TARGET in "${TARGETS[@]}"; do
   [[ "${STATUS}" -eq 0 ]] || exit "${STATUS}"
 done
 
-echo "netns-test-gate: OK timeout=${TIMEOUT_SECONDS}s twin-timeout=${TWIN_TIMEOUT_SECONDS}s targets=${#TARGETS[@]}"
+echo "netns-test-gate: OK timeout=${TIMEOUT_SECONDS}s twin-timeout=${TWIN_TIMEOUT_SECONDS}s address-follow-timeout=${ADDRESS_FOLLOW_TIMEOUT_SECONDS}s targets=${#TARGETS[@]}"

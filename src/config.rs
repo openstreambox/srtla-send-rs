@@ -39,6 +39,10 @@ pub struct DynamicConfig {
     /// this is read once, at sender startup, to build the re-home gate. See
     /// `sender::rehome`.
     rehome_on_failure: Arc<AtomicBool>,
+    /// Re-bind a mapped link to its interface's new source address when the
+    /// old one disappears, without waiting for a reload. Read once at sender
+    /// startup, like `rehome_on_failure`. See `sender::address_follow`.
+    follow_source_address: Arc<AtomicBool>,
     /// Learned from the wire rather than configured: see
     /// [`DynamicConfig::set_negotiated_latency_ms`].
     negotiated_latency_ms: Arc<AtomicU32>,
@@ -60,6 +64,7 @@ impl DynamicConfig {
             stall_ack_stale_ms: Arc::new(AtomicU64::new(STALL_ACK_STALE_MS)),
             conn_timeout_ms: Arc::new(AtomicU64::new(CONN_TIMEOUT_MS)),
             rehome_on_failure: Arc::new(AtomicBool::new(true)),
+            follow_source_address: Arc::new(AtomicBool::new(true)),
             negotiated_latency_ms: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -84,6 +89,7 @@ impl DynamicConfig {
                 conn_timeout_ms.clamp(CONN_TIMEOUT_MS_MIN, CONN_TIMEOUT_MS_MAX),
             )),
             rehome_on_failure: Arc::new(AtomicBool::new(!no_rehome)),
+            follow_source_address: Arc::new(AtomicBool::new(true)),
             negotiated_latency_ms: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -94,6 +100,18 @@ impl DynamicConfig {
     /// until DNS luck changes or the process is restarted.
     pub fn rehome_on_failure(&self) -> bool {
         self.rehome_on_failure.load(Ordering::Relaxed)
+    }
+
+    /// Whether a mapped link follows its interface's source address when the
+    /// bound one disappears. On by default; `--no-follow-address` turns it off.
+    pub fn follow_source_address(&self) -> bool {
+        self.follow_source_address.load(Ordering::Relaxed)
+    }
+
+    /// Turn source-address following on or off. Takes effect when the sender
+    /// starts.
+    pub fn set_follow_source_address(&self, enabled: bool) {
+        self.follow_source_address.store(enabled, Ordering::Relaxed);
     }
 
     /// Create a snapshot of current configuration.

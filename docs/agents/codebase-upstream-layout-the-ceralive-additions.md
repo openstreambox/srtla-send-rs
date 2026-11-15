@@ -14,9 +14,11 @@ src/telemetry_doc.rs     ADR-001 document model                      src/telemet
 src/toml_config.rs       applied --config file (read once at startup)
 src/stats.rs             upstream snapshot + SessionBytes + bind-map report slot
 src/bind_map/            ADR-003 sidecar: parser, coherence, retry, resolve, report
-src/net/                 sockets (SourceIpBinder/DeviceBinder), spec, egress, route, batch I/O
+src/net/                 sockets (SourceIpBinder/DeviceBinder), spec, egress, route, batch I/O,
+                         local_addrs (netlink address table + watcher)
 src/sender/              forwarding loop, links (ips file vs bind-map pair), connections,
-                         reload guard, egress_tick, housekeeping, rehome, status
+                         reload guard, egress_tick, housekeeping, rehome, status,
+                         address_follow (re-bind a mapped link to its interface's new address)
 src/sender/client_dedup.rs   forwards each SRT ACK/NAK to the client once
 docs/adr/                ADR-001 (historical), ADR-002, ADR-003, ADR-004
 ci/build-deb.sh          the .deb packager      scripts/  contract tests + netns gate
