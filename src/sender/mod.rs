@@ -129,27 +129,6 @@ impl Drop for ShutdownHooks {
     }
 }
 
-/// Slack added to the follower's wake-up so it never lands a millisecond before
-/// the deadline it waits for (`now_ms` and the timer round differently).
-const FOLLOW_WAKE_SLACK_MS: u64 = 5;
-
-/// Point the follower's timer at its next deadline. Returns whether one is
-/// pending; without one only a table change or a housekeeping tick wakes it.
-fn rearm_follow_wake(
-    timer: std::pin::Pin<&mut time::Sleep>,
-    follower: &address_follow::AddressFollower,
-) -> bool {
-    let now = srtla_core::utils::now_ms();
-    match follower.next_wake(now) {
-        Some(at) => {
-            let wait = at.saturating_sub(now) + FOLLOW_WAKE_SLACK_MS;
-            timer.reset(Instant::now() + Duration::from_millis(wait));
-            true
-        }
-        None => false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sender_with_config(
     local_srt_port: u16,
@@ -354,9 +333,7 @@ pub async fn run_sender_with_config(
     // One address-follower round, then re-arm its own wake-up: a settle time
     // ending between housekeeping ticks is acted on when it ends, not up to a
     // tick later, which is what keeps a single-link bond's gap short.
-    let follow_wake = time::sleep(Duration::ZERO);
-    tokio::pin!(follow_wake);
-    let mut follow_armed = false;
+    let mut follow_wake = address_follow::FollowWake::new();
     macro_rules! follow_round {
         () => {{
             address_follow::follow_addresses(
@@ -371,7 +348,7 @@ pub async fn run_sender_with_config(
                 srtla_core::utils::now_ms(),
             )
             .await;
-            follow_armed = rearm_follow_wake(follow_wake.as_mut(), &follower);
+            follow_wake.rearm(&follower, srtla_core::utils::now_ms());
         }};
     }
 
@@ -463,7 +440,7 @@ pub async fn run_sender_with_config(
                         }
                         follow_round!();
                     }
-                    () = &mut follow_wake, if follow_armed => {
+                    () = follow_wake.fired() => {
                         // A settle time or hold-down ended between ticks.
                         follow_round!();
                     }

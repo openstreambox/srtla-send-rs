@@ -647,8 +647,8 @@ mod linux {
         fn a_point_to_point_address_reports_the_local_side_not_the_peer() {
             // Given: a PPP-style record where IFA_ADDRESS is the peer.
             let mut payload = ifaddrmsg(libc::AF_INET as u8, 0, 7);
-            payload.extend(rta(IFA_ADDRESS, &[10, 64, 0, 1]));
-            payload.extend(rta(IFA_LOCAL, &[10, 64, 12, 34]));
+            payload.extend(rta(IFA_ADDRESS, &[192, 0, 2, 1]));
+            payload.extend(rta(IFA_LOCAL, &[192, 0, 2, 34]));
             let msg = nlmsg(RTM_NEWADDR, &payload);
 
             // When: the datagram is parsed.
@@ -659,7 +659,7 @@ mod linux {
             assert_eq!(progress, DumpProgress::More);
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].ifindex, 7);
-            assert_eq!(out[0].ip, "10.64.12.34".parse::<IpAddr>().unwrap());
+            assert_eq!(out[0].ip, "192.0.2.34".parse::<IpAddr>().unwrap());
         }
 
         #[test]

@@ -183,12 +183,14 @@ impl LinkFollow {
     /// When this link next needs a look even if the address table does not
     /// change: the end of its settle time, or of the hold-down it waits out.
     /// `None` when only a table change can move it.
+    ///
+    /// A down link still offers its settle time: after a failed re-bind the
+    /// retry settles again, and that may end after the hold-down. A link that
+    /// [`FollowAction::MarkDown`] took down settled long ago, so the `> now`
+    /// filter drops its settle time anyway.
     #[must_use]
     pub fn wake_at(&self, now: u64) -> Option<u64> {
-        let settle = self
-            .missing_since
-            .filter(|_| !self.down)
-            .map(|since| since + ADDRESS_SETTLE_MS);
+        let settle = self.missing_since.map(|since| since + ADDRESS_SETTLE_MS);
         let hold = (self.down || self.missing_since.is_some()).then_some(self.hold_until);
         [settle, hold]
             .into_iter()
@@ -311,6 +313,62 @@ impl AddressFollower {
     #[must_use]
     pub fn link(&self, conn_id: ConnectionId) -> Option<&LinkFollow> {
         self.links.get(&conn_id)
+    }
+}
+
+/// Slack added to the follower's wake-up so it never lands a millisecond before
+/// the deadline it waits for (`now_ms` and the timer round differently).
+pub(crate) const FOLLOW_WAKE_SLACK_MS: u64 = 5;
+
+/// The follower's own wake-up between housekeeping ticks, so a settle time or
+/// hold-down that ends mid-tick is acted on when it ends.
+///
+/// The sender's loop re-arms it after every follower round and awaits
+/// [`FollowWake::fired`] in its `select!`.
+pub(crate) struct FollowWake {
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    armed: bool,
+}
+
+impl FollowWake {
+    pub(crate) fn new() -> Self {
+        Self {
+            sleep: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
+            armed: false,
+        }
+    }
+
+    /// Point the timer at the follower's next deadline, seen from `now`
+    /// (`now_ms` time). With none pending it is disarmed, and only a table
+    /// change or a housekeeping tick wakes the follower.
+    pub(crate) fn rearm(&mut self, follower: &AddressFollower, now: u64) {
+        self.armed = match follower.next_wake(now) {
+            Some(at) => {
+                let wait = at.saturating_sub(now) + FOLLOW_WAKE_SLACK_MS;
+                self.sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + std::time::Duration::from_millis(wait));
+                true
+            }
+            None => false,
+        };
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Resolves once the armed deadline passes, then stays pending until the
+    /// next [`FollowWake::rearm`], so a fired timer never spins the loop. Never
+    /// resolves while disarmed. Cancel-safe: dropping it keeps the deadline.
+    pub(crate) async fn fired(&mut self) {
+        if !self.armed {
+            std::future::pending::<()>().await;
+        }
+        self.sleep.as_mut().await;
+        self.armed = false;
     }
 }
 
@@ -527,7 +585,7 @@ mod tests {
     const WWAN1: u32 = 5;
 
     fn v4(last: u8) -> IpAddr {
-        IpAddr::V4(Ipv4Addr::new(10, 64, 0, last))
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))
     }
 
     fn v6(s: &str) -> IpAddr {
@@ -986,6 +1044,50 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_rebind_is_retried_when_its_settle_time_ends_not_a_tick_later() {
+        // Given: a move whose bind failed at the end of the settle time, and
+        // the next housekeeping tick 900 ms later, so the retry's settle time
+        // (from that tick) ends after the hold-down does.
+        const TICK_MS: u64 = 1_000;
+        let mut s = LinkFollow::default();
+        let moved = Observation::Moved(v4(11));
+        let _ = s.step(v4(10), moved, 0);
+        let failed_at = ADDRESS_SETTLE_MS;
+        assert_eq!(
+            s.step(v4(10), moved, failed_at),
+            FollowAction::Rebind { to: v4(11) }
+        );
+        s.rebind_failed(v4(10));
+        let first_tick = failed_at + 900;
+        assert_eq!(s.step(v4(10), moved, first_tick), FollowAction::None);
+        assert!(
+            s.hold_until < first_tick + ADDRESS_SETTLE_MS,
+            "settle ends last"
+        );
+
+        // When: rounds run as the sender runs them, on every tick and on every
+        // wake-up the link asks for, whichever comes first.
+        let mut now = first_tick;
+        let mut next_tick = first_tick + TICK_MS;
+        let retry = loop {
+            let wake = s.wake_at(now);
+            now = wake.map_or(next_tick, |at| at.min(next_tick));
+            if now == next_tick {
+                next_tick += TICK_MS;
+            }
+            if let FollowAction::Rebind { .. } = s.step(v4(10), moved, now) {
+                break now;
+            }
+            assert!(now < 60_000, "never retried");
+        };
+
+        // Then: the retry comes when its settle time ends, not on the tick
+        // after.
+        assert_eq!(retry, first_tick + ADDRESS_SETTLE_MS);
+        assert!(retry < first_tick + 2 * TICK_MS);
+    }
+
+    #[test]
     fn twin_links_on_two_interfaces_may_share_one_address() {
         // Given: twin A on wwan0 bound to .100, twin B on wwan1 bound to .101;
         // A's interface is renumbered to .101 as well.
@@ -1221,6 +1323,94 @@ mod tests {
             assert!(Arc::ptr_eq(&untouched, &pool.conn_io[&2].socket));
             assert!(pool.connections[1].connected);
             assert_eq!(pool.connections[1].local_ip, lo_ip(3));
+        }
+
+        /// The sender's loop, reduced to the follower: wait for the follower's
+        /// own timer, run a round at that (virtual) time, re-arm. Returns the
+        /// time the timer fired.
+        async fn wait_and_follow(
+            pool: &mut Pool,
+            follower: &mut AddressFollower,
+            wake: &mut FollowWake,
+            clock: &impl Fn() -> u64,
+        ) -> u64 {
+            wake.fired().await;
+            let now = clock();
+            pool.follow(follower, now).await;
+            wake.rearm(follower, now);
+            now
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_follow_timer_wakes_the_follower_when_its_deadlines_end() {
+            // Given: virtual time, and link 1's 127.0.0.1 replaced by
+            // 127.0.0.2 in the table the follower just saw.
+            let start = tokio::time::Instant::now();
+            let t0 = 10_000;
+            let clock = || t0 + u64::try_from(start.elapsed().as_millis()).unwrap();
+            let mut pool = Pool::new();
+            let mut follower = follower_with(&[lo_ip(2), lo_ip(3)]);
+            let mut wake = FollowWake::new();
+            assert!(!wake.is_armed(), "nothing to wait for before a round");
+            pool.follow(&mut follower, t0).await;
+            wake.rearm(&follower, t0);
+
+            // Then: the timer stays quiet until the settle time ends...
+            assert!(wake.is_armed());
+            let early = Duration::from_millis(ADDRESS_SETTLE_MS - 1);
+            assert!(
+                tokio::time::timeout(early, wake.fired()).await.is_err(),
+                "fired before the settle time ended"
+            );
+            assert_eq!(pool.connections[0].local_ip, lo_ip(1));
+
+            // ...and then fires within the slack, once: until it is re-armed
+            // it stays quiet, so the loop cannot spin on it.
+            let slack = Duration::from_millis(FOLLOW_WAKE_SLACK_MS + 1);
+            tokio::time::timeout(slack, wake.fired())
+                .await
+                .expect("fires right after the settle time");
+            let fired = clock();
+            assert_eq!(fired, t0 + ADDRESS_SETTLE_MS + FOLLOW_WAKE_SLACK_MS);
+            assert!(!wake.is_armed(), "a fired timer waits for the next re-arm");
+
+            // And: the round it wakes re-binds the link.
+            pool.follow(&mut follower, fired).await;
+            wake.rearm(&follower, fired);
+            assert_eq!(pool.connections[0].local_ip, lo_ip(2));
+
+            // And: with nothing pending the timer is off; it does not fire
+            // again on its old deadline.
+            assert!(!wake.is_armed());
+            let brief = Duration::from_millis(100);
+            assert!(tokio::time::timeout(brief, wake.fired()).await.is_err());
+
+            // When: the address moves again right after that re-bind, so the
+            // new settle time ends before the hold-down does.
+            let moved_at = clock();
+            follower.set_table(Arc::new(AddrTable::new(vec![
+                addr(LO, lo_ip(3)),
+                addr(LO, lo_ip(4)),
+            ])));
+            pool.follow(&mut follower, moved_at).await;
+            wake.rearm(&follower, moved_at);
+            let hold_until = fired + REBIND_HOLD_BASE_MS;
+            assert!(moved_at + ADDRESS_SETTLE_MS < hold_until);
+
+            // Then: the timer wakes at the end of the settle time, where the
+            // hold-down still holds the link...
+            let settled = wait_and_follow(&mut pool, &mut follower, &mut wake, &clock).await;
+            assert_eq!(settled, moved_at + ADDRESS_SETTLE_MS + FOLLOW_WAKE_SLACK_MS);
+            assert_eq!(pool.connections[0].local_ip, lo_ip(2), "held");
+
+            // ...and again at the end of the hold-down, which re-binds, with
+            // no housekeeping tick involved.
+            let released = wait_and_follow(&mut pool, &mut follower, &mut wake, &clock).await;
+            assert_eq!(released, hold_until + FOLLOW_WAKE_SLACK_MS);
+            assert_eq!(pool.connections[0].local_ip, lo_ip(4));
+            assert!(!wake.is_armed());
+            let hour = Duration::from_secs(3_600);
+            assert!(tokio::time::timeout(hour, wake.fired()).await.is_err());
         }
 
         #[tokio::test]

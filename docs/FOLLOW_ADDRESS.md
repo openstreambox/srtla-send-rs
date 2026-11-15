@@ -41,9 +41,9 @@ doubling up to 30 s. After a minute without a move, the wait is back to 2 s.
 
 Each line starts with the link's name.
 
-- `source address moved 10.64.0.10 -> 10.64.0.11 on wwan0; re-bound this link without a reload`
-- `source address 10.64.0.10 left wwan0 and nothing replaced it; link is down until an address returns or a reload names one`
-- `source address 10.64.0.10 is back on wwan0; link re-bound`
+- `source address moved 192.0.2.10 -> 192.0.2.11 on wwan0; re-bound this link without a reload`
+- `source address 192.0.2.10 left wwan0 and nothing replaced it; link is down until an address returns or a reload names one`
+- `source address 192.0.2.10 is back on wwan0; link re-bound`
 
 ## Limits
 
