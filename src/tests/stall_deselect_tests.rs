@@ -1310,6 +1310,33 @@ mod tests {
     }
 
     #[test]
+    fn unproven_payload_waits_out_a_late_keepalive_echo() {
+        // A link whose only steady proof is the 1 s keepalive echo: one echo
+        // 100 ms late must not hold it out, one missing echo plus margin must.
+        use srtla_core::config_snapshot::{
+            STALL_MIN_UNPROVEN_SENDS, STALL_UNPROVEN_STALE_FLOOR_MS,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(2));
+        let now = now_ms();
+        conns[0].rtt.update_estimate(7, now);
+        send_payload(&mut conns[0], 100, STALL_MIN_UNPROVEN_SENDS, now);
+        make_healthy_busy(&mut conns[1], now);
+
+        conns[0].last_ack_or_rtt_sample_ms = now - 1_100;
+        let _ = select_connection_idx(&mut conns, None, now, &enhanced());
+        assert!(
+            !conns[0].stall_gated,
+            "an echo 100 ms late is jitter, not a dead path"
+        );
+
+        conns[0].last_ack_or_rtt_sample_ms = now - STALL_UNPROVEN_STALE_FLOOR_MS;
+        let _ = select_connection_idx(&mut conns, None, now, &enhanced());
+        assert!(conns[0].stall_gated);
+    }
+
+    #[test]
     fn fewer_unproven_sends_than_the_threshold_do_not_stall() {
         use srtla_core::config_snapshot::STALL_MIN_UNPROVEN_SENDS;
 

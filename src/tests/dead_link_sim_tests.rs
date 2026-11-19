@@ -534,13 +534,13 @@ mod tests {
     const RATES_PPS: [u64; 3] = [30, 100, 400];
 
     #[test]
-    fn a_path_that_dies_inbound_is_gated_within_a_second_and_a_half() {
+    fn a_path_that_dies_inbound_is_held_out_within_1600_ms() {
         for rate in RATES_PPS {
             let mut sim = Sim::new([7, 7], 0x5eed_0001 ^ rate);
             let out = sim.run(rate, 70_000, &cut_and_heal(PathState::DeadInbound), 0);
             let gated = out.gated_after_ms.expect("the dead link must be gated");
             assert!(
-                gated <= 1_500,
+                gated <= 1_600,
                 "{rate} pkt/s: gated {gated} ms after the cut, {out:?}"
             );
             assert_eq!(
@@ -551,13 +551,13 @@ mod tests {
     }
 
     #[test]
-    fn a_blackholed_path_is_gated_within_a_second_and_a_half() {
+    fn a_blackholed_path_is_held_out_within_1600_ms() {
         for rate in RATES_PPS {
             let mut sim = Sim::new([7, 7], 0x5eed_0002 ^ rate);
             let out = sim.run(rate, 70_000, &cut_and_heal(PathState::Blackhole), 0);
             let gated = out.gated_after_ms.expect("the dead link must be gated");
             assert!(
-                gated <= 1_500,
+                gated <= 1_600,
                 "{rate} pkt/s: gated {gated} ms after the cut, {out:?}"
             );
             assert_eq!(
@@ -750,6 +750,32 @@ mod tests {
                          {gated} ms, {out:?}"
                     );
                     assert_eq!(out.stall_gate_events, 1, "{out:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_lossy_link_on_jittered_unequal_paths_is_never_held_out() {
+        for rtts in [[7, 25], [25, 7]] {
+            for loss_permille in [50, 100] {
+                for rate in [67, 103, 401] {
+                    for seed in 0..3u64 {
+                        let mut sim =
+                            jittered(rtts, 0x7055 ^ rate ^ (seed << 20) ^ loss_permille as u64);
+                        let steps = [Step {
+                            at_ms: 5_000,
+                            link: 0,
+                            state: PathState::Alive { loss_permille },
+                        }];
+                        let out = sim.run(rate, 125_000, &steps, 0);
+                        assert_eq!(
+                            [out.stall_gate_events, sim.conns[1].stall_gate_events()],
+                            [0, 0],
+                            "{rtts:?} ms, {loss_permille}‰ loss on link 0 at {rate} pkt/s, seed \
+                             {seed}"
+                        );
+                    }
                 }
             }
         }

@@ -1003,11 +1003,20 @@ impl SrtlaConnection {
     /// input ONLY — it never affects `is_timed_out`/re-registration/CONN_TIMEOUT.
     #[inline]
     pub fn is_stalled(&self, now_ms: u64, min_in_flight: i32, stale_ceiling_ms: u64) -> bool {
-        self.connected
-            && self.has_stall_load(min_in_flight)
-            && self.last_ack_or_rtt_sample_ms != 0
-            && now_ms.saturating_sub(self.last_ack_or_rtt_sample_ms)
-                >= self.effective_stall_stale_ms(stale_ceiling_ms)
+        if !self.connected || self.last_ack_or_rtt_sample_ms == 0 {
+            return false;
+        }
+        let proof_age_ms = now_ms.saturating_sub(self.last_ack_or_rtt_sample_ms);
+        let stale_ms = self.effective_stall_stale_ms(stale_ceiling_ms);
+        if self.in_flight_packets >= min_in_flight && proof_age_ms >= stale_ms {
+            return true;
+        }
+        // The unproven-send arm also fires on links whose only steady proof
+        // is the keepalive echo, so its window must clear the keepalive
+        // period with room for echo jitter (see
+        // `STALL_UNPROVEN_STALE_FLOOR_MS`).
+        self.unproven_sends >= crate::config_snapshot::STALL_MIN_UNPROVEN_SENDS
+            && proof_age_ms >= stale_ms.max(crate::config_snapshot::STALL_UNPROVEN_STALE_FLOOR_MS)
     }
 
     /// Drive the asymmetric stall latch: quick to drop, conservative to
