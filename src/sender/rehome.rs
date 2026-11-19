@@ -9,10 +9,13 @@
 //! the bond across two receiver identities — the moved link would arrive at an
 //! instance that has never heard of our group and would be worse off than it was
 //! talking to a stale address. The per-uplink reconnect path therefore never
-//! swaps `io.remote` (it only warns; see [`super::connections`]). This module is
-//! the one sanctioned place that address changes, and only because it changes it
-//! for **every** uplink in the same housekeeping pass and then re-registers the
-//! whole bond.
+//! swaps `io.remote` on its own (it only warns; see [`super::connections`]).
+//! This module changes it for **every** uplink in the same housekeeping pass
+//! and then re-registers the whole bond. The one other place a link's address
+//! changes is per-link failover between the addresses a hostname answers with
+//! ([`super::receiver_addrs`]), which only ever moves a failing link onto the
+//! address the rest of the bond is registered on, or, with no link registered,
+//! on to the next answer.
 //!
 //! # When it fires
 //!
@@ -40,10 +43,11 @@
 //! Re-home rebuilds whatever uplinks the bond currently has, so it always runs
 //! against the local-IP set that the last accepted reload installed. In the
 //! other direction, a reload that lands *after* a re-home dials any newly added
-//! uplink through [`crate::net::resolve_remote`], which picks the first answer —
-//! the same deterministic pick this module makes — so the added link joins the
-//! bond at the address the bond just moved to. Neither order can leave uplinks
-//! split across two receivers.
+//! uplink at the first answer in its family
+//! ([`crate::net::pick_remote_for_source`]), which for a same-family bond is
+//! the address this module just moved to. If it is not, the added link fails
+//! to register there and the address book moves it to the address the bond is
+//! registered on. Neither order can leave uplinks split across two receivers.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -59,6 +63,7 @@ use tokio::time::Duration;
 use tracing::{debug, warn};
 
 use super::connections::{rebuild_uplink_socket, receiver_moved, recover_connection};
+use super::receiver_addrs::{AddressBookDns, ReceiverAddresses};
 use super::sequence::SequenceTracker;
 use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for};
 use crate::net::resolve_remote_all;
@@ -130,6 +135,10 @@ pub struct RehomeGate {
     /// is a published JSON/Prometheus contract and this counter is not worth
     /// widening it for.
     rehomes: u64,
+    /// Per-link failover between the hostname's addresses while the bond is
+    /// still up (see [`super::receiver_addrs`]). It shares this gate's opt-out:
+    /// `--no-rehome` keeps every uplink on the address it first dialed.
+    pub(super) addresses: ReceiverAddresses,
 }
 
 impl RehomeGate {
@@ -139,6 +148,7 @@ impl RehomeGate {
             resolver: Arc::new(DnsResolver),
             last_probe_ms: None,
             rehomes: 0,
+            addresses: ReceiverAddresses::new(enabled, Arc::new(AddressBookDns)),
         }
     }
 
@@ -162,13 +172,31 @@ impl RehomeGate {
 impl RehomeGate {
     /// Build a gate over a stub resolver, for tests that drive the trigger
     /// policy without DNS.
+    ///
+    /// The address book gets a resolver that never answers, so these tests see
+    /// exactly the re-home lookups they script.
     pub fn with_resolver(enabled: bool, resolver: Arc<dyn ReceiverResolver>) -> Self {
+        Self::with_resolvers(enabled, resolver, StubResolver::new(Vec::new()))
+    }
+
+    /// Build a gate whose re-home probe and address book each use their own
+    /// stub resolver.
+    pub fn with_resolvers(
+        enabled: bool,
+        resolver: Arc<dyn ReceiverResolver>,
+        address_resolver: Arc<dyn ReceiverResolver>,
+    ) -> Self {
         Self {
             enabled,
             resolver,
             last_probe_ms: None,
             rehomes: 0,
+            addresses: ReceiverAddresses::new(enabled, address_resolver),
         }
+    }
+
+    pub fn addresses(&self) -> &ReceiverAddresses {
+        &self.addresses
     }
 
     pub fn rehome_count(&self) -> u64 {
@@ -274,7 +302,7 @@ pub(super) async fn try_rehome(
         return false;
     }
 
-    // Deterministic pick, matching `resolve_remote`: the first answer.
+    // Deterministic pick: the first answer.
     let new_remote = fresh[0];
     warn!(
         "re-homing the whole bond: {receiver_host} no longer resolves to {pinned} and every \
@@ -294,6 +322,8 @@ pub(super) async fn try_rehome(
         now,
     )
     .await;
+    // The old address's registrations no longer describe this bond.
+    gate.addresses.forget_registrations();
     gate.rehomes = gate.rehomes.saturating_add(1);
     true
 }
@@ -321,6 +351,7 @@ async fn rehome_bond(
     for conn in connections.iter() {
         if let Some(io) = conn_io.get_mut(&conn.conn_id) {
             io.remote = new_remote;
+            io.remote_since_ms = now;
         }
     }
 

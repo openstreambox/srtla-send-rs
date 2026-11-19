@@ -14,7 +14,7 @@ use super::uplink::{ConnIo, ConnIoMap};
 use crate::bind_map::EffectiveLink;
 use crate::net::{
     BatchUdpSocket, EgressLifecycle, RouteHealth, SocketKey, SystemIfaceResolver, UplinkBinder,
-    UplinkSpec, create_uplink_socket, resolve_remote, resolve_remote_all,
+    UplinkSpec, create_uplink_socket, pick_remote_for_source, resolve_remote_all,
 };
 
 pub struct PendingConnectionChanges {
@@ -307,7 +307,12 @@ async fn connect_uplink(
 ) -> Result<(SrtlaConnection, ConnIo)> {
     use rand::RngCore;
 
-    let remote = resolve_remote(receiver_host, receiver_port).await?;
+    // Only the first dial is chosen here. If this address never answers, the
+    // receiver address book moves the link on to another answer (see
+    // `super::receiver_addrs`).
+    let answers = resolve_remote_all(receiver_host, receiver_port).await?;
+    let remote = pick_remote_for_source(&answers, spec.ip)
+        .ok_or_else(|| anyhow::anyhow!("no DNS result for {}", receiver_host))?;
     let mut egress = EgressLifecycle::for_spec(spec.iface.as_ref());
     // Re-resolve the interface by NAME before every socket creation: a replug
     // leaves the old ifindex describing nothing, and SO_BINDTODEVICE freezes
@@ -330,6 +335,7 @@ async fn connect_uplink(
         socket,
         binder: link_binder,
         remote,
+        remote_since_ms: now_ms(),
         spec: spec.clone(),
         egress,
         route_health,
@@ -499,6 +505,11 @@ pub(super) fn receiver_moved(current: &[SocketAddr], fresh: &[SocketAddr]) -> bo
 /// nothing left to protect. On a healthy bond the operator still just gets this
 /// warning and decides.
 ///
+/// The one per-link move is [`super::receiver_addrs`]: a link that cannot
+/// register on its address joins the address the rest of the bond is
+/// registered on, which by construction cannot split the bond, or, while no
+/// link is registered, tries the next answer.
+///
 /// Runs detached so a slow or hanging resolver cannot delay the reconnect it was
 /// triggered by — the reconnect is on the housekeeping tick of the main event
 /// loop, and this is diagnostics.
@@ -515,8 +526,8 @@ fn spawn_receiver_dns_drift_check(receiver_host: &str, cached: SocketAddr, now: 
                         fresh.iter().map(|a| a.to_string()).collect();
                     warn!(
                         "receiver DNS drift: {host} no longer resolves to {cached} (now {}); \
-                         keeping the current address because the bond is registered against this \
-                         receiver instance",
+                         uplinks registered there stay, because the bond is registered against \
+                         that receiver instance",
                         answers.join(", ")
                     );
                 }

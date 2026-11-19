@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use super::connections::{reconnect_uplink, recover_connection};
 use super::egress_tick;
+use super::receiver_addrs::{proven_for, registered_remotes};
 use super::rehome::{RehomeGate, try_rehome};
 use super::sequence::SequenceTracker;
 use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for};
@@ -53,6 +54,29 @@ pub async fn handle_housekeeping(
         }
     }
 
+    // Keep the receiver hostname's answers fresh (never waits on DNS), and note
+    // which addresses registered uplinks are on before any link below changes
+    // state: a failing link prefers the address the bond already lives on.
+    let failover = rehome.addresses.applies_to(receiver_host);
+    let registered = if failover {
+        if let Some(port) = conn_io.values().next().map(|io| io.remote.port()) {
+            rehome.addresses.poll(receiver_host, port, current_ms);
+        }
+        let registered = registered_remotes(connections, conn_io, current_ms);
+        rehome.addresses.note_registered(&registered, current_ms);
+        // A registered link restarts its address trial every tick, so a link
+        // that loses registration is judged from that moment, not from when
+        // it was first dialed.
+        for (conn_id, _) in &registered {
+            if let Some(io) = conn_io.get_mut(conn_id) {
+                io.remote_since_ms = current_ms;
+            }
+        }
+        registered
+    } else {
+        Default::default()
+    };
+
     // housekeeping: drive registration, send keepalives
     for (i, conn) in connections.iter_mut().enumerate() {
         // Re-resolve the egress interface by NAME and re-read the route
@@ -90,6 +114,23 @@ pub async fn handle_housekeeping(
                 // I/O map; the connection itself owns no socket).
                 match conn_io.get_mut(&conn.conn_id) {
                     Some(io) => {
+                        // A hostname with several addresses: rebuild against
+                        // the one the bond is (or was recently) registered
+                        // on, or, with no registration, the address the
+                        // bond is trying (see `super::receiver_addrs`).
+                        if failover
+                            && let Some(next) = rehome.addresses.choose_for(
+                                &label,
+                                io.remote,
+                                io.remote_since_ms,
+                                conn.local_ip,
+                                &proven_for(&registered, conn.conn_id),
+                                current_ms,
+                            )
+                        {
+                            io.remote = next;
+                            io.remote_since_ms = current_ms;
+                        }
                         if let Err(e) =
                             reconnect_uplink(conn, io, receiver_host, seq_tracker, current_ms).await
                         {
@@ -289,6 +330,7 @@ mod tests {
     use srtla_core::utils::now_ms;
 
     use super::*;
+    use crate::sender::receiver_addrs::ADDRESS_TRIAL_MS;
     use crate::sender::rehome::StubResolver;
     use crate::sender::uplink::{create_uplink_channel, sync_readers};
     use crate::test_helpers::{
@@ -497,13 +539,17 @@ mod tests {
         }
 
         async fn tick(&mut self, gate: &mut RehomeGate, now: u64) -> Result<()> {
+            self.tick_host(gate, "rec.example.com", now).await
+        }
+
+        async fn tick_host(&mut self, gate: &mut RehomeGate, host: &str, now: u64) -> Result<()> {
             let (packet_tx, _packet_rx) = create_uplink_channel();
             handle_housekeeping(
                 &mut self.connections,
                 &mut self.conn_io,
                 &mut self.reg,
                 &mut self.seq_tracker,
-                "rec.example.com",
+                host,
                 false,
                 now,
                 &mut self.all_failed_at,
@@ -682,5 +728,208 @@ mod tests {
             fired.is_err(),
             "the pre-existing all-failed error must fire"
         );
+    }
+
+    /// Per-link address failover (`super::super::receiver_addrs`), driven
+    /// through the real housekeeping tick.
+    impl RehomeFixture {
+        fn remote_of(&self, idx: usize) -> SocketAddr {
+            self.conn_io
+                .get(&self.connections[idx].conn_id)
+                .unwrap()
+                .remote
+        }
+
+        fn set_remote(&mut self, idx: usize, remote: SocketAddr) {
+            self.conn_io
+                .get_mut(&self.connections[idx].conn_id)
+                .unwrap()
+                .remote = remote;
+        }
+
+        /// Link `idx` is registered and hearing from the receiver.
+        fn live(&mut self, idx: usize, now: u64) {
+            let conn = &mut self.connections[idx];
+            conn.connected = true;
+            conn.last_received = Some(now);
+            conn.reconnection.connection_established_ms = 1;
+        }
+
+        /// Link `idx` has never registered and is due a retry at `now`, which
+        /// is where an uplink pinned to a dead address sits for good.
+        fn never_registered(&mut self, idx: usize) {
+            let conn = &mut self.connections[idx];
+            conn.connected = false;
+            conn.last_received = None;
+            conn.reconnection.connection_established_ms = 0;
+            conn.reconnection.startup_grace_deadline_ms = 0;
+            conn.reconnection.last_reconnect_attempt_ms = 0;
+        }
+
+        /// Let the address book's background lookup finish and be collected.
+        async fn settle_lookup(&mut self, gate: &mut RehomeGate, now: u64) {
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+                gate.addresses
+                    .poll("rec.example.com", self.remote_of(0).port(), now);
+                if !gate.addresses().lookup_pending() {
+                    return;
+                }
+            }
+            panic!("address lookup never finished");
+        }
+    }
+
+    /// The field failure: the name answers with a live and a stale address, one
+    /// uplink landed on each. The stale one must join the live one instead of
+    /// waiting for the live link to die and the stream with it.
+    #[tokio::test]
+    async fn a_link_on_a_dead_address_joins_the_address_the_bond_registered_on() {
+        let live = remote(1);
+        let dead = remote(2);
+        let mut fixture = RehomeFixture::new(live).await;
+        fixture.set_remote(1, dead);
+        let addresses = StubResolver::new(vec![Some(vec![dead, live])]);
+        let mut gate = RehomeGate::with_resolvers(true, StubResolver::new(vec![]), addresses);
+
+        let t0 = now_ms();
+        fixture.live(0, t0);
+        fixture.never_registered(1);
+        fixture.tick(&mut gate, t0).await.unwrap();
+
+        assert_eq!(fixture.remote_of(1), live, "moved onto the proven address");
+        assert_eq!(
+            fixture.remote_of(0),
+            live,
+            "the registered link is untouched"
+        );
+        assert_eq!(gate.addresses().move_count(), 1);
+
+        // Once there it stays, however the link's next retries go.
+        fixture.never_registered(1);
+        fixture.live(0, t0 + 1_000);
+        fixture.tick(&mut gate, t0 + 1_000).await.unwrap();
+        assert_eq!(fixture.remote_of(1), live);
+        assert_eq!(gate.addresses().move_count(), 1);
+    }
+
+    /// With nothing registered anywhere, every link gives its address the trial
+    /// window and then works through the answers in DNS order.
+    #[tokio::test]
+    async fn with_no_registered_link_a_failing_link_tries_the_next_answer() {
+        let dead = remote(1);
+        let live = remote(2);
+        let mut fixture = RehomeFixture::new(dead).await;
+        let addresses = StubResolver::new(vec![Some(vec![dead, live])]);
+        let mut gate = RehomeGate::with_resolvers(true, StubResolver::new(vec![]), addresses);
+
+        let t0 = now_ms();
+        for conn in fixture.conn_io.values_mut() {
+            conn.remote_since_ms = t0;
+        }
+        // Still inside the startup grace: unregistered but not yet failing.
+        for conn in fixture.connections.iter_mut() {
+            conn.connected = false;
+            conn.last_received = None;
+            conn.reconnection.connection_established_ms = 0;
+            conn.reconnection.startup_grace_deadline_ms = t0 + 60_000;
+        }
+        fixture.tick(&mut gate, t0).await.unwrap();
+        fixture.settle_lookup(&mut gate, t0).await;
+        assert_eq!(gate.addresses().answers(), &[dead, live]);
+
+        // Both fail inside the trial window: they stay and retry.
+        let t1 = t0 + ADDRESS_TRIAL_MS - 1_000;
+        fixture.never_registered(0);
+        fixture.never_registered(1);
+        fixture.tick(&mut gate, t1).await.unwrap();
+        assert_eq!(fixture.remotes(), vec![dead]);
+
+        // Past it, both move on to the next answer.
+        let t2 = t0 + ADDRESS_TRIAL_MS;
+        fixture.never_registered(0);
+        fixture.never_registered(1);
+        fixture.tick(&mut gate, t2).await.unwrap();
+        assert_eq!(fixture.remotes(), vec![live]);
+        assert_eq!(gate.addresses().move_count(), 2);
+    }
+
+    /// Review P1: a bond registered on the live address for a long time loses
+    /// every link at once (a whole-bond blip, or any timeout on a one-link
+    /// bond). It keeps retrying the live address; the stale answer is never
+    /// tried while the bond could still recover.
+    #[tokio::test]
+    async fn a_whole_bond_blip_retries_the_registered_address_not_the_stale_one() {
+        let live = remote(1);
+        let stale = remote(2);
+        let mut fixture = RehomeFixture::new(live).await;
+        let addresses = StubResolver::new(vec![Some(vec![live, stale])]);
+        let mut gate = RehomeGate::with_resolvers(true, StubResolver::new(vec![]), addresses);
+
+        // Dialed long ago, registered ever since.
+        for io in fixture.conn_io.values_mut() {
+            io.remote_since_ms = 0;
+        }
+        let t0 = now_ms();
+        fixture.live(0, t0);
+        fixture.live(1, t0);
+        fixture.tick(&mut gate, t0).await.unwrap();
+        fixture.settle_lookup(&mut gate, t0).await;
+
+        // Both links drop. Drive every retry through the all-failed window.
+        for dt in [1_000, 2_000, 3_000, 4_000, 5_000, 8_000, 9_000] {
+            for idx in 0..2 {
+                let conn = &mut fixture.connections[idx];
+                conn.connected = false;
+                conn.last_received = None;
+                conn.reconnection.startup_grace_deadline_ms = 0;
+                conn.reconnection.last_reconnect_attempt_ms = 0;
+            }
+            fixture.tick(&mut gate, t0 + dt).await.unwrap();
+            assert_eq!(fixture.remotes(), vec![live], "{dt}ms into the blip");
+        }
+        assert_eq!(gate.addresses().move_count(), 0);
+    }
+
+    /// A link that is registered is never moved, even when most of the bond
+    /// sits on another address.
+    #[tokio::test]
+    async fn a_registered_link_is_never_moved() {
+        let mut fixture = RehomeFixture::new(remote(1)).await;
+        fixture.set_remote(1, remote(2));
+        let addresses = StubResolver::new(vec![Some(vec![remote(1), remote(2)])]);
+        let mut gate = RehomeGate::with_resolvers(true, StubResolver::new(vec![]), addresses);
+
+        let t0 = now_ms();
+        for step in 0..3 {
+            let now = t0 + step * ADDRESS_TRIAL_MS;
+            fixture.live(0, now);
+            fixture.live(1, now);
+            fixture.tick(&mut gate, now).await.unwrap();
+            fixture.settle_lookup(&mut gate, now).await;
+        }
+        assert_eq!(fixture.remote_of(0), remote(1));
+        assert_eq!(fixture.remote_of(1), remote(2));
+        assert_eq!(gate.addresses().move_count(), 0);
+    }
+
+    /// An IP-literal receiver and `--no-rehome` keep the old behaviour: no
+    /// lookups and no moves.
+    #[tokio::test]
+    async fn ip_literal_receivers_and_the_opt_out_never_fail_over() {
+        for (enabled, host) in [(true, "203.0.113.1"), (false, "rec.example.com")] {
+            let mut fixture = RehomeFixture::new(remote(1)).await;
+            fixture.set_remote(1, remote(2));
+            let addresses = StubResolver::new(vec![Some(vec![remote(1), remote(2)])]);
+            let mut gate =
+                RehomeGate::with_resolvers(enabled, StubResolver::new(vec![]), addresses.clone());
+
+            let t0 = now_ms();
+            fixture.live(0, t0);
+            fixture.never_registered(1);
+            fixture.tick_host(&mut gate, host, t0).await.unwrap();
+            assert_eq!(fixture.remote_of(1), remote(2), "{host}: link stays put");
+            assert_eq!(addresses.calls(), 0, "{host}: no lookup");
+        }
     }
 }

@@ -16,7 +16,8 @@ src/stats.rs             upstream snapshot + SessionBytes + bind-map report slot
 src/bind_map/            ADR-003 sidecar: parser, coherence, retry, resolve, report
 src/net/                 sockets (SourceIpBinder/DeviceBinder), spec, egress, route, batch I/O
 src/sender/              forwarding loop, links (ips file vs bind-map pair), connections,
-                         reload guard, egress_tick, housekeeping, rehome, status
+                         reload guard, egress_tick, housekeeping, rehome,
+                         receiver_addrs (per-link address failover), status
 src/sender/client_dedup.rs   forwards each SRT ACK/NAK to the client once
 docs/adr/                ADR-001 (historical), ADR-002, ADR-003, ADR-004
 ci/build-deb.sh          the .deb packager      scripts/  contract tests + netns gate

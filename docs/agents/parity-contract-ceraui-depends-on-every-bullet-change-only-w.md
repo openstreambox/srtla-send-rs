@@ -128,6 +128,9 @@
 - **Re-home and stall deselect are upstream defaults, ON.** `--no-rehome` and
   `--no-stall-deselect` are the opt-outs. Neither is a CERALIVE experimental flag; they
   are upstream behavior and are documented by upstream's README sections below.
+  `--no-rehome` also disables per-link failover between a receiver hostname's
+  addresses (`src/sender/receiver_addrs.rs`); IP-literal receivers never fail over.
+  A new link's first dial prefers an answer in its own family in every mode.
 - **`-v/--version`** is operator-visible (CeraUI renders it in Settings → Versions).
   Shape: `<version> [(<branch>@<hash>[-dirty])] [srtla_send]`; the parenthetical is
   omitted, not placeholdered, when there is no git context. `src/version.rs`.
