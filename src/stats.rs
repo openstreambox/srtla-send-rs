@@ -212,6 +212,18 @@ pub struct LinkStats {
     /// `in_flight_cap_packets`). When true and at least one other link
     /// is un-gated, this link is being skipped by Enhanced selection.
     pub in_flight_cap_active: bool,
+    /// Data datagrams queued on this link since the process started
+    /// (payload, retransmits, duplicate probes). Monotonic.
+    pub packets_sent_total: u64,
+    /// Packets the receiver acknowledged, in SRTLA ACKs arriving on this link,
+    /// as received on this link. Monotonic. With `packets_sent_total` and
+    /// `bytes_sent_total` a consumer gets this path's delivered rate as the
+    /// receiver saw it, which the sender's own counters cannot show.
+    pub srtla_acked_packets_total: u64,
+    /// Milliseconds since an SRTLA ACK last arrived on this link. Absent
+    /// before the first one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_srtla_ack_age_ms: Option<u64>,
 }
 
 impl Default for LinkStats {
@@ -263,6 +275,9 @@ impl Default for LinkStats {
             sole_carrier_elections: 0,
             in_flight_cap_packets: 0,
             in_flight_cap_active: false,
+            packets_sent_total: 0,
+            srtla_acked_packets_total: 0,
+            last_srtla_ack_age_ms: None,
         }
     }
 }
@@ -568,6 +583,9 @@ impl SharedStats {
                 sole_carrier_elections: conn.sole_carrier_elections(),
                 in_flight_cap_packets: in_flight_cap_pkts,
                 in_flight_cap_active,
+                packets_sent_total: conn.packets_sent_total(),
+                srtla_acked_packets_total: conn.srtla_acked_packets_total(),
+                last_srtla_ack_age_ms: conn.last_srtla_ack_age_ms(current_time_ms),
             };
 
             if is_active {

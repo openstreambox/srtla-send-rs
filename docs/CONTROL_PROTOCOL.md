@@ -69,6 +69,16 @@ Result:
 
 Return per-link telemetry (the JSON previously returned by `stats`).
 
+Per-link delivery counters, both process-monotonic (a reconnect or reload keeps them):
+
+| field | meaning |
+| --- | --- |
+| `packets_sent_total` | Data datagrams queued on the link: payload, SRT retransmits and duplicate probes. Counted where `bytes_sent_total` is counted. |
+| `srtla_acked_packets_total` | Sequence numbers listed in SRTLA ACKs that arrived on the link. `srtla_rec` acknowledges a packet only on the link it arrived on, so this is delivery over that path as the receiver saw it, independent of the sender's packet logs. |
+| `last_srtla_ack_age_ms` | Milliseconds since an SRTLA ACK last arrived on the link. Absent before the first one. Keepalive replies do not reset it. |
+
+A consumer that needs a path's delivered rate takes deltas of `srtla_acked_packets_total` over time and scales them by `bytes_sent_total / packets_sent_total` for that link. The receiver holds up to a few packets per link before it sends an ACK, so the count trails the wire by that batch.
+
 ## Subscriptions
 
 The Unix control socket supports server-push subscriptions. Polling `get_stats` at 1 Hz misses sub-second link-state changes (NAK bursts, quality drops, reconnects); subscriptions let clients receive push events on the same socket they already use for requests.

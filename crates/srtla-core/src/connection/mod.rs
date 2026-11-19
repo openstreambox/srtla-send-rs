@@ -434,6 +434,19 @@ pub struct SrtlaConnection {
     /// Cumulative silence-pull engagements (rising edges). Expected to tick
     /// on routine cellular HARQ stalls; a high rate is telemetry, not alarm.
     pub(crate) silence_pulls: u64,
+    /// Data datagrams queued on this link (payload, retransmits and duplicate
+    /// probes alike), counted at the same site as `bitrate.bytes_sent_total`.
+    /// Process-monotonic like that counter: a socket replacement keeps it.
+    pub(crate) packets_sent_total: u64,
+    /// Sequence numbers the receiver acknowledged in SRTLA ACKs that arrived
+    /// on this link. `srtla_rec` lists in an SRTLA ACK only packets it
+    /// received on the link that carries the ACK, so this counts delivery
+    /// over this path as the receiver saw it, whatever the sender's logs
+    /// hold. Process-monotonic.
+    pub(crate) srtla_acked_packets_total: u64,
+    /// When the last SRTLA ACK arrived on this link, `0` before the first.
+    /// Unlike `last_ack_or_rtt_sample_ms`, keepalive replies never stamp it.
+    pub(crate) last_srtla_ack_ms: u64,
     /// Per-link liveness timeout in ms. Refreshed from the config snapshot on
     /// every selection pass so `is_timed_out` (called from paths that do not
     /// carry a config) always sees the current runtime value.
@@ -548,6 +561,9 @@ impl SrtlaConnection {
             sole_carrier_elections: 0,
             silence_pulled: false,
             silence_pulls: 0,
+            packets_sent_total: 0,
+            srtla_acked_packets_total: 0,
+            last_srtla_ack_ms: 0,
             conn_timeout_ms: crate::config_snapshot::CONN_TIMEOUT_MS,
             delay_budget_ms: 0,
             rtt: RttTracker::default(),
@@ -602,6 +618,7 @@ impl SrtlaConnection {
     pub fn queue_data_packet(&mut self, data: &[u8], seq: Option<u32>, send_time_ms: u64) -> bool {
         // Track bytes for bitrate calculation (tracked at queue time)
         self.bitrate.update_on_send(data.len() as u64);
+        self.packets_sent_total = self.packets_sent_total.saturating_add(1);
         self.batch_sender.queue_packet(data, seq, send_time_ms)
     }
 
@@ -620,6 +637,7 @@ impl SrtlaConnection {
     /// attributed to the link that actually carried the stream data.
     pub fn queue_probe_packet(&mut self, data: &[u8], seq: u32, send_time_ms: u64) -> bool {
         self.bitrate.update_on_send(data.len() as u64);
+        self.packets_sent_total = self.packets_sent_total.saturating_add(1);
         self.record_probe(seq as i32, send_time_ms);
         self.batch_sender.queue_packet(data, None, send_time_ms)
     }
@@ -1278,6 +1296,35 @@ impl SrtlaConnection {
     #[inline(always)]
     pub fn silence_pulls(&self) -> u64 {
         self.silence_pulls
+    }
+
+    /// Count the sequence numbers of one SRTLA ACK that arrived on this link.
+    /// See [`Self::srtla_acked_packets_total`] for why the arrival link is
+    /// the delivering link.
+    #[inline]
+    pub fn note_srtla_ack_arrival(&mut self, acked: usize, now_ms: u64) {
+        self.srtla_acked_packets_total =
+            self.srtla_acked_packets_total.saturating_add(acked as u64);
+        self.last_srtla_ack_ms = now_ms;
+    }
+
+    /// Data datagrams queued on this link over the process lifetime.
+    #[inline(always)]
+    pub fn packets_sent_total(&self) -> u64 {
+        self.packets_sent_total
+    }
+
+    /// Packets the receiver acknowledged as received on this link.
+    #[inline(always)]
+    pub fn srtla_acked_packets_total(&self) -> u64 {
+        self.srtla_acked_packets_total
+    }
+
+    /// Milliseconds since an SRTLA ACK last arrived on this link, `None`
+    /// before the first.
+    #[inline]
+    pub fn last_srtla_ack_age_ms(&self, now_ms: u64) -> Option<u64> {
+        (self.last_srtla_ack_ms != 0).then(|| now_ms.saturating_sub(self.last_srtla_ack_ms))
     }
 
     /// Whether this link has gone silent past its liveness timeout
