@@ -91,6 +91,12 @@ pub async fn process_connection_events(
         }
     }
 
+    // `srtla_rec` lists in an SRTLA ACK only packets it received on the link
+    // that carries the ACK, so the arrival link is the one that delivered them.
+    if !incoming.srtla_ack_numbers.is_empty() {
+        connections[idx].note_srtla_ack_arrival(incoming.srtla_ack_numbers.len(), current_time_ms);
+    }
+
     for srtla_ack in incoming.srtla_ack_numbers.iter() {
         // Match the arrival link's packet log FIRST. The receiver sends an
         // SRTLA ACK back on the link that delivered the packet, and with

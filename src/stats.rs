@@ -247,6 +247,18 @@ pub struct LinkStats {
     /// silence pulls. Informational: decide whether a link carries the stream
     /// on `payload_age_ms` only.
     pub payload_held_out: bool,
+    /// Data datagrams queued on this link since the process started
+    /// (payload, retransmits, duplicate probes). Monotonic.
+    pub packets_sent_total: u64,
+    /// Packets the receiver acknowledged, in SRTLA ACKs arriving on this link,
+    /// as received on this link. Monotonic. With `packets_sent_total` and
+    /// `bytes_sent_total` a consumer gets this path's delivered rate as the
+    /// receiver saw it, which the sender's own counters cannot show.
+    pub srtla_acked_packets_total: u64,
+    /// Milliseconds since an SRTLA ACK last arrived on this link. Absent
+    /// before the first one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_srtla_ack_age_ms: Option<u64>,
 }
 
 impl Default for LinkStats {
@@ -302,6 +314,9 @@ impl Default for LinkStats {
             payload_bytes_total: 0,
             payload_age_ms: None,
             payload_held_out: false,
+            packets_sent_total: 0,
+            srtla_acked_packets_total: 0,
+            last_srtla_ack_age_ms: None,
         }
     }
 }
@@ -639,6 +654,9 @@ impl SharedStats {
                 payload_bytes_total: conn.payload_bytes_total(),
                 payload_age_ms: conn.payload_age_ms(current_time_ms),
                 payload_held_out: conn.is_payload_held_out(),
+                packets_sent_total: conn.packets_sent_total(),
+                srtla_acked_packets_total: conn.srtla_acked_packets_total(),
+                last_srtla_ack_age_ms: conn.last_srtla_ack_age_ms(current_time_ms),
             };
 
             if is_active {
