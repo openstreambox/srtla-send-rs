@@ -122,6 +122,10 @@ impl SrtlaConnection {
     }
 
     /// Handle SRTLA ACK for a specific sequence. O(1) remove.
+    ///
+    /// For an ACK that arrived on *this* link. The receiver answers on the
+    /// link that delivered the packet, so this is the one place an SRTLA ACK
+    /// proves anything about this path.
     #[inline]
     pub fn handle_srtla_ack_specific(&mut self, seq: i32, classic_mode: bool, now_ms: u64) -> bool {
         // A probe this link sent, answered on this link. It proves the path
@@ -131,24 +135,58 @@ impl SrtlaConnection {
         // release. Checked first — the sweep-proof log is where a slow link's
         // probes actually survive to be answered.
         if self.probe_log.remove(&seq).is_some() {
-            self.last_ack_or_rtt_sample_ms = now_ms;
+            self.note_delivery_proof(now_ms);
             return true;
         }
+        self.settle_srtla_ack(seq, classic_mode, now_ms, true)
+    }
 
+    /// Handle an SRTLA ACK that arrived on a *different* link and did not
+    /// match anything there (typically because a cumulative SRT ACK already
+    /// pruned the arrival link's copy).
+    ///
+    /// The receiver only ever answers on the link that delivered, so such an
+    /// ACK says nothing about this path: it settles this link's packet-log
+    /// accounting as before but stamps no delivery proof and takes no RTT
+    /// sample. Probes are left alone entirely. A gated link's probe shares its
+    /// sequence with the copy the healthy link delivered, and crediting it here
+    /// handed a dead path proof it never earned, restarting its rejoin dwell.
+    #[inline]
+    pub fn handle_srtla_ack_from_other_link(
+        &mut self,
+        seq: i32,
+        classic_mode: bool,
+        now_ms: u64,
+    ) -> bool {
+        self.settle_srtla_ack(seq, classic_mode, now_ms, false)
+    }
+
+    fn settle_srtla_ack(
+        &mut self,
+        seq: i32,
+        classic_mode: bool,
+        now_ms: u64,
+        arrived_here: bool,
+    ) -> bool {
         let sent_ms = self.packet_log.remove(&seq);
         if let Some(sent_ms) = sent_ms {
             self.in_flight_packets = self.packet_log.len() as i32;
 
-            // Delivery proof for `stall_deselect`: this link OWNED the acked seq,
-            // the strongest per-link proof it is still moving data. Stamped here
-            // and at the keepalive-RTT site only (see `packet_io.rs`), never on
-            // generic inbound bytes, so a stalled-but-echoing link stays stale.
-            self.last_ack_or_rtt_sample_ms = now_ms;
+            if arrived_here {
+                // Delivery proof for `stall_deselect`: this link OWNED the
+                // acked seq and the ACK came back on it, the strongest per-link
+                // proof it is still moving data. Stamped here and at the
+                // keepalive-RTT site only (see `packet_io.rs`), never on
+                // generic inbound bytes, so a stalled-but-echoing link stays
+                // stale.
+                self.note_delivery_proof(now_ms);
 
-            // Retransmitted sequences still earn delivery proof and accounting,
-            // but the ACK may belong to an older copy (Karn's ambiguity).
-            if let Some(sent_ms) = sent_ms {
-                self.rtt.record_round_trip(sent_ms, now_ms);
+                // Retransmitted sequences still earn delivery proof and
+                // accounting, but the ACK may belong to an older copy (Karn's
+                // ambiguity).
+                if let Some(sent_ms) = sent_ms {
+                    self.rtt.record_round_trip(sent_ms, now_ms);
+                }
             }
 
             if classic_mode {

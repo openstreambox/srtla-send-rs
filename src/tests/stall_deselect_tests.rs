@@ -926,6 +926,127 @@ mod tests {
         assert_eq!(conns[1].in_flight_packets, 0);
     }
 
+    #[tokio::test]
+    async fn an_ack_on_another_link_never_proves_a_gated_probe() {
+        // The healthy link 0 carried the unique copy, and a cumulative SRT ACK
+        // already pruned it there by the time its SRTLA ACK arrives (routine:
+        // SRT acks every 10 ms, srtla_rec only every tenth packet). The probe
+        // copy still sits in the dead link 1's probe log. The fallback scan
+        // must not turn link 0's ACK into delivery proof for link 1.
+        use srtla_core::connection::SrtlaIncoming;
+
+        use crate::sender::{SequenceTracker, process_connection_events};
+
+        let mut conns = create_test_connections(2).await;
+        let now = now_ms();
+        let seq: u32 = 4243;
+        let probe = {
+            let mut p = [0u8; 16];
+            p[..4].copy_from_slice(&seq.to_be_bytes());
+            p
+        };
+        conns[1].queue_probe_packet(&probe, seq, now);
+        let _ = conns[1].take_batch(now);
+        conns[1].last_ack_or_rtt_sample_ms = 1;
+        // A payload packet link 1 still owes, which the fallback may settle.
+        conns[1].register_packet(4244, now);
+
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seq_tracker = SequenceTracker::new();
+        let incoming = SrtlaIncoming {
+            srtla_ack_numbers: smallvec::smallvec![seq, 4244],
+            read_any: true,
+            ..Default::default()
+        };
+        process_connection_events(
+            0,
+            &mut conns,
+            None,
+            &listener,
+            &seq_tracker,
+            false,
+            incoming,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            conns[1].last_ack_or_rtt_sample_ms, 1,
+            "an ACK that came back on link 0 proves nothing about link 1"
+        );
+        assert_eq!(
+            conns[1].in_flight_packets, 0,
+            "accounting still settles the sequence link 1 held"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ack_for_a_pruned_sequence_still_proves_the_link_that_carried_it() {
+        // Link 0 has the slower return path. The cumulative SRT ACK that came
+        // back over link 1 already pruned link 0's packet, so link 0's own
+        // SRTLA ACK matches nothing in its log. It is still link 0's proof.
+        use srtla_core::connection::SrtlaIncoming;
+
+        use crate::sender::{SequenceTracker, process_connection_events};
+
+        let mut conns = create_test_connections(2).await;
+        let now = now_ms();
+        let seq: u32 = 500;
+        let mut pkt = [0u8; 16];
+        pkt[..4].copy_from_slice(&seq.to_be_bytes());
+        conns[0].queue_data_packet(&pkt, Some(seq), now);
+        let _ = conns[0].take_batch(now);
+        let mut seq_tracker = SequenceTracker::new();
+        seq_tracker.insert(seq, conns[0].conn_id, now);
+        for c in conns.iter_mut() {
+            c.handle_srt_ack(seq as i32, now, false);
+            c.last_ack_or_rtt_sample_ms = 1;
+        }
+        assert_eq!(conns[0].in_flight_packets, 0, "precondition: pruned");
+        assert_eq!(conns[0].unproven_sends, 1);
+
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let incoming = || SrtlaIncoming {
+            srtla_ack_numbers: smallvec::smallvec![seq],
+            read_any: true,
+            ..Default::default()
+        };
+
+        // The same ACK arriving on link 1 proves nothing about either link.
+        process_connection_events(
+            1,
+            &mut conns,
+            None,
+            &listener,
+            &seq_tracker,
+            false,
+            incoming(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conns[0].last_ack_or_rtt_sample_ms, 1);
+        assert_eq!(conns[1].last_ack_or_rtt_sample_ms, 1);
+
+        // On link 0, which carried the sequence, it is link 0's proof.
+        process_connection_events(
+            0,
+            &mut conns,
+            None,
+            &listener,
+            &seq_tracker,
+            false,
+            incoming(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            conns[0].last_ack_or_rtt_sample_ms > 1,
+            "the carrying link earns proof"
+        );
+        assert_eq!(conns[0].unproven_sends, 0);
+        assert_eq!(conns[1].last_ack_or_rtt_sample_ms, 1);
+    }
+
     // --- Cross-mechanism blackout immunity (librist !375 field lesson,
     // commit 8cf11e11: one leg RTT-muted while the other stalled left the
     // balancer with no carrier at all — a self-sustaining both-legs
@@ -1143,6 +1264,168 @@ mod tests {
             conns[0].stall_gated,
             "after escalation, a single byte must not readmit the link"
         );
+    }
+
+    // --- Unproven sends: payload handed to a link since its last proof ---
+
+    /// Route `n` payload packets onto `conn` through the real send path.
+    fn send_payload(
+        conn: &mut srtla_core::connection::SrtlaConnection,
+        first: u32,
+        n: u32,
+        now: u64,
+    ) {
+        for seq in first..first + n {
+            let mut pkt = [0u8; 16];
+            pkt[..4].copy_from_slice(&seq.to_be_bytes());
+            conn.queue_data_packet(&pkt, Some(seq), now);
+        }
+        let _ = conn.take_batch(now);
+    }
+
+    #[test]
+    fn a_dead_link_drained_by_naks_and_acks_still_stalls() {
+        // The field failure: NAKs and cumulative SRT ACKs reach the sender
+        // over the healthy link and prune the dead link's packet log, so its
+        // backlog never reaches the in-flight threshold. What it was handed
+        // since its last proof does not drain.
+        use srtla_core::config_snapshot::STALL_MIN_UNPROVEN_SENDS;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(2));
+        let now = now_ms();
+        conns[0].last_ack_or_rtt_sample_ms = now.saturating_sub(STALL_ACK_STALE_MS + 1000);
+        send_payload(&mut conns[0], 100, STALL_MIN_UNPROVEN_SENDS, now);
+        for seq in 100..110 {
+            conns[0].handle_nak(seq, now);
+        }
+        conns[0].handle_srt_ack(100 + STALL_MIN_UNPROVEN_SENDS as i32 - 1, now, false);
+        assert_eq!(conns[0].in_flight_packets, 0, "the backlog has drained");
+        make_healthy_busy(&mut conns[1], now);
+
+        let selected = select_connection_idx(&mut conns, None, now, &enhanced());
+        assert_eq!(selected, Some(1));
+        assert!(conns[0].stall_gated, "unproven payload must gate the link");
+        assert!(conns[0].stall_latched());
+    }
+
+    #[test]
+    fn unproven_payload_waits_out_a_late_keepalive_echo() {
+        // A link whose only steady proof is the 1 s keepalive echo: one echo
+        // 100 ms late must not hold it out, one missing echo plus margin must.
+        use srtla_core::config_snapshot::{
+            STALL_MIN_UNPROVEN_SENDS, STALL_UNPROVEN_STALE_FLOOR_MS,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(2));
+        let now = now_ms();
+        conns[0].rtt.update_estimate(7, now);
+        send_payload(&mut conns[0], 100, STALL_MIN_UNPROVEN_SENDS, now);
+        make_healthy_busy(&mut conns[1], now);
+
+        conns[0].last_ack_or_rtt_sample_ms = now - 1_100;
+        let _ = select_connection_idx(&mut conns, None, now, &enhanced());
+        assert!(
+            !conns[0].stall_gated,
+            "an echo 100 ms late is jitter, not a dead path"
+        );
+
+        conns[0].last_ack_or_rtt_sample_ms = now - STALL_UNPROVEN_STALE_FLOOR_MS;
+        let _ = select_connection_idx(&mut conns, None, now, &enhanced());
+        assert!(conns[0].stall_gated);
+    }
+
+    #[test]
+    fn fewer_unproven_sends_than_the_threshold_do_not_stall() {
+        use srtla_core::config_snapshot::STALL_MIN_UNPROVEN_SENDS;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(2));
+        let now = now_ms();
+        conns[0].last_ack_or_rtt_sample_ms = now.saturating_sub(STALL_ACK_STALE_MS + 1000);
+        send_payload(&mut conns[0], 100, STALL_MIN_UNPROVEN_SENDS - 1, now);
+        make_healthy_busy(&mut conns[1], now);
+
+        let _ = select_connection_idx(&mut conns, None, now, &enhanced());
+        assert!(!conns[0].stall_gated);
+        assert_eq!(conns[0].stall_gate_events(), 0);
+    }
+
+    #[test]
+    fn any_delivery_proof_clears_the_unproven_count() {
+        use srtla_core::config_snapshot::STALL_MIN_UNPROVEN_SENDS;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(1));
+        let now = now_ms();
+
+        // A keepalive echo.
+        send_payload(&mut conns[0], 100, STALL_MIN_UNPROVEN_SENDS, now);
+        let ka = conns[0].keepalive_packet(now);
+        conns[0].handle_keepalive_echo(&ka, now + 5);
+        assert_eq!(conns[0].unproven_sends, 0);
+
+        // An SRTLA ACK for a packet this link carried.
+        send_payload(&mut conns[0], 200, STALL_MIN_UNPROVEN_SENDS, now);
+        assert!(conns[0].handle_srtla_ack_specific(210, false, now + 5));
+        assert_eq!(conns[0].unproven_sends, 0);
+
+        // NAKs, cumulative ACKs and ACKs that came back on another link are
+        // not proof and leave the count alone.
+        send_payload(&mut conns[0], 300, STALL_MIN_UNPROVEN_SENDS, now);
+        conns[0].handle_nak(300, now);
+        conns[0].handle_srt_ack(305, now, true);
+        assert!(conns[0].handle_srtla_ack_from_other_link(310, false, now));
+        assert_eq!(conns[0].unproven_sends, STALL_MIN_UNPROVEN_SENDS);
+    }
+
+    #[test]
+    fn probes_on_a_gated_link_are_not_unproven_payload() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(1));
+        let now = now_ms();
+        for seq in 0..100u32 {
+            let mut pkt = [0u8; 16];
+            pkt[..4].copy_from_slice(&seq.to_be_bytes());
+            conns[0].queue_probe_packet(&pkt, seq, now);
+        }
+        let _ = conns[0].take_batch(now);
+        assert_eq!(conns[0].unproven_sends, 0);
+    }
+
+    #[test]
+    fn a_link_reset_forgets_its_unproven_sends() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(1));
+        send_payload(&mut conns[0], 0, 50, now_ms());
+        conns[0].mark_for_recovery();
+        assert_eq!(conns[0].unproven_sends, 0);
+    }
+
+    #[test]
+    fn a_silent_link_with_unproven_payload_is_pulled() {
+        // A full blackhole: nothing at all comes back, and the backlog has
+        // been drained by NAKs arriving over the healthy link.
+        use srtla_core::config_snapshot::STALL_MIN_UNPROVEN_SENDS;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(2));
+        let now = now_ms();
+        conns[0].last_ack_or_rtt_sample_ms = now;
+        conns[0].last_received = Some(now - 300);
+        send_payload(&mut conns[0], 100, STALL_MIN_UNPROVEN_SENDS, now);
+        for seq in 100..100 + STALL_MIN_UNPROVEN_SENDS as i32 {
+            conns[0].handle_nak(seq, now);
+        }
+        make_healthy_busy(&mut conns[1], now);
+
+        let _ = select_connection_idx(&mut conns, None, now, &enhanced());
+        assert!(
+            conns[0].stall_gated,
+            "a mute link owed proof must be pulled"
+        );
+        assert_eq!(conns[0].silence_pulls(), 1);
     }
 
     // --- Runtime-scaled liveness timeout (librist c7a578d1's slow half) ---
