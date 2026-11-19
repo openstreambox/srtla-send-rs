@@ -99,7 +99,9 @@ pub async fn process_connection_events(
         // link's ACK stamp delivery proof on the gated link — falsely warming
         // its rejoin dwell. The fallback scan is kept for ACKs whose owner
         // can't be resolved from the arrival link (e.g. after a reconnect
-        // cleared its log).
+        // cleared its log, or a cumulative SRT ACK pruned the copy first). It
+        // only settles accounting: an ACK that came back on another link is
+        // no proof that this one delivers, and must not match its probes.
         let found_on_arrival =
             connections[idx].handle_srtla_ack_specific(*srtla_ack as i32, classic, current_time_ms);
         if !found_on_arrival {
@@ -107,7 +109,7 @@ pub async fn process_connection_events(
                 if i == idx {
                     continue;
                 }
-                if c.handle_srtla_ack_specific(*srtla_ack as i32, classic, current_time_ms) {
+                if c.handle_srtla_ack_from_other_link(*srtla_ack as i32, classic, current_time_ms) {
                     break;
                 }
             }
