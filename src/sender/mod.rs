@@ -4,6 +4,7 @@ mod egress_tick;
 mod housekeeping;
 mod links;
 mod packet_handler;
+mod receiver_addrs;
 mod rehome;
 mod reload;
 pub(crate) use reload::{normalise_link_weights, parse_ip_line};
@@ -42,6 +43,10 @@ use packet_handler::{drain_packet_queue, handle_srt_packet};
 // path the send loop uses, not a mirrored copy.
 #[allow(unused_imports)]
 pub(crate) use packet_handler::{flush_all_batches, handle_uplink_packet};
+#[allow(unused_imports)]
+pub use receiver_addrs::{
+    ADDRESS_TRIAL_MS, REFRESH_INTERVAL_MS, ReceiverAddresses, URGENT_REFRESH_MIN_MS,
+};
 // Scripted resolver seam for tests that drive the re-home trigger policy.
 #[cfg(any(test, feature = "test-internals"))]
 pub use rehome::StubResolver;

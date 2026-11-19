@@ -147,10 +147,10 @@ pub fn create_uplink_socket(domain_for: IpAddr) -> Result<Socket> {
 
 /// Every address the receiver's hostname currently answers with.
 ///
-/// [`resolve_remote`] picks the first of these to dial. The full set matters
-/// only to the reconnect path, which compares the address an uplink is pinned
-/// to against a fresh answer to detect that the receiver's DNS has drifted (see
-/// `sender::connections`).
+/// A new uplink dials the first answer in its own address family (see
+/// [`pick_remote_for_source`]). The full set feeds the sender's receiver address
+/// book, which moves a link that gets no answer from its address on to the next
+/// one, and the reconnect path's DNS drift check (see `sender::connections`).
 pub async fn resolve_remote_all(host: &str, port: u16) -> Result<SmallVec<SocketAddr, 4>> {
     let addrs = tokio::net::lookup_host((host, port))
         .await
@@ -164,4 +164,46 @@ pub async fn resolve_remote(host: &str, port: u16) -> Result<SocketAddr> {
         .first()
         .copied()
         .ok_or_else(|| anyhow::anyhow!("no DNS result for {}", host))
+}
+
+/// Whether `remote` is in the same address family as the uplink source `source`.
+///
+/// An IPv4-mapped IPv6 source (`::ffff:a.b.c.d`) counts as IPv4, because that
+/// is the socket family [`create_uplink_socket`] opens for it.
+pub fn same_family(remote: SocketAddr, source: IpAddr) -> bool {
+    remote.is_ipv4() == source.to_canonical().is_ipv4()
+}
+
+/// The address a new uplink from `source` dials first: the first answer in the
+/// source's address family, or the first answer if none matches (the
+/// historical pick, kept so a receiver that only offers the other family still
+/// fails the way it always has).
+pub fn pick_remote_for_source(addrs: &[SocketAddr], source: IpAddr) -> Option<SocketAddr> {
+    addrs
+        .iter()
+        .copied()
+        .find(|addr| same_family(*addr, source))
+        .or_else(|| addrs.first().copied())
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_uplink_dials_the_first_answer_in_its_own_family() {
+        let v4: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let v4b: SocketAddr = "192.0.2.2:5000".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
+        let src4: IpAddr = "10.0.0.2".parse().unwrap();
+        let mapped: IpAddr = "::ffff:10.0.0.2".parse().unwrap();
+        let src6: IpAddr = "2001:db8:1::2".parse().unwrap();
+
+        assert_eq!(pick_remote_for_source(&[v6, v4, v4b], src4), Some(v4));
+        assert_eq!(pick_remote_for_source(&[v6, v4], mapped), Some(v4));
+        assert_eq!(pick_remote_for_source(&[v4, v6], src6), Some(v6));
+        // No answer in the source's family: the historical first-answer pick.
+        assert_eq!(pick_remote_for_source(&[v6], src4), Some(v6));
+        assert_eq!(pick_remote_for_source(&[], src4), None);
+    }
 }

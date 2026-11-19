@@ -33,7 +33,8 @@ pub use socket::CallbackBinder;
 #[cfg(target_os = "linux")]
 pub use socket::DeviceBinder;
 pub use socket::{
-    SourceIpBinder, UplinkBinder, create_uplink_socket, resolve_remote, resolve_remote_all,
+    SourceIpBinder, UplinkBinder, create_uplink_socket, pick_remote_for_source, resolve_remote,
+    resolve_remote_all, same_family,
 };
 pub use spec::{SocketKey, UplinkSpec};
 use srtla_core::connection::BATCH_SEND_SIZE;

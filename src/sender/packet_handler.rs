@@ -721,6 +721,7 @@ mod tests {
                 socket: Arc::new(BatchUdpSocket::new(socket, remote).unwrap()),
                 binder: Arc::new(SourceIpBinder),
                 remote,
+                remote_since_ms: 0,
                 spec: UplinkSpec {
                     ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
                     iface: iface.clone(),

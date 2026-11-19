@@ -30,6 +30,11 @@ pub struct ConnIo {
     pub socket: Arc<BatchUdpSocket>,
     pub binder: Arc<dyn UplinkBinder>,
     pub remote: SocketAddr,
+    /// When this link was pointed at `remote`. The receiver address book gives
+    /// a link this long to get registered on an address before it moves the
+    /// link on to the next one (see `super::receiver_addrs`). `0` means "long
+    /// ago": the address has had its chance.
+    pub remote_since_ms: u64,
     /// Identity (`link_id`) plus current socket key (`ip`, `iface`).
     pub spec: UplinkSpec,
     /// Ifindex staleness for a device-bound link; inert for an unmapped one.
@@ -55,6 +60,7 @@ impl ConnIo {
             socket,
             binder,
             remote,
+            remote_since_ms: 0,
             spec: UplinkSpec::unmapped(ip),
             egress: EgressLifecycle::unmapped(),
             route_health: RouteHealth::Unknown,
