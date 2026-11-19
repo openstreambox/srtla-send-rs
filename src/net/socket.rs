@@ -168,8 +168,9 @@ pub async fn resolve_remote(host: &str, port: u16) -> Result<SocketAddr> {
 
 /// Whether `remote` is in the same address family as the uplink source `source`.
 ///
-/// An IPv4-mapped IPv6 source (`::ffff:a.b.c.d`) counts as IPv4, because that
-/// is the socket family [`create_uplink_socket`] opens for it.
+/// An IPv4-mapped IPv6 source (`::ffff:a.b.c.d`) counts as IPv4: its path
+/// only reaches IPv4 destinations. ([`create_uplink_socket`] opens a dual-stack
+/// AF_INET6 socket for it, which accepts IPv4 destinations on Linux.)
 pub fn same_family(remote: SocketAddr, source: IpAddr) -> bool {
     remote.is_ipv4() == source.to_canonical().is_ipv4()
 }

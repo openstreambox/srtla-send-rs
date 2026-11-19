@@ -63,7 +63,7 @@ use tokio::time::Duration;
 use tracing::{debug, warn};
 
 use super::connections::{rebuild_uplink_socket, receiver_moved, recover_connection};
-use super::receiver_addrs::ReceiverAddresses;
+use super::receiver_addrs::{AddressBookDns, ReceiverAddresses};
 use super::sequence::SequenceTracker;
 use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for};
 use crate::net::resolve_remote_all;
@@ -148,7 +148,7 @@ impl RehomeGate {
             resolver: Arc::new(DnsResolver),
             last_probe_ms: None,
             rehomes: 0,
-            addresses: ReceiverAddresses::new(enabled, Arc::new(DnsResolver)),
+            addresses: ReceiverAddresses::new(enabled, Arc::new(AddressBookDns)),
         }
     }
 
@@ -322,6 +322,8 @@ pub(super) async fn try_rehome(
         now,
     )
     .await;
+    // The old address's registrations no longer describe this bond.
+    gate.addresses.forget_registrations();
     gate.rehomes = gate.rehomes.saturating_add(1);
     true
 }

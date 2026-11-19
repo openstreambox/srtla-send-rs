@@ -62,7 +62,17 @@ pub async fn handle_housekeeping(
         if let Some(port) = conn_io.values().next().map(|io| io.remote.port()) {
             rehome.addresses.poll(receiver_host, port, current_ms);
         }
-        registered_remotes(connections, conn_io, current_ms)
+        let registered = registered_remotes(connections, conn_io, current_ms);
+        rehome.addresses.note_registered(&registered, current_ms);
+        // A registered link restarts its address trial every tick, so a link
+        // that loses registration is judged from that moment, not from when
+        // it was first dialed.
+        for (conn_id, _) in &registered {
+            if let Some(io) = conn_io.get_mut(conn_id) {
+                io.remote_since_ms = current_ms;
+            }
+        }
+        registered
     } else {
         Default::default()
     };
@@ -105,9 +115,9 @@ pub async fn handle_housekeeping(
                 match conn_io.get_mut(&conn.conn_id) {
                     Some(io) => {
                         // A hostname with several addresses: rebuild against
-                        // the one the bond is registered on, or, with no
-                        // registered link, the next answer once this one has
-                        // had its chance (see `super::receiver_addrs`).
+                        // the one the bond is (or was recently) registered
+                        // on, or, with no registration, the address the
+                        // bond is trying (see `super::receiver_addrs`).
                         if failover
                             && let Some(next) = rehome.addresses.choose_for(
                                 &label,
@@ -817,8 +827,13 @@ mod tests {
         for conn in fixture.conn_io.values_mut() {
             conn.remote_since_ms = t0;
         }
-        fixture.live(0, t0);
-        fixture.live(1, t0);
+        // Still inside the startup grace: unregistered but not yet failing.
+        for conn in fixture.connections.iter_mut() {
+            conn.connected = false;
+            conn.last_received = None;
+            conn.reconnection.connection_established_ms = 0;
+            conn.reconnection.startup_grace_deadline_ms = t0 + 60_000;
+        }
         fixture.tick(&mut gate, t0).await.unwrap();
         fixture.settle_lookup(&mut gate, t0).await;
         assert_eq!(gate.addresses().answers(), &[dead, live]);
@@ -837,6 +852,43 @@ mod tests {
         fixture.tick(&mut gate, t2).await.unwrap();
         assert_eq!(fixture.remotes(), vec![live]);
         assert_eq!(gate.addresses().move_count(), 2);
+    }
+
+    /// Review P1: a bond registered on the live address for a long time loses
+    /// every link at once (a whole-bond blip, or any timeout on a one-link
+    /// bond). It keeps retrying the live address; the stale answer is never
+    /// tried while the bond could still recover.
+    #[tokio::test]
+    async fn a_whole_bond_blip_retries_the_registered_address_not_the_stale_one() {
+        let live = remote(1);
+        let stale = remote(2);
+        let mut fixture = RehomeFixture::new(live).await;
+        let addresses = StubResolver::new(vec![Some(vec![live, stale])]);
+        let mut gate = RehomeGate::with_resolvers(true, StubResolver::new(vec![]), addresses);
+
+        // Dialed long ago, registered ever since.
+        for io in fixture.conn_io.values_mut() {
+            io.remote_since_ms = 0;
+        }
+        let t0 = now_ms();
+        fixture.live(0, t0);
+        fixture.live(1, t0);
+        fixture.tick(&mut gate, t0).await.unwrap();
+        fixture.settle_lookup(&mut gate, t0).await;
+
+        // Both links drop. Drive every retry through the all-failed window.
+        for dt in [1_000, 2_000, 3_000, 4_000, 5_000, 8_000, 9_000] {
+            for idx in 0..2 {
+                let conn = &mut fixture.connections[idx];
+                conn.connected = false;
+                conn.last_received = None;
+                conn.reconnection.startup_grace_deadline_ms = 0;
+                conn.reconnection.last_reconnect_attempt_ms = 0;
+            }
+            fixture.tick(&mut gate, t0 + dt).await.unwrap();
+            assert_eq!(fixture.remotes(), vec![live], "{dt}ms into the blip");
+        }
+        assert_eq!(gate.addresses().move_count(), 0);
     }
 
     /// A link that is registered is never moved, even when most of the bond
