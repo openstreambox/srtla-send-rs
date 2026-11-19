@@ -40,6 +40,7 @@ fn build_connection(local_ip: IpAddr, label: String) -> SrtlaConnection {
         last_sent: None,
         last_keepalive_sent: None,
         last_ack_or_rtt_sample_ms: 0,
+        unproven_sends: 0,
         stall_gated: false,
         stall_latched_since_ms: 0,
         stall_recovery_since_ms: 0,

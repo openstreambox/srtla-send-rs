@@ -353,6 +353,18 @@ pub struct SrtlaConnection {
     /// stale. `0` = no proof yet. Read only by the `stall_deselect` selection
     /// guard; never a liveness/timeout signal.
     pub last_ack_or_rtt_sample_ms: u64,
+    /// Payload packets handed to this link since its last delivery proof
+    /// ([`Self::last_ack_or_rtt_sample_ms`]). Reset only where that proof is
+    /// stamped (and on a reset), never by NAKs or cumulative SRT ACKs: those
+    /// prune the packet log but say nothing about whether *this* path
+    /// delivered, which is exactly why the in-flight count cannot see a dead
+    /// link at moderate rates (see
+    /// [`crate::config_snapshot::STALL_MIN_UNPROVEN_SENDS`]). Probes are not
+    /// counted; they are not payload this link owes.
+    #[cfg(any(test, feature = "test-internals"))]
+    pub unproven_sends: u32,
+    #[cfg(not(any(test, feature = "test-internals")))]
+    pub(crate) unproven_sends: u32,
     /// Transient per-select flag: set by `select_connection_idx` when
     /// `stall_deselect` is on and this link's stall latch is engaged while a
     /// healthier link exists. Recomputed every select call and read only by the
@@ -532,6 +544,7 @@ impl SrtlaConnection {
             last_sent: None,
             last_keepalive_sent: None,
             last_ack_or_rtt_sample_ms: 0,
+            unproven_sends: 0,
             stall_gated: false,
             stall_latched_since_ms: 0,
             stall_recovery_since_ms: 0,
@@ -684,6 +697,7 @@ impl SrtlaConnection {
             if let Some(s) = seq {
                 let seq = *s as i32;
                 self.register_packet(seq, *send_time_ms);
+                self.unproven_sends = self.unproven_sends.saturating_add(1);
                 if is_srt_data_retransmit(data) {
                     self.packet_log.insert(seq, None);
                 }
@@ -832,8 +846,29 @@ impl SrtlaConnection {
             self.record_rtt_probe();
         }
         if rtt::keepalive_echo_rtt_ms(data, now_ms).is_some() {
-            self.last_ack_or_rtt_sample_ms = now_ms;
+            self.note_delivery_proof(now_ms);
         }
+    }
+
+    /// Stamp delivery proof: an earned SRTLA ACK, a probe ACK or a keepalive
+    /// echo. The only place the unproven-send count resets.
+    #[inline]
+    pub(crate) fn note_delivery_proof(&mut self, now_ms: u64) {
+        self.last_ack_or_rtt_sample_ms = now_ms;
+        self.unproven_sends = 0;
+    }
+
+    /// Whether this link carries enough unanswered payload for silence or
+    /// stale proof to mean a stall: an in-flight backlog of at least
+    /// `min_in_flight`, or [`crate::config_snapshot::STALL_MIN_UNPROVEN_SENDS`]
+    /// packets sent since its last delivery proof. The second arm is what sees
+    /// a dead path at moderate rates, where NAKs and cumulative ACKs arriving
+    /// over the healthy links keep draining the first. An idle link meets
+    /// neither, so its keepalive cadence alone never gates it.
+    #[inline]
+    pub fn has_stall_load(&self, min_in_flight: i32) -> bool {
+        self.in_flight_packets >= min_in_flight
+            || self.unproven_sends >= crate::config_snapshot::STALL_MIN_UNPROVEN_SENDS
     }
 
     /// Record an RTT probe and advance warming → live if enough probes collected.
@@ -938,7 +973,9 @@ impl SrtlaConnection {
     }
 
     /// `stall_deselect` signal (pure read; never mutates). True for a connected
-    /// link whose in-flight backlog is at or above `min_in_flight` AND whose
+    /// link that carries stall load ([`Self::has_stall_load`]: an in-flight
+    /// backlog of at least `min_in_flight`, or enough payload sent since its
+    /// last proof) AND whose
     /// last delivery proof (earned-ACK or keepalive-RTT sample) is older than
     /// the effective staleness window ([`Self::effective_stall_stale_ms`] of
     /// `stale_ceiling_ms`). `now_ms` is the selection clock.
@@ -951,7 +988,7 @@ impl SrtlaConnection {
     #[inline]
     pub fn is_stalled(&self, now_ms: u64, min_in_flight: i32, stale_ceiling_ms: u64) -> bool {
         self.connected
-            && self.in_flight_packets >= min_in_flight
+            && self.has_stall_load(min_in_flight)
             && self.last_ack_or_rtt_sample_ms != 0
             && now_ms.saturating_sub(self.last_ack_or_rtt_sample_ms)
                 >= self.effective_stall_stale_ms(stale_ceiling_ms)
@@ -1211,8 +1248,8 @@ impl SrtlaConnection {
         base.min(self.effective_stall_stale_ms(stale_ceiling_ms))
     }
 
-    /// Fast silence signal (pure read): a connected link with a full backlog
-    /// (`in_flight >= min_in_flight`) that has received *nothing* — under
+    /// Fast silence signal (pure read): a connected link with stall load
+    /// ([`Self::has_stall_load`]) that has received *nothing* — under
     /// load, SRTLA ACKs arrive continuously, so total silence is abnormal —
     /// for [`Self::silence_pull_window_ms`]. The routing pull this drives is
     /// transient and self-clearing (any inbound byte refreshes
@@ -1226,7 +1263,7 @@ impl SrtlaConnection {
         min_in_flight: i32,
         stale_ceiling_ms: u64,
     ) -> bool {
-        if !self.connected || self.in_flight_packets < min_in_flight {
+        if !self.connected || !self.has_stall_load(min_in_flight) {
             return false;
         }
         let Some(last_received) = self.last_received else {
@@ -1365,6 +1402,7 @@ impl SrtlaConnection {
         // engagements over the link's life, and a reset is often the *result*
         // of the stall it just latched on.
         self.last_ack_or_rtt_sample_ms = 0;
+        self.unproven_sends = 0;
         self.stall_gated = false;
         self.stall_latched_since_ms = 0;
         self.stall_recovery_since_ms = 0;

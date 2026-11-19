@@ -135,7 +135,7 @@ impl SrtlaConnection {
         // release. Checked first — the sweep-proof log is where a slow link's
         // probes actually survive to be answered.
         if self.probe_log.remove(&seq).is_some() {
-            self.last_ack_or_rtt_sample_ms = now_ms;
+            self.note_delivery_proof(now_ms);
             return true;
         }
         self.settle_srtla_ack(seq, classic_mode, now_ms, true)
@@ -179,7 +179,7 @@ impl SrtlaConnection {
                 // keepalive-RTT site only (see `packet_io.rs`), never on
                 // generic inbound bytes, so a stalled-but-echoing link stays
                 // stale.
-                self.last_ack_or_rtt_sample_ms = now_ms;
+                self.note_delivery_proof(now_ms);
 
                 // Retransmitted sequences still earn delivery proof and
                 // accounting, but the ACK may belong to an older copy (Karn's
