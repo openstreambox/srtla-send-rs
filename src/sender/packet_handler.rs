@@ -105,6 +105,13 @@ pub async fn process_connection_events(
         let found_on_arrival =
             connections[idx].handle_srtla_ack_specific(*srtla_ack as i32, classic, current_time_ms);
         if !found_on_arrival {
+            // A cumulative SRT ACK that came back over a faster sibling already
+            // pruned the sequence here. If this link carried it, the ACK on
+            // this link is still this link's delivery proof; without it a
+            // healthy link with the slower return path never earns any.
+            if seq_tracker.get(*srtla_ack, current_time_ms) == Some(connections[idx].conn_id) {
+                connections[idx].note_srtla_ack_proof(current_time_ms);
+            }
             for (i, c) in connections.iter_mut().enumerate() {
                 if i == idx {
                     continue;

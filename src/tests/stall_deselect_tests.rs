@@ -980,6 +980,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_ack_for_a_pruned_sequence_still_proves_the_link_that_carried_it() {
+        // Link 0 has the slower return path. The cumulative SRT ACK that came
+        // back over link 1 already pruned link 0's packet, so link 0's own
+        // SRTLA ACK matches nothing in its log. It is still link 0's proof.
+        use srtla_core::connection::SrtlaIncoming;
+
+        use crate::sender::{SequenceTracker, process_connection_events};
+
+        let mut conns = create_test_connections(2).await;
+        let now = now_ms();
+        let seq: u32 = 500;
+        let mut pkt = [0u8; 16];
+        pkt[..4].copy_from_slice(&seq.to_be_bytes());
+        conns[0].queue_data_packet(&pkt, Some(seq), now);
+        let _ = conns[0].take_batch(now);
+        let mut seq_tracker = SequenceTracker::new();
+        seq_tracker.insert(seq, conns[0].conn_id, now);
+        for c in conns.iter_mut() {
+            c.handle_srt_ack(seq as i32, now, false);
+            c.last_ack_or_rtt_sample_ms = 1;
+        }
+        assert_eq!(conns[0].in_flight_packets, 0, "precondition: pruned");
+        assert_eq!(conns[0].unproven_sends, 1);
+
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let incoming = || SrtlaIncoming {
+            srtla_ack_numbers: smallvec::smallvec![seq],
+            read_any: true,
+            ..Default::default()
+        };
+
+        // The same ACK arriving on link 1 proves nothing about either link.
+        process_connection_events(
+            1,
+            &mut conns,
+            None,
+            &listener,
+            &seq_tracker,
+            false,
+            incoming(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conns[0].last_ack_or_rtt_sample_ms, 1);
+        assert_eq!(conns[1].last_ack_or_rtt_sample_ms, 1);
+
+        // On link 0, which carried the sequence, it is link 0's proof.
+        process_connection_events(
+            0,
+            &mut conns,
+            None,
+            &listener,
+            &seq_tracker,
+            false,
+            incoming(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            conns[0].last_ack_or_rtt_sample_ms > 1,
+            "the carrying link earns proof"
+        );
+        assert_eq!(conns[0].unproven_sends, 0);
+        assert_eq!(conns[1].last_ack_or_rtt_sample_ms, 1);
+    }
+
     // --- Cross-mechanism blackout immunity (librist !375 field lesson,
     // commit 8cf11e11: one leg RTT-muted while the other stalled left the
     // balancer with no carrier at all — a self-sustaining both-legs

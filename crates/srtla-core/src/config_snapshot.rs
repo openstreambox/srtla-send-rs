@@ -27,9 +27,10 @@ pub const RECEIVER_ACK_INTERVAL_PACKETS: u32 = 10;
 ///
 /// Three receiver ACK intervals. Proof normally arrives at least once a
 /// second from the keepalive echo, and after every ten delivered packets from
-/// an SRTLA ACK, so a live link only reaches this count with the staleness
-/// window elapsed when a keepalive echo *and* two SRTLA ACKs in a row go
-/// missing. At two intervals that coincidence still gated a link with 5 to
+/// an SRTLA ACK (the shell credits it even when a cumulative ACK over a
+/// faster sibling pruned those packets first), so a live link only reaches
+/// this count with the staleness window elapsed when a keepalive echo *and*
+/// two SRTLA ACKs in a row go missing. At two intervals that coincidence still gated a link with 5 to
 /// 20 % loss once every hour or two in simulation; at three it did not, while a
 /// dead link carrying 30 packets/s or more is still gated as soon as the
 /// staleness window (1 s at Wi-Fi and cellular round trips) has passed.

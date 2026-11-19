@@ -20,7 +20,12 @@
 //! - a packet still missing when its 2000 ms latency budget runs out is
 //!   dropped by the receiver. Those drops are what freezes the picture.
 //!
-//! Loss uses a fixed-seed generator so every run is identical.
+//! Return paths can carry random extra delay, separately for keepalive echoes
+//! and for the receiver's ACKs. With unequal round trips that reproduces the
+//! race real links run: the broadcast SRT ACK over the faster path prunes the
+//! slower link's packets before that link's own SRTLA ACK arrives.
+//!
+//! Loss and jitter use a fixed-seed generator so every run is identical.
 
 #[cfg(test)]
 mod tests {
@@ -123,6 +128,17 @@ mod tests {
         recv_batch: [Vec<u32>; 2],
         last_active_link: usize,
         receiver_drops: u64,
+        /// Extra random delay (0..=n ms) on keepalive echoes and on the
+        /// receiver's ACKs, per packet.
+        echo_jitter_ms: u64,
+        ack_jitter_ms: u64,
+        /// Per-link payload packets sent, ms spent held out, and worst
+        /// rejoin backoff seen.
+        payload_sent: [u64; 2],
+        held_out_ms: [u64; 2],
+        max_backoff: [u32; 2],
+        /// Longest a link went without delivery proof after the first 5 s.
+        max_proof_age_ms: [u64; 2],
     }
 
     impl Sim {
@@ -148,6 +164,12 @@ mod tests {
                 recv_batch: [Vec::new(), Vec::new()],
                 last_active_link: 0,
                 receiver_drops: 0,
+                echo_jitter_ms: 0,
+                ack_jitter_ms: 0,
+                payload_sent: [0; 2],
+                held_out_ms: [0; 2],
+                max_backoff: [0; 2],
+                max_proof_age_ms: [0; 2],
             }
         }
 
@@ -155,6 +177,19 @@ mod tests {
             self.next_ev += 1;
             self.payloads.insert(self.next_ev, ev);
             self.events.push(Reverse((at, self.next_ev)));
+        }
+
+        fn jitter(&mut self, max_ms: u64) -> u64 {
+            if max_ms == 0 {
+                0
+            } else {
+                self.rng.permille() as u64 % (max_ms + 1)
+            }
+        }
+
+        /// One-way delay back to the sender on `link` for a receiver ACK.
+        fn ack_delay(&mut self, link: usize) -> u64 {
+            self.rtt_ms[link] / 2 + self.jitter(self.ack_jitter_ms)
         }
 
         /// Whether one packet makes it from sender to receiver on `link`.
@@ -202,6 +237,7 @@ mod tests {
             self.conns[idx].queue_data_packet(&pkt, Some(seq), now);
             let _ = self.conns[idx].take_batch(now);
             self.owner.insert(seq, idx);
+            self.payload_sent[idx] += 1;
             self.transmit(idx, now, seq);
             for i in 0..self.conns.len() {
                 if i == idx || !self.conns[i].is_stall_gated() || !self.conns[i].stall_probe_due() {
@@ -232,7 +268,7 @@ mod tests {
                 let last_acked = self.received_upto as i32 - 1;
                 for link in 0..2 {
                     if self.return_ok(link, now) {
-                        let at = now + self.rtt_ms[link] / 2;
+                        let at = now + self.ack_delay(link);
                         self.schedule(at, Ev::SrtAck { link, last_acked });
                     }
                 }
@@ -248,7 +284,7 @@ mod tests {
                 for s in due {
                     self.missing.insert(s, now);
                     if self.return_ok(link, now) {
-                        let at = now + self.rtt_ms[link] / 2;
+                        let at = now + self.ack_delay(link);
                         self.schedule(at, Ev::Nak { link, seq: s });
                     }
                 }
@@ -269,7 +305,7 @@ mod tests {
             if self.recv_batch[link].len() == RECV_ACK_INT {
                 let seqs = std::mem::take(&mut self.recv_batch[link]);
                 if self.return_ok(link, now) {
-                    let at = now + self.rtt_ms[link] / 2;
+                    let at = now + self.ack_delay(link);
                     self.schedule(at, Ev::SrtlaAck { link, seqs });
                 }
             }
@@ -283,7 +319,7 @@ mod tests {
                         if seq.saturating_sub(gap) < 4096 && !self.missing.contains_key(&gap) {
                             self.missing.insert(gap, now);
                             if self.return_ok(link, now) {
-                                let at = now + self.rtt_ms[link] / 2;
+                                let at = now + self.ack_delay(link);
                                 self.schedule(at, Ev::Nak { link, seq: gap });
                             }
                         }
@@ -298,10 +334,16 @@ mod tests {
                 Ev::Arrive { link, seq } => self.on_arrive(now, link, seq),
                 Ev::SrtlaAck { link, seqs } => {
                     self.conns[link].last_received = Some(now);
-                    // The shell credits the arrival link first and falls back
-                    // to a scan (see `process_connection_events`).
+                    // The shell credits the arrival link first, counts an ACK
+                    // for a pruned sequence the arrival link carried as its
+                    // proof, and falls back to a scan for accounting (see
+                    // `process_connection_events`; `owner` plays the sequence
+                    // tracker, which never records probes).
                     for s in seqs {
                         if !self.conns[link].handle_srtla_ack_specific(s as i32, false, now) {
+                            if self.owner.get(&s) == Some(&link) {
+                                self.conns[link].note_srtla_ack_proof(now);
+                            }
                             for i in 0..self.conns.len() {
                                 if i != link
                                     && self.conns[i]
@@ -353,7 +395,7 @@ mod tests {
                     if self.forward_ok(link) {
                         self.last_arrival[link] = now;
                         if self.return_ok(link, now) {
-                            let at = now + self.rtt_ms[link];
+                            let at = now + self.rtt_ms[link] + self.jitter(self.echo_jitter_ms);
                             self.schedule(at, Ev::KeepaliveEcho { link, pkt });
                         }
                     }
@@ -431,6 +473,17 @@ mod tests {
                     }
                 }
                 self.receiver_tick(now, ms);
+                for l in 0..2 {
+                    if self.conns[l].is_stall_gated() {
+                        self.held_out_ms[l] += 1;
+                    }
+                    self.max_backoff[l] =
+                        self.max_backoff[l].max(self.conns[l].stall_rejoin_backoff());
+                    let proof = self.conns[l].last_ack_or_rtt_sample_ms;
+                    if ms > 5_000 && proof != 0 {
+                        self.max_proof_age_ms[l] = self.max_proof_age_ms[l].max(now - proof);
+                    }
+                }
                 let gated = self.conns[watch].is_stall_gated();
                 if let Some(c) = cut_at
                     && ms >= c
@@ -612,6 +665,93 @@ mod tests {
             let out = sim.run(rate, 60_000, &[], 0);
             assert_eq!(out.stall_gate_events, 0, "{rate} pkt/s, {out:?}");
             assert_eq!(sim.conns[1].stall_gate_events(), 0, "{rate} pkt/s, {out:?}");
+        }
+    }
+
+    // --- Jittered, unequal return paths ---
+    //
+    // `srtla_rec` broadcasts each SRT ACK on every link, so on a link whose
+    // return path is slower than its sibling's, the SRT ACK over the faster
+    // path prunes the link's packets before its own SRTLA ACK arrives. Those
+    // SRTLA ACKs still have to count as the slower link's proof, or a healthy
+    // link is left with only the keepalive echo and gets held out on jitter.
+
+    /// Keepalive echoes up to 20 ms late, receiver ACKs up to 10 ms late.
+    fn jittered(rtts: [u64; 2], seed: u64) -> Sim {
+        let mut sim = Sim::new(rtts, seed);
+        sim.echo_jitter_ms = 20;
+        sim.ack_jitter_ms = 10;
+        sim
+    }
+
+    #[test]
+    fn a_healthy_link_with_the_slower_return_path_is_never_held_out() {
+        // Wi-Fi next to cellular, or two carriers: lossless, but 18 to 40 ms
+        // apart. Non-round packet rates keep selection off a fixed phase.
+        for (rtts, rate, min_share) in [
+            ([20, 40], 97, 0.2),
+            ([7, 25], 97, 0.2),
+            ([7, 25], 103, 0.2),
+            ([30, 30], 67, 0.4),
+            ([40, 80], 151, 0.0),
+        ] {
+            for seed in 0..4u64 {
+                let mut sim = jittered(rtts, 0xabc0_0000 ^ rate ^ (seed << 20));
+                let _ = sim.run(rate, 120_000, &[], 0);
+                let gates = [
+                    sim.conns[0].stall_gate_events(),
+                    sim.conns[1].stall_gate_events(),
+                ];
+                assert_eq!(
+                    gates,
+                    [0, 0],
+                    "{rtts:?} ms at {rate} pkt/s, seed {seed}: healthy links held out {gates:?} \
+                     times, {:?} ms",
+                    sim.held_out_ms
+                );
+                let share =
+                    sim.payload_sent[1] as f64 / (sim.payload_sent[0] + sim.payload_sent[1]) as f64;
+                assert!(
+                    share >= min_share,
+                    "{rtts:?} ms at {rate} pkt/s: the slower link must carry a real share, got \
+                     {share:.2}"
+                );
+                // Carrying real load, it must keep earning SRTLA-ACK proof
+                // between keepalive echoes rather than living on the echoes.
+                if min_share > 0.0 {
+                    assert!(
+                        sim.max_proof_age_ms[1] < 800,
+                        "{rtts:?} ms at {rate} pkt/s, seed {seed}: the slower link went {} ms \
+                         without proof",
+                        sim.max_proof_age_ms[1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_dead_link_is_caught_on_jittered_unequal_paths() {
+        // Either link of a 7/25 ms pair dies, inbound only or both ways.
+        for (watch, rate) in [(0, 31), (0, 103), (1, 103), (0, 401)] {
+            for state in [PathState::DeadInbound, PathState::Blackhole] {
+                for seed in 0..4u64 {
+                    let mut sim = jittered([7, 25], 0xd00d ^ rate ^ (seed << 20));
+                    let steps = [Step {
+                        at_ms: 20_000 + seed * 131,
+                        link: watch,
+                        state,
+                    }];
+                    let out = sim.run(rate, 40_000, &steps, watch);
+                    let gated = out.gated_after_ms.expect("the dead link must be held out");
+                    assert!(
+                        gated <= 1_600,
+                        "link {watch} {state:?} at {rate} pkt/s, seed {seed}: held out after \
+                         {gated} ms, {out:?}"
+                    );
+                    assert_eq!(out.stall_gate_events, 1, "{out:?}");
+                }
+            }
         }
     }
 }

@@ -858,6 +858,22 @@ impl SrtlaConnection {
         self.unproven_sends = 0;
     }
 
+    /// Delivery proof from an SRTLA ACK that came back on this link for a
+    /// sequence this link carried, but that a cumulative SRT ACK had already
+    /// pruned from the packet log.
+    ///
+    /// That is the normal case on a link whose return path is slower than a
+    /// sibling's: `srtla_rec` broadcasts each SRT ACK on every link, so the one
+    /// over the faster path prunes the slower link's packets before the slower
+    /// link's own SRTLA ACK arrives. The ACK still proves this path delivered.
+    /// The shell decides ownership from its sequence tracker, which never
+    /// records duplicate probes. No RTT sample is taken: the send time went
+    /// with the pruned log entry.
+    #[inline]
+    pub fn note_srtla_ack_proof(&mut self, now_ms: u64) {
+        self.note_delivery_proof(now_ms);
+    }
+
     /// Whether this link carries enough unanswered payload for silence or
     /// stale proof to mean a stall: an in-flight backlog of at least
     /// `min_in_flight`, or [`crate::config_snapshot::STALL_MIN_UNPROVEN_SENDS`]
