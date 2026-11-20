@@ -324,7 +324,11 @@ pub async fn run_sender_with_config(
                         let config_snap = config.snapshot();
                         let standby_now = config.standby_generation();
                         if standby_now != standby_seen {
-                            config.apply_link_standby(&mut connections, srtla_core::utils::now_ms());
+                            config.apply_link_standby(
+                                &mut connections,
+                                |c| link_id_for(&conn_io, c),
+                                srtla_core::utils::now_ms(),
+                            );
                             standby_seen = standby_now;
                         }
                         handle_srt_packet(
@@ -411,7 +415,11 @@ pub async fn run_sender_with_config(
                         // controller, stamp results onto each connection
                         // for selection to consume, and surface via stats.
                         let housekeeping_snap = config.snapshot();
-                        config.apply_link_standby(&mut connections, srtla_core::utils::now_ms());
+                        config.apply_link_standby(
+                            &mut connections,
+                            |c| link_id_for(&conn_io, c),
+                            srtla_core::utils::now_ms(),
+                        );
                         let classification = weak_link_filter
                             .classify(&connections, housekeeping_snap.negotiated_latency_ms);
                         let link_cc_snapshots = link_cc_controller
@@ -467,6 +475,9 @@ pub async fn run_sender_with_config(
                                 &binder,
                             ).await;
                             info!("connection changes applied successfully");
+                            // Links a reload created pick up existing holds on
+                            // the next client packet, not a tick later.
+                            standby_seen = u64::MAX;
                             sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
                             // Bootstrap registration when a reload populated an
                             // empty pool. `start_probing` self-guards (no-op once
@@ -611,6 +622,16 @@ pub async fn run_sender_with_config(
 
     #[cfg(not(unix))]
     event_loop! {}
+}
+
+/// A connection's bind-map `link_id`, when its link is mapped.
+fn link_id_for(
+    conn_io: &ConnIoMap,
+    conn: &srtla_core::connection::SrtlaConnection,
+) -> Option<String> {
+    conn_io
+        .get(&conn.conn_id)
+        .and_then(|io| io.spec.link_id.as_ref().map(|i| i.as_str().to_string()))
 }
 
 /// The ADR-003 identity echo for every live uplink, keyed by `conn_id`.

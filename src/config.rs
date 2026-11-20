@@ -44,11 +44,30 @@ pub struct DynamicConfig {
     /// Learned from the wire rather than configured: see
     /// [`DynamicConfig::set_negotiated_latency_ms`].
     negotiated_latency_ms: Arc<AtomicU32>,
-    /// Host-requested standby per link source IP: the monotonic time it ends.
-    /// Deliberately absent from [`ConfigSnapshot`]; the event loop copies it
-    /// onto the connections whenever `standby_generation` moves.
-    standby: Arc<Mutex<HashMap<IpAddr, u64>>>,
+    /// Host-requested standby per link: the monotonic time it ends.
+    /// Deliberately absent from [`ConfigSnapshot`]; the event loop resolves
+    /// it against the live pool whenever `standby_generation` moves.
+    standby: Arc<Mutex<HashMap<StandbyKey, u64>>>,
     standby_generation: Arc<AtomicU64>,
+}
+
+/// Which link a standby request names: the bind-map `link_id` when the bond
+/// is mapped (the stable identity), or a source IP that must name exactly one
+/// live link.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum StandbyKey {
+    LinkId(String),
+    Ip(IpAddr),
+}
+
+impl StandbyKey {
+    /// Whether the key names a link with these `(ip, link_id)` facts.
+    pub fn matches(&self, ip: IpAddr, link_id: Option<&str>) -> bool {
+        match self {
+            StandbyKey::LinkId(id) => link_id == Some(id.as_str()),
+            StandbyKey::Ip(want) => *want == ip,
+        }
+    }
 }
 
 /// Longest standby one `set_link_standby` call may request. A host renews it
@@ -107,16 +126,23 @@ impl DynamicConfig {
         }
     }
 
-    /// Put the link with source address `ip` into standby until `now_ms +
-    /// ttl_ms` (clamped), or release it. Returns the applied TTL, `0` on release.
-    pub fn set_link_standby(&self, ip: IpAddr, standby: bool, ttl_ms: u64, now_ms: u64) -> u64 {
+    /// Hold the link `key` names until `now_ms + ttl_ms` (clamped), or release
+    /// it. Returns the applied TTL, `0` on release. The caller has already
+    /// checked that the key names exactly one live link.
+    pub fn set_link_standby(
+        &self,
+        key: StandbyKey,
+        standby: bool,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> u64 {
         let mut table = self.standby.lock().unwrap_or_else(PoisonError::into_inner);
         let applied = if standby {
             let ttl = ttl_ms.clamp(LINK_STANDBY_TTL_MS_MIN, LINK_STANDBY_TTL_MS_MAX);
-            table.insert(ip, now_ms.saturating_add(ttl));
+            table.insert(key, now_ms.saturating_add(ttl));
             ttl
         } else {
-            table.remove(&ip);
+            table.remove(&key);
             0
         };
         self.standby_generation.fetch_add(1, Ordering::Release);
@@ -129,17 +155,40 @@ impl DynamicConfig {
         self.standby_generation.load(Ordering::Acquire)
     }
 
-    /// Copy the standby table onto the connections. Expired entries are
-    /// dropped; a connection whose IP is not in the table has no standby.
+    /// Resolve the standby table against the live pool and copy it onto the
+    /// connections. `link_id_of` gives a connection's bind-map identity.
+    /// An entry that has expired, or no longer names exactly one live link
+    /// (its link was removed, or an IP became shared by twins), is dropped:
+    /// a hold ends with its link and never moves to another one.
     pub fn apply_link_standby(
         &self,
         connections: &mut [srtla_core::connection::SrtlaConnection],
+        link_id_of: impl Fn(&srtla_core::connection::SrtlaConnection) -> Option<String>,
         now_ms: u64,
     ) {
+        let ids: Vec<Option<String>> = connections.iter().map(&link_id_of).collect();
         let mut table = self.standby.lock().unwrap_or_else(PoisonError::into_inner);
-        table.retain(|_, until| *until > now_ms);
-        for c in connections.iter_mut() {
-            c.standby_until_ms = table.get(&c.local_ip).copied().unwrap_or(0);
+        let mut until = vec![0u64; connections.len()];
+        table.retain(|key, deadline| {
+            if *deadline <= now_ms {
+                return false;
+            }
+            let hits: Vec<usize> = connections
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| key.matches(c.local_ip, ids[*i].as_deref()))
+                .map(|(i, _)| i)
+                .collect();
+            match hits.as_slice() {
+                [only] => {
+                    until[*only] = until[*only].max(*deadline);
+                    true
+                }
+                _ => false,
+            }
+        });
+        for (c, u) in connections.iter_mut().zip(until) {
+            c.standby_until_ms = u;
         }
     }
 

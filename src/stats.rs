@@ -224,10 +224,11 @@ pub struct LinkStats {
     /// before the first one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_srtla_ack_age_ms: Option<u64>,
-    /// A host-requested standby (`set_link_standby`) is in force. The link is
-    /// held back from payload only while another link can carry, so read
-    /// `stall_gated` for whether it is actually skipped right now.
+    /// A host-requested standby (`set_link_standby`) is in force.
     pub standby: bool,
+    /// The last selection pass actually held this link back for its standby
+    /// (another link could carry). `stall_gated` stays the stall verdict.
+    pub standby_gated: bool,
 }
 
 impl Default for LinkStats {
@@ -283,6 +284,7 @@ impl Default for LinkStats {
             srtla_acked_packets_total: 0,
             last_srtla_ack_age_ms: None,
             standby: false,
+            standby_gated: false,
         }
     }
 }
@@ -592,6 +594,7 @@ impl SharedStats {
                 srtla_acked_packets_total: conn.srtla_acked_packets_total(),
                 last_srtla_ack_age_ms: conn.last_srtla_ack_age_ms(current_time_ms),
                 standby: conn.in_standby(current_time_ms),
+                standby_gated: conn.standby_gated,
             };
 
             if is_active {
