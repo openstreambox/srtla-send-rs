@@ -29,6 +29,9 @@ pub mod sender_tests;
 pub mod stall_deselect_tests;
 
 #[cfg(test)]
+pub mod link_standby_tests;
+
+#[cfg(test)]
 pub mod protocol_tests;
 
 #[cfg(test)]

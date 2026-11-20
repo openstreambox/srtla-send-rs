@@ -4,9 +4,11 @@
 //! actual wire protocol lives in [`crate::control`] — this module exposes
 //! plain getters/setters that the control dispatcher calls into.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::sync::Arc;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 // The hot-path snapshot type + its default constants are core; they live in
 // `config_snapshot` (free of this module's control/stats coupling). Re-exported
@@ -42,7 +44,20 @@ pub struct DynamicConfig {
     /// Learned from the wire rather than configured: see
     /// [`DynamicConfig::set_negotiated_latency_ms`].
     negotiated_latency_ms: Arc<AtomicU32>,
+    /// Host-requested standby per link source IP: the monotonic time it ends.
+    /// Deliberately absent from [`ConfigSnapshot`]; the event loop copies it
+    /// onto the connections whenever `standby_generation` moves.
+    standby: Arc<Mutex<HashMap<IpAddr, u64>>>,
+    standby_generation: Arc<AtomicU64>,
 }
+
+/// Longest standby one `set_link_standby` call may request. A host renews it
+/// while it needs the link held; one that dies releases the link within this.
+pub const LINK_STANDBY_TTL_MS_MAX: u64 = 30_000;
+/// Shortest standby, so a renewal loop has room for a scheduling hiccup.
+pub const LINK_STANDBY_TTL_MS_MIN: u64 = 1_000;
+/// Standby length when the request names none.
+pub const LINK_STANDBY_TTL_MS_DEFAULT: u64 = 10_000;
 
 impl Default for DynamicConfig {
     fn default() -> Self {
@@ -61,6 +76,8 @@ impl DynamicConfig {
             conn_timeout_ms: Arc::new(AtomicU64::new(CONN_TIMEOUT_MS)),
             rehome_on_failure: Arc::new(AtomicBool::new(true)),
             negotiated_latency_ms: Arc::new(AtomicU32::new(0)),
+            standby: Arc::new(Mutex::new(HashMap::new())),
+            standby_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -85,6 +102,44 @@ impl DynamicConfig {
             )),
             rehome_on_failure: Arc::new(AtomicBool::new(!no_rehome)),
             negotiated_latency_ms: Arc::new(AtomicU32::new(0)),
+            standby: Arc::new(Mutex::new(HashMap::new())),
+            standby_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Put the link with source address `ip` into standby until `now_ms +
+    /// ttl_ms` (clamped), or release it. Returns the applied TTL, `0` on release.
+    pub fn set_link_standby(&self, ip: IpAddr, standby: bool, ttl_ms: u64, now_ms: u64) -> u64 {
+        let mut table = self.standby.lock().unwrap_or_else(PoisonError::into_inner);
+        let applied = if standby {
+            let ttl = ttl_ms.clamp(LINK_STANDBY_TTL_MS_MIN, LINK_STANDBY_TTL_MS_MAX);
+            table.insert(ip, now_ms.saturating_add(ttl));
+            ttl
+        } else {
+            table.remove(&ip);
+            0
+        };
+        self.standby_generation.fetch_add(1, Ordering::Release);
+        applied
+    }
+
+    /// Changes whenever a standby is set or released.
+    #[inline(always)]
+    pub fn standby_generation(&self) -> u64 {
+        self.standby_generation.load(Ordering::Acquire)
+    }
+
+    /// Copy the standby table onto the connections. Expired entries are
+    /// dropped; a connection whose IP is not in the table has no standby.
+    pub fn apply_link_standby(
+        &self,
+        connections: &mut [srtla_core::connection::SrtlaConnection],
+        now_ms: u64,
+    ) {
+        let mut table = self.standby.lock().unwrap_or_else(PoisonError::into_inner);
+        table.retain(|_, until| *until > now_ms);
+        for c in connections.iter_mut() {
+            c.standby_until_ms = table.get(&c.local_ip).copied().unwrap_or(0);
         }
     }
 

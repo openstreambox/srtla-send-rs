@@ -237,6 +237,10 @@ pub struct LinkStats {
     /// and never repeats within the process. Compare the totals and the age
     /// only between two snapshots with the same epoch.
     pub srtla_ack_epoch: u64,
+    /// A host-requested standby (`set_link_standby`) is in force. The link is
+    /// held back from payload only while another link can carry, so read
+    /// `stall_gated` for whether it is actually skipped right now.
+    pub standby: bool,
 }
 
 impl Default for LinkStats {
@@ -292,6 +296,7 @@ impl Default for LinkStats {
             srtla_ack_entries_total: 0,
             last_srtla_ack_age_ms: None,
             srtla_ack_epoch: 0,
+            standby: false,
         }
     }
 }
@@ -601,6 +606,7 @@ impl SharedStats {
                 srtla_ack_entries_total: conn.srtla_ack_entries_total(),
                 last_srtla_ack_age_ms: conn.last_srtla_ack_age_ms(current_time_ms),
                 srtla_ack_epoch: conn.srtla_ack_epoch(),
+                standby: conn.in_standby(current_time_ms),
             };
 
             if is_active {

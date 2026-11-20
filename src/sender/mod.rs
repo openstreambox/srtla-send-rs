@@ -343,6 +343,11 @@ pub async fn run_sender_with_config(
         }
     }
 
+    // Host-requested standbys reach the connections on the next client packet
+    // after they change, and again every housekeeping tick (which also covers
+    // connections a reload just created).
+    let mut standby_seen = u64::MAX;
+
     // Use a macro to avoid duplicating the event loop for Unix/non-Unix
     // The only difference is SIGHUP handling on Unix
     macro_rules! event_loop {
@@ -351,6 +356,11 @@ pub async fn run_sender_with_config(
                 tokio::select! {
                     res = local_listener.recv_from(&mut recv_buf) => {
                         let config_snap = config.snapshot();
+                        let standby_now = config.standby_generation();
+                        if standby_now != standby_seen {
+                            config.apply_link_standby(&mut connections, srtla_core::utils::now_ms());
+                            standby_seen = standby_now;
+                        }
                         handle_srt_packet(
                             res,
                             &mut recv_buf,
@@ -437,6 +447,7 @@ pub async fn run_sender_with_config(
                         // controller, stamp results onto each connection
                         // for selection to consume, and surface via stats.
                         let housekeeping_snap = config.snapshot();
+                        config.apply_link_standby(&mut connections, srtla_core::utils::now_ms());
                         let classification = weak_link_filter
                             .classify(&connections, housekeeping_snap.negotiated_latency_ms);
                         let link_cc_snapshots = link_cc_controller
