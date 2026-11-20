@@ -100,8 +100,15 @@ pub fn select_connection_idx(
 /// link exists to carry the traffic. That "any healthy" guard guarantees we
 /// never gate the last usable link, so the mode selectors can treat a gated
 /// link as unschedulable without a fallback pass. When the guard is off,
-/// flag, latch, and pull are all cleared, restoring byte-for-byte baseline
-/// selection.
+/// latch and pull are cleared, and without a host standby that restores
+/// byte-for-byte baseline selection.
+///
+/// A host standby (`set_link_standby`) is folded into the same gate: a held
+/// link is gated only while some other link is usable (not timed out, past
+/// registration) and neither stalled nor held. That is the whole fail-open
+/// predicate: a weak, late or in-flight-capped carrier still counts, so a
+/// held link stays held while such a link carries alone. `standby_gated`
+/// records that this pass gated the link for its hold, apart from a stall.
 ///
 /// Also refreshes each link's `conn_timeout_ms` and `delay_budget_ms` from the
 /// snapshot, so the runtime-tunable liveness window and the peer's declared
@@ -116,31 +123,38 @@ fn apply_stall_gate(conns: &mut [SrtlaConnection], current_time_ms: u64, config:
 
     if !config.stall_deselect {
         for c in conns.iter_mut() {
-            c.stall_gated = false;
             c.silence_pulled = false;
             c.clear_stall_latch();
         }
-        return;
+    } else {
+        let min_in_flight = config.stall_min_in_flight;
+        let stale_ceiling_ms = config.stall_ack_stale_ms;
+
+        for c in conns.iter_mut() {
+            // Pull first: the latch's escalation path reads the fresh pull state.
+            c.update_silence_pull(current_time_ms, min_in_flight, stale_ceiling_ms);
+            c.update_stall_latch(current_time_ms, min_in_flight, stale_ceiling_ms);
+        }
     }
 
-    let min_in_flight = config.stall_min_in_flight;
-    let stale_ceiling_ms = config.stall_ack_stale_ms;
+    // With the guard off, latch and pull were just cleared, so `stalled` is
+    // false for every link and only a standby can gate.
+    let stalled = |c: &SrtlaConnection| c.stall_latched() || c.silence_pulled;
+    let usable = |c: &SrtlaConnection| !c.is_timed_out(current_time_ms) && c.is_schedulable();
+    let any_healthy = conns.iter().any(|c| usable(c) && !stalled(c));
+    // A standby link is held back only while a link that is neither stalled
+    // nor in standby can carry: it never blacks out the stream. Without any
+    // standby this is the stall gate exactly as before.
+    let any_carrier = conns
+        .iter()
+        .any(|c| usable(c) && !stalled(c) && !c.in_standby(current_time_ms));
 
     for c in conns.iter_mut() {
-        // Pull first: the latch's escalation path reads the fresh pull state.
-        c.update_silence_pull(current_time_ms, min_in_flight, stale_ceiling_ms);
-        c.update_stall_latch(current_time_ms, min_in_flight, stale_ceiling_ms);
-    }
-
-    let any_healthy = conns.iter().any(|c| {
-        !c.is_timed_out(current_time_ms)
-            && c.is_schedulable()
-            && !c.stall_latched()
-            && !c.silence_pulled
-    });
-
-    for c in conns.iter_mut() {
-        c.stall_gated = any_healthy && (c.stall_latched() || c.silence_pulled);
+        let stall_gate = any_healthy && stalled(c);
+        // Reported apart from the stall verdict, so stall diagnostics stay
+        // honest: a held link is not a stalled one.
+        c.standby_gated = !stall_gate && any_carrier && c.in_standby(current_time_ms);
+        c.stall_gated = stall_gate || c.standby_gated;
     }
 }
 

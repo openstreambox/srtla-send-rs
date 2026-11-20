@@ -42,12 +42,13 @@ const JSONRPC_VERSION: &str = "2.0";
 /// Every method name this control plane dispatches, `get_capabilities`
 /// included. Published by `get_capabilities` so a client feature-detects from
 /// one round trip instead of probing each name for `-32601`.
-const METHODS: [&str; 10] = [
+const METHODS: [&str; 11] = [
     "get_capabilities",
     "get_stats",
     "get_status",
     "get_subscription_count",
     "set_conn_timeout",
+    "set_link_standby",
     "set_mode",
     "set_quality",
     "set_stall_deselect",
@@ -337,6 +338,86 @@ fn handle_method(
                 .ok_or_else(|| ErrorObject::new(INVALID_PARAMS, "expected params.enabled: bool"))?;
             config.set_stall_deselect(enabled);
             Ok(json!({ "enabled": enabled }))
+        }
+
+        "set_link_standby" => {
+            use crate::config::StandbyKey;
+            let key = match (params.get("link_id"), params.get("ip")) {
+                (Some(_), Some(_)) => {
+                    return Err(ErrorObject::new(
+                        INVALID_PARAMS,
+                        "name the link by params.link_id or params.ip, not both",
+                    ));
+                }
+                (Some(id), None) => StandbyKey::LinkId(
+                    id.as_str()
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            ErrorObject::new(INVALID_PARAMS, "expected params.link_id: string")
+                        })?
+                        .to_string(),
+                ),
+                (None, Some(ip)) => {
+                    StandbyKey::Ip(ip.as_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                        ErrorObject::new(INVALID_PARAMS, "expected params.ip: IP address string")
+                    })?)
+                }
+                (None, None) => {
+                    return Err(ErrorObject::new(
+                        INVALID_PARAMS,
+                        "expected params.link_id (preferred) or params.ip",
+                    ));
+                }
+            };
+            let standby = params
+                .get("standby")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| ErrorObject::new(INVALID_PARAMS, "expected params.standby: bool"))?;
+            let ttl_ms = match params.get("ttl_ms") {
+                None => crate::config::LINK_STANDBY_TTL_MS_DEFAULT,
+                Some(v) => match v.as_u64() {
+                    Some(0) | None if standby => {
+                        return Err(ErrorObject::new(
+                            INVALID_PARAMS,
+                            "expected params.ttl_ms: u64 greater than 0",
+                        ));
+                    }
+                    other => other.unwrap_or(0),
+                },
+            };
+            // Resolve against the live links in the latest snapshot (at most
+            // one housekeeping tick old). A hold must name exactly one link: an
+            // IP that two bind-map twins share would hold both, and a hold on
+            // nothing would look applied while doing nothing.
+            let stats = stats
+                .ok_or_else(|| ErrorObject::new(INTERNAL_ERROR, "stats provider not registered"))?;
+            let snap = stats.get();
+            let matched = snap
+                .links
+                .iter()
+                .filter(|l| key.matches(l.ip, l.link_id.as_deref()))
+                .count();
+            if standby && matched != 1 {
+                return Err(ErrorObject {
+                    code: INVALID_PARAMS,
+                    message: if matched == 0 {
+                        "no live link matches".into()
+                    } else {
+                        "more than one live link matches; name it by params.link_id".into()
+                    },
+                    data: Some(json!({ "matched": matched })),
+                });
+            }
+            // Echo the applied TTL: it is clamped, so a renewal loop must pace
+            // itself on the response, not on its input. Release ignores ttl_ms.
+            let applied =
+                config.set_link_standby(key.clone(), standby, ttl_ms, srtla_core::utils::now_ms());
+            let mut result = json!({ "standby": standby, "ttl_ms": applied, "matched": matched });
+            match key {
+                StandbyKey::LinkId(id) => result["link_id"] = json!(id),
+                StandbyKey::Ip(ip) => result["ip"] = json!(ip.to_string()),
+            }
+            Ok(result)
         }
 
         "set_conn_timeout" => {
