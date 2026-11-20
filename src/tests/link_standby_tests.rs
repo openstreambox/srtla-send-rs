@@ -4,6 +4,8 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use serde_json::Value;
     use srtla_core::mode::SchedulingMode;
     use srtla_core::selection::select_connection_idx;
@@ -11,10 +13,10 @@ mod tests {
 
     use crate::config::{
         ConfigSnapshot, DynamicConfig, LINK_STANDBY_TTL_MS_DEFAULT, LINK_STANDBY_TTL_MS_MAX,
-        LINK_STANDBY_TTL_MS_MIN,
+        LINK_STANDBY_TTL_MS_MIN, StandbyKey,
     };
     use crate::control::dispatch;
-    use crate::stats::SharedStats;
+    use crate::stats::{LinkIdentity, SharedStats};
     use crate::test_helpers::create_test_connections;
 
     fn snap(mode: SchedulingMode, stall_deselect: bool) -> ConfigSnapshot {
@@ -105,19 +107,75 @@ mod tests {
         let now = now_ms();
         let ip0 = conns[0].local_ip;
         let before = config.standby_generation();
-        assert_eq!(config.set_link_standby(ip0, true, 5_000, now), 5_000);
+        assert_eq!(
+            config.set_link_standby(StandbyKey::Ip(ip0), true, 5_000, now),
+            5_000
+        );
         assert_ne!(config.standby_generation(), before);
-        config.apply_link_standby(&mut conns, now);
+        config.apply_link_standby(&mut conns, |_| None, now);
         assert!(conns[0].in_standby(now));
         assert!(!conns[1].in_standby(now));
         // Expired entries are dropped on the next application.
-        config.apply_link_standby(&mut conns, now + 5_000);
+        config.apply_link_standby(&mut conns, |_| None, now + 5_000);
         assert_eq!(conns[0].standby_until_ms, 0);
         // Release.
-        config.set_link_standby(ip0, true, 5_000, now);
-        assert_eq!(config.set_link_standby(ip0, false, 0, now), 0);
-        config.apply_link_standby(&mut conns, now);
+        config.set_link_standby(StandbyKey::Ip(ip0), true, 5_000, now);
+        assert_eq!(
+            config.set_link_standby(StandbyKey::Ip(ip0), false, 0, now),
+            0
+        );
+        config.apply_link_standby(&mut conns, |_| None, now);
         assert!(!conns[0].in_standby(now));
+    }
+
+    #[test]
+    fn a_link_id_holds_one_twin_and_an_ip_shared_by_twins_holds_neither() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(2));
+        // A bind-map pair on one source IP, as two radios leasing the same
+        // address from two routers would be.
+        conns[1].local_ip = conns[0].local_ip;
+        let first = conns[0].conn_id;
+        let id_of = move |c: &srtla_core::connection::SrtlaConnection| {
+            Some(
+                if c.conn_id == first {
+                    "radio-a"
+                } else {
+                    "radio-b"
+                }
+                .to_string(),
+            )
+        };
+        let config = DynamicConfig::new();
+        let now = now_ms();
+        config.set_link_standby(StandbyKey::LinkId("radio-b".into()), true, 5_000, now);
+        config.apply_link_standby(&mut conns, id_of, now);
+        assert!(!conns[0].in_standby(now));
+        assert!(conns[1].in_standby(now));
+        // An IP both twins carry names two links: the entry is dropped and
+        // holds neither, instead of silently holding both.
+        let config = DynamicConfig::new();
+        config.set_link_standby(StandbyKey::Ip(conns[0].local_ip), true, 5_000, now);
+        config.apply_link_standby(&mut conns, id_of, now);
+        assert!(!conns[0].in_standby(now) && !conns[1].in_standby(now));
+    }
+
+    #[test]
+    fn a_hold_ends_with_its_link_and_never_moves_to_a_successor() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(2));
+        let config = DynamicConfig::new();
+        let now = now_ms();
+        config.set_link_standby(StandbyKey::Ip(conns[1].local_ip), true, 10_000, now);
+        // The link is removed by a reload: the next application drops the hold.
+        let mut remaining = vec![conns.remove(0)];
+        config.apply_link_standby(&mut remaining, |_| None, now);
+        // A new link later takes the old address: it must not inherit the hold.
+        let held_ip = conns[0].local_ip;
+        let mut successor = rt.block_on(create_test_connections(1));
+        successor[0].local_ip = held_ip;
+        config.apply_link_standby(&mut successor, |_| None, now);
+        assert!(!successor[0].in_standby(now));
     }
 
     fn call(config: &DynamicConfig, stats: Option<&SharedStats>, params: &str) -> Value {
@@ -127,34 +185,113 @@ mod tests {
         serde_json::from_str(&resp.to_json()).unwrap()
     }
 
+    /// Live links 192.168.1.10 (link_id "radio-a") and 192.168.1.11, plus a
+    /// twin pair on 192.168.1.20 ("radio-b", "radio-c").
+    fn live_stats() -> SharedStats {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(4));
+        let twin_ip: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        conns[2].local_ip = twin_ip;
+        conns[3].local_ip = twin_ip;
+        let mut ids = HashMap::new();
+        for (c, id) in conns
+            .iter()
+            .zip([Some("radio-a"), None, Some("radio-b"), Some("radio-c")])
+        {
+            ids.insert(
+                c.conn_id,
+                LinkIdentity {
+                    iface: None,
+                    link_id: id.map(str::to_string),
+                },
+            );
+        }
+        let stats = SharedStats::new();
+        stats.update(&conns, &ConfigSnapshot::default(), None, None, Some(&ids));
+        stats
+    }
+
+    #[test]
+    fn the_control_method_names_exactly_one_live_link() {
+        let config = DynamicConfig::new();
+        let stats = live_stats();
+        let v = call(
+            &config,
+            Some(&stats),
+            r#"{"link_id":"radio-b","standby":true}"#,
+        );
+        assert_eq!(v["result"]["matched"], 1, "{v}");
+        assert_eq!(v["result"]["link_id"], "radio-b");
+        let v = call(
+            &config,
+            Some(&stats),
+            r#"{"ip":"192.168.1.11","standby":true}"#,
+        );
+        assert_eq!(v["result"]["matched"], 1, "{v}");
+        let v = call(
+            &config,
+            Some(&stats),
+            r#"{"ip":"192.168.1.20","standby":true}"#,
+        );
+        assert_eq!(v["error"]["code"], -32602, "{v}");
+        assert_eq!(v["error"]["data"]["matched"], 2);
+        let v = call(
+            &config,
+            Some(&stats),
+            r#"{"ip":"192.0.2.99","standby":true}"#,
+        );
+        assert_eq!(v["error"]["data"]["matched"], 0, "{v}");
+        let v = call(
+            &config,
+            Some(&stats),
+            r#"{"link_id":"gone","standby":true}"#,
+        );
+        assert_eq!(v["error"]["code"], -32602, "{v}");
+        // Releasing what is not there is a harmless no-op that says so.
+        let v = call(
+            &config,
+            Some(&stats),
+            r#"{"link_id":"gone","standby":false}"#,
+        );
+        assert_eq!(v["result"]["matched"], 0, "{v}");
+    }
+
     #[test]
     fn the_control_method_clamps_the_ttl_and_validates_its_params() {
         let config = DynamicConfig::new();
-        let v = call(&config, None, r#"{"ip":"192.0.2.10","standby":true}"#);
+        let stats = live_stats();
+        let s = Some(&stats);
+        let v = call(&config, s, r#"{"link_id":"radio-a","standby":true}"#);
         assert_eq!(v["result"]["ttl_ms"], LINK_STANDBY_TTL_MS_DEFAULT);
-        assert_eq!(v["result"]["ip"], "192.0.2.10");
         let v = call(
             &config,
-            None,
-            r#"{"ip":"192.0.2.10","standby":true,"ttl_ms":5}"#,
+            s,
+            r#"{"link_id":"radio-a","standby":true,"ttl_ms":5}"#,
         );
         assert_eq!(v["result"]["ttl_ms"], LINK_STANDBY_TTL_MS_MIN);
         let v = call(
             &config,
-            None,
-            r#"{"ip":"192.0.2.10","standby":true,"ttl_ms":3600000}"#,
+            s,
+            r#"{"link_id":"radio-a","standby":true,"ttl_ms":3600000}"#,
         );
         assert_eq!(v["result"]["ttl_ms"], LINK_STANDBY_TTL_MS_MAX);
-        let v = call(&config, None, r#"{"ip":"2001:db8::1","standby":false}"#);
+        let v = call(
+            &config,
+            s,
+            r#"{"link_id":"radio-a","standby":false,"ttl_ms":0}"#,
+        );
         assert_eq!(v["result"]["standby"], false);
         assert_eq!(v["result"]["ttl_ms"], 0);
         for bad in [
             r#"{"standby":true}"#,
             r#"{"ip":"not-an-ip","standby":true}"#,
-            r#"{"ip":"192.0.2.10"}"#,
-            r#"{"ip":"192.0.2.10","standby":true,"ttl_ms":"long"}"#,
+            r#"{"link_id":"","standby":true}"#,
+            r#"{"link_id":"radio-a","ip":"192.168.1.10","standby":true}"#,
+            r#"{"link_id":"radio-a"}"#,
+            r#"{"link_id":"radio-a","standby":true,"ttl_ms":0}"#,
+            r#"{"link_id":"radio-a","standby":true,"ttl_ms":"long"}"#,
         ] {
-            let v = call(&config, None, bad);
+            let v = call(&config, s, bad);
             assert_eq!(v["error"]["code"], -32602, "{bad}: {v}");
         }
     }
@@ -185,5 +322,37 @@ mod tests {
         let v: Value = serde_json::from_str(&stats.to_json()).unwrap();
         assert_eq!(v["links"][0]["standby"], true);
         assert_eq!(v["links"][1]["standby"], false);
+    }
+
+    #[test]
+    fn a_held_link_is_reported_as_held_not_as_stalled() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(2));
+        let now = now_ms();
+        conns[0].standby_until_ms = now + 10_000;
+        let _ = select_connection_idx(&mut conns, None, now, &snap(SchedulingMode::Enhanced, true));
+        assert!(conns[0].standby_gated);
+        let stats = SharedStats::new();
+        stats.update(&conns, &ConfigSnapshot::default(), None, None, None);
+        let v: Value = serde_json::from_str(&stats.to_json()).unwrap();
+        assert_eq!(v["links"][0]["standby_gated"], true);
+        assert_eq!(v["links"][0]["stall_gated"], false);
+        let text = crate::metrics::render(
+            &stats,
+            &DynamicConfig::new(),
+            &srtla_core::priority::CriticalWindow::new(),
+        );
+        assert!(
+            text.contains(r#"srtla_send_link_standby_gated{ip="192.168.1.10"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"srtla_send_link_stall_gated{ip="192.168.1.10"} 0"#),
+            "{text}"
+        );
+        // The only carrier left: held, it still carries and is not gated.
+        conns.truncate(1);
+        let _ = select_connection_idx(&mut conns, None, now, &snap(SchedulingMode::Enhanced, true));
+        assert!(!conns[0].standby_gated);
     }
 }

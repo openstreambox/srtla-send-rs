@@ -497,6 +497,8 @@ pub struct SrtlaConnection {
     /// selection gives it no payload while another link can carry. `0` = none.
     /// Expires by itself, so a host that dies cannot strand a link.
     pub standby_until_ms: u64,
+    /// The last selection pass gated this link for its standby, not a stall.
+    pub standby_gated: bool,
     /// Per-link liveness timeout in ms. Refreshed from the config snapshot on
     /// every selection pass so `is_timed_out` (called from paths that do not
     /// carry a config) always sees the current runtime value.
@@ -617,6 +619,7 @@ impl SrtlaConnection {
             last_srtla_ack_ms: 0,
             srtla_ack_epoch: next_srtla_ack_epoch(),
             standby_until_ms: 0,
+            standby_gated: false,
             conn_timeout_ms: crate::config_snapshot::CONN_TIMEOUT_MS,
             delay_budget_ms: 0,
             rtt: RttTracker::default(),

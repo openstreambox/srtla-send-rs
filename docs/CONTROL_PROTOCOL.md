@@ -66,21 +66,25 @@ Params: `{ "ms": u64 }`. Result: `{ "ms": <applied> }`. The value is clamped to 
 
 ### `set_link_standby`
 
-Hold one link back from payload while it stays registered, for a host that wants a path ready but idle (for example while it proves another path before a hand-over).
+Hold one link back from unique payload while it stays registered, for a host that wants a path ready but idle (a backup kept warm, or an old path kept while a new one proves itself).
 
 | param | type | values |
 | --- | --- | --- |
-| `ip` | string | the link's source address, as in the IP list |
+| `link_id` | string | the link's bind-map `link_id` (preferred: the stable identity) |
+| `ip` | string | the link's source address; only when exactly one live link has it |
 | `standby` | bool | `true` to hold, `false` to release |
-| `ttl_ms` | u64, optional | how long the hold lasts; default 10000, clamped to 1000..30000 |
+| `ttl_ms` | u64, optional | how long the hold lasts; default 10000, clamped to 1000..30000; `0` is an error; ignored on release |
 
-Result: `{ "ip": "<ip>", "standby": bool, "ttl_ms": <applied, 0 on release> }`.
+Name the link by exactly one of `link_id` or `ip`. A hold is checked against the live links in the latest stats snapshot (at most one housekeeping tick old) and must match exactly one: none, or an `ip` that two bind-map twins share, is `-32602` with `data.matched`. A release that matches nothing is a no-op and says `matched: 0`.
 
-- A link in standby keeps its registration and keepalives, so its RTT stays fresh. Like a stall-gated link, it gets an occasional duplicate probe of payload sent elsewhere, so its delivery proof stays current; it gets no unique payload.
-- Standby never blacks out the stream: if no other link can carry (timed out, registering, stalled), the standby link carries.
-- The hold expires after `ttl_ms`. A host that needs it longer renews it before then, pacing on the returned `ttl_ms`; a host that stops renewing releases the link within that time.
-- A change applies with the next packet from the SRT client. A link created by a reload picks up an existing hold within one housekeeping tick (1 s).
-- `get_stats` reports `standby` per link; `stall_gated` says whether the link is skipped right now.
+Result: `{ "link_id" | "ip": <as given>, "standby": bool, "ttl_ms": <applied, 0 on release>, "matched": <live links named> }`.
+
+- The link keeps its registration and keepalives, so its RTT and liveness stay current. Like a stall-gated link it gets an occasional duplicate probe (1 in 100 routed packets), so a fresh SRTLA ACK on it is rare: with batches of 10 at the receiver, about one per thousand stream packets. Its `last_srtla_ack_age_ms` grows while held and is not a liveness signal.
+- Fail-open predicate: a held link is gated only while some other link is usable (not timed out, registered) and neither stalled nor held. A weak, late or in-flight-capped link counts, so a held link stays held while such a link carries alone. With no such link, the held link carries.
+- The hold ends after `ttl_ms` unless renewed (pace renewals on the returned `ttl_ms`), on release, or when its link leaves the pool or stops being uniquely named; it never moves to another link. It lives in process memory only.
+- A change applies with the next packet from the SRT client; a link created by a reload picks up an existing hold the same way. Batches already queued on the link still drain.
+- Without a hold, selection is unchanged. The hold does not detect a path that answers keepalives but drops data; that needs the stall gate or the host's own proof.
+- `get_stats` reports `standby` (a hold is in force) and `standby_gated` (the last selection pass actually held the link back). `stall_gated` keeps meaning a stall. Prometheus exports `srtla_send_link_standby_gated`.
 
 ### `get_status`
 

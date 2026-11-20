@@ -226,6 +226,23 @@ pub fn render(stats: &SharedStats, config: &DynamicConfig, cw: &CriticalWindow) 
 
     writeln!(
         out,
+        "# HELP srtla_send_link_standby_gated link is held back from payload by a host standby \
+         (0/1)"
+    )
+    .ok();
+    writeln!(out, "# TYPE srtla_send_link_standby_gated gauge").ok();
+    for link in &snap.links {
+        writeln!(
+            out,
+            r#"srtla_send_link_standby_gated{{ip="{}"}} {}"#,
+            link.ip,
+            if link.standby_gated { 1 } else { 0 }
+        )
+        .ok();
+    }
+
+    writeln!(
+        out,
         "# HELP srtla_send_link_stall_gate_events cumulative stall-latch engagements"
     )
     .ok();
