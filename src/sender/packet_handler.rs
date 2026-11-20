@@ -122,6 +122,22 @@ pub(crate) fn apply_link_feedback(
         }
     }
 
+    // `srtla_rec` sends an SRTLA ACK on a link only after packets arrived on
+    // that link, so its arrival is that link's delivery proof whatever the
+    // sequences now map to. Matching sequences is not enough: a cumulative SRT
+    // ACK over a faster sibling can prune the slower link's packets before its
+    // own SRTLA ACK arrives, and NAKs can clear and re-route them.
+    //
+    // Only on a registered link: before REG3 the receiver does not yet know
+    // this socket as part of the group, and REG3 clears the unproven count
+    // but not the proof stamp. Datagrams from a retired socket never get here
+    // (`handle_uplink_packet` drops them by generation). The per-sequence
+    // matching below, with its RTT samples and window accounting, does not
+    // depend on this.
+    if connections[idx].connected && !incoming.srtla_ack_numbers.is_empty() {
+        connections[idx].note_srtla_ack_proof(current_time_ms);
+    }
+
     for srtla_ack in incoming.srtla_ack_numbers.iter() {
         // Match the arrival link's packet log FIRST. The receiver sends an
         // SRTLA ACK back on the link that delivered the packet, and with
