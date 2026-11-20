@@ -447,6 +447,11 @@ pub struct SrtlaConnection {
     /// When the last SRTLA ACK arrived on this link, `0` before the first.
     /// Unlike `last_ack_or_rtt_sample_ms`, keepalive replies never stamp it.
     pub(crate) last_srtla_ack_ms: u64,
+    /// Host-requested standby (control method `set_link_standby`): until this
+    /// monotonic time the link stays registered and keeps its keepalives, but
+    /// selection gives it no payload while another link can carry. `0` = none.
+    /// Expires by itself, so a host that dies cannot strand a link.
+    pub standby_until_ms: u64,
     /// Per-link liveness timeout in ms. Refreshed from the config snapshot on
     /// every selection pass so `is_timed_out` (called from paths that do not
     /// carry a config) always sees the current runtime value.
@@ -564,6 +569,7 @@ impl SrtlaConnection {
             packets_sent_total: 0,
             srtla_acked_packets_total: 0,
             last_srtla_ack_ms: 0,
+            standby_until_ms: 0,
             conn_timeout_ms: crate::config_snapshot::CONN_TIMEOUT_MS,
             delay_budget_ms: 0,
             rtt: RttTracker::default(),
@@ -1306,6 +1312,12 @@ impl SrtlaConnection {
         self.srtla_acked_packets_total =
             self.srtla_acked_packets_total.saturating_add(acked as u64);
         self.last_srtla_ack_ms = now_ms;
+    }
+
+    /// Whether a host-requested standby is in force at `now_ms`.
+    #[inline(always)]
+    pub fn in_standby(&self, now_ms: u64) -> bool {
+        now_ms < self.standby_until_ms
     }
 
     /// Data datagrams queued on this link over the process lifetime.

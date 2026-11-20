@@ -50,6 +50,24 @@ Toggle quality scoring (enhanced mode).
 
 Params: `{ "enabled": bool }`. Result: `{ "enabled": bool }`.
 
+### `set_link_standby`
+
+Hold one link back from payload while it stays registered, for a host that wants a path ready but idle (for example while it proves another path before a hand-over).
+
+| param | type | values |
+| --- | --- | --- |
+| `ip` | string | the link's source address, as in the IP list |
+| `standby` | bool | `true` to hold, `false` to release |
+| `ttl_ms` | u64, optional | how long the hold lasts; default 10000, clamped to 1000..30000 |
+
+Result: `{ "ip": "<ip>", "standby": bool, "ttl_ms": <applied, 0 on release> }`.
+
+- A link in standby keeps its registration and keepalives, so its RTT stays fresh. Like a stall-gated link, it gets an occasional duplicate probe of payload sent elsewhere, so its delivery proof stays current; it gets no unique payload.
+- Standby never blacks out the stream: if no other link can carry (timed out, registering, stalled), the standby link carries.
+- The hold expires after `ttl_ms`. A host that needs it longer renews it before then, pacing on the returned `ttl_ms`; a host that stops renewing releases the link within that time.
+- A change applies with the next packet from the SRT client. A link created by a reload picks up an existing hold within one housekeeping tick (1 s).
+- `get_stats` reports `standby` per link; `stall_gated` says whether the link is skipped right now.
+
 ### `get_status`
 
 Return the full runtime configuration plus priority-sidecar telemetry.
