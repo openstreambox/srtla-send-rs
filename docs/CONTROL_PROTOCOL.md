@@ -90,6 +90,28 @@ Result:
 
 Return per-link telemetry (the JSON previously returned by `stats`).
 
+#### Arrival reports per link
+
+The receiver acknowledges each data packet in an SRTLA ACK sent back on the link the packet arrived on (irlserver/srtla `register_packet`, BELABOX `srtla_rec`, both in batches of 10). Counting those entries on the link the ACK came back on tells which path the receiver actually heard from. The sender's own counters (`bitrate_bytes_per_sec`, `in_flight`) only say what it put on a link, and cumulative SRT ACKs and NAKs, which often come back over a sibling link, prune its packet logs.
+
+| field | meaning |
+| --- | --- |
+| `data_packets_queued_total` | SRT DATA datagrams queued on the link: first sends, retransmits and duplicate probes. Forwarded SRT control traffic is not counted. |
+| `srtla_ack_entries_total` | Sequence entries in SRTLA ACKs that arrived on the link while it was registered. Every entry counts, including a repeated ACK or a packet that arrived twice. |
+| `last_srtla_ack_age_ms` | Milliseconds since an SRTLA ACK last arrived on the link in the current epoch. Absent before the first one, never `null`. Keepalive replies do not reset it. |
+| `srtla_ack_epoch` | Changes when the link's connection is created or its socket replaced, and never repeats in the process. |
+
+These are observations of arrival reports, not goodput:
+
+- The totals are monotonic for the life of one connection. A link removed by a reload and added again is a new connection: its totals start at 0 under a new epoch. A socket replacement keeps the totals, starts a new epoch and clears the age. Compare two snapshots only when their epochs match.
+- The receiver reports in batches, so up to one batch per link is outstanding at any time, and a link that goes quiet may never report its last partial batch.
+- A lost SRTLA ACK loses its whole batch of reports. A report already in flight when a socket is replaced can be counted in the new epoch.
+- Arrival at the receiver says nothing about delivery further downstream.
+- A receiver that throttles its ACKs reports fewer entries than arrived.
+- A link that carries only occasional duplicate probes (for example one held out by the stall gate) gets a report only every few hundred to thousand stream packets, so its age grows even while the path works. Keepalive RTT, not this age, is the liveness signal for such a link.
+
+The same two totals are exported as Prometheus counters, `srtla_send_link_data_packets_queued_total` and `srtla_send_link_srtla_ack_entries_total`.
+
 ## Subscriptions
 
 The Unix control socket supports server-push subscriptions. Polling `get_stats` at 1 Hz misses sub-second link-state changes (NAK bursts, quality drops, reconnects); subscriptions let clients receive push events on the same socket they already use for requests.
