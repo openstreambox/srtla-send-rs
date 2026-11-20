@@ -107,6 +107,15 @@
   it. `src/toml_config.rs`, `tests/cli_surface.rs`.
 - **`get_stats` and `stats` links gain upstream's additive `weight` field**
   (`src/stats.rs`). The ADR-001 `--stats-file` document does not carry it.
+- **`get_stats` and `stats` links carry per-link arrival reports**
+  (`data_packets_queued_total`, `srtla_ack_entries_total`, `last_srtla_ack_age_ms`,
+  `srtla_ack_epoch`; `src/stats.rs`, "Arrival reports per link" in
+  `docs/CONTROL_PROTOCOL.md`). Unlike `bytes_sent_total` the totals belong to one
+  connection object: a link a reload removes and adds again starts at 0 under a new
+  epoch, and a socket replacement keeps the totals but starts a new epoch and clears the
+  age. Consumers key deltas by `link_id` and compare only equal epochs. They are
+  receiver arrival reports, not goodput. The `--stats-file` document does not carry
+  them. `src/tests/link_arrival_tests.rs`, `tests/netns_arrival_reports.rs`.
 - **Empty start is not fatal.** A missing, empty, or all-invalid `BIND_IPS_FILE` at
   startup binds the local listener, starts with an empty uplink pool, and waits for a
   `SIGHUP`. It must never crash-loop the device. `tests/signal_parity.rs`.

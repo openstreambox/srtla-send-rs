@@ -288,6 +288,10 @@ impl Default for LinkStats {
             sole_carrier_elections: 0,
             in_flight_cap_packets: 0,
             in_flight_cap_active: false,
+            data_packets_queued_total: 0,
+            srtla_ack_entries_total: 0,
+            last_srtla_ack_age_ms: None,
+            srtla_ack_epoch: 0,
         }
     }
 }

@@ -99,7 +99,7 @@ mod tests {
         conns[0].queue_data_packet(&[0u8; 1316], Some(1), now);
         ack_on(&mut conns, 0, &[1]).await;
         let stats = SharedStats::new();
-        stats.update(&conns, &ConfigSnapshot::default(), None, None);
+        stats.update(&conns, &ConfigSnapshot::default(), None, None, None);
         let v: serde_json::Value = serde_json::from_str(&stats.to_json()).unwrap();
         let links = v["links"].as_array().unwrap();
         assert_eq!(links[0]["data_packets_queued_total"], 1);
