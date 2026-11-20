@@ -54,3 +54,6 @@ pub mod link_weight_tests;
 
 #[cfg(test)]
 pub mod srt_session_tests;
+
+#[cfg(test)]
+pub mod link_arrival_tests;
