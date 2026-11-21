@@ -8,7 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 
 use super::connections::{reconnect_uplink, recover_connection};
-use super::rehome::{RehomeGate, try_rehome};
+use super::rehome::{RehomeGate, try_leave_unregistered, try_rehome};
 use super::sequence::SequenceTracker;
 use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart_reader_for};
 
@@ -155,6 +155,27 @@ pub async fn handle_housekeeping(
         }
     }
 
+    // A sender that has never registered may have dialled a stale record ahead
+    // of a live one; the all-failed branch below never arms for it. See
+    // `super::rehome`: whole bond, rate-limited, and never once anything has
+    // registered.
+    if try_leave_unregistered(
+        rehome,
+        connections,
+        conn_io,
+        reg,
+        seq_tracker,
+        reader_handles,
+        packet_tx,
+        receiver_host,
+        current_ms,
+    )
+    .await
+    {
+        *all_failed_at = None;
+        return Ok(());
+    }
+
     // Update active connections count (matches C implementation behavior)
     // C code resets active_connections=0 then counts non-timed-out connections
     reg.update_active_connections(connections);
@@ -261,7 +282,7 @@ mod tests {
     use srtla_core::utils::now_ms;
 
     use super::*;
-    use crate::sender::rehome::StubResolver;
+    use crate::sender::rehome::{StubResolver, UNREGISTERED_MOVE_MS};
     use crate::sender::uplink::{create_uplink_channel, sync_readers};
     use crate::test_helpers::{
         create_test_conn_io_map, create_test_connection, create_test_connections,
@@ -628,6 +649,68 @@ mod tests {
         assert_eq!(resolver.calls(), 1, "the rate limit gates the lookup too");
         assert_eq!(gate.rehome_count(), 1);
         assert!(fired.is_err(), "the all-failed error path stands meanwhile");
+    }
+
+    /// A sender that never registered, pinned to a stale first answer next to
+    /// a live one, keeps re-arming its startup grace on every retry, so on a
+    /// real sender the all-failed window never arms. It still moves to the
+    /// live answer once it has gone the hold without a registration.
+    #[tokio::test]
+    async fn a_sender_that_never_registered_moves_on_after_the_hold() {
+        let stale = remote(1);
+        let live = remote(2);
+        let mut fixture = RehomeFixture::new(stale).await;
+        fixture.reg.has_connected = false;
+        let resolver = StubResolver::new(vec![Some(vec![stale, live])]);
+        let mut gate = RehomeGate::with_resolver(true, resolver.clone());
+
+        let t0 = now_ms();
+        for now in (t0..t0 + UNREGISTERED_MOVE_MS).step_by(1_000) {
+            // Retries keep each link inside a fresh grace window.
+            for conn in fixture.connections.iter_mut() {
+                conn.reconnection.startup_grace_deadline_ms = now + STARTUP_GRACE_MS;
+            }
+            fixture
+                .tick(&mut gate, now)
+                .await
+                .expect("no error while retrying");
+        }
+        assert_eq!(resolver.calls(), 0, "no lookup during the hold");
+        assert_eq!(fixture.remotes(), vec![stale]);
+
+        fixture
+            .tick(&mut gate, t0 + UNREGISTERED_MOVE_MS)
+            .await
+            .expect("moving on is not an error");
+        assert_eq!(fixture.remotes(), vec![live], "every uplink moved together");
+        assert_eq!(gate.rehome_count(), 1);
+        assert!(fixture.reg.is_probing());
+    }
+
+    /// When every link of a sender that never registered does time out, the
+    /// all-failed branch spends the lookup first; it moves on with it rather
+    /// than leaving the bond on the stale answer for another rate-limit window.
+    #[tokio::test]
+    async fn the_all_failed_lookup_also_moves_a_sender_that_never_registered() {
+        let stale = remote(1);
+        let live = remote(2);
+        let mut fixture = RehomeFixture::new(stale).await;
+        fixture.reg.has_connected = false;
+        let resolver = StubResolver::new(vec![Some(vec![stale, live])]);
+        let mut gate = RehomeGate::with_resolver(true, resolver.clone());
+
+        let t0 = now_ms();
+        fixture.kill_all_uplinks(t0);
+        fixture
+            .tick(&mut gate, t0)
+            .await
+            .expect("arming must not error");
+        fixture
+            .tick(&mut gate, t0 + GLOBAL_TIMEOUT_MS + 1_000)
+            .await
+            .expect("moving on replaces the all-failed error");
+        assert_eq!(resolver.calls(), 1);
+        assert_eq!(fixture.remotes(), vec![live]);
     }
 
     /// `--no-rehome` restores the pre-existing behaviour exactly.

@@ -31,6 +31,24 @@
 //! 3. The per-process rate limit allows it: at most one probe+re-home attempt
 //!    per [`REHOME_MIN_INTERVAL_MS`].
 //!
+//! # A sender that never registered
+//!
+//! The all-failed window above never arms for a sender that has not registered
+//! once: each initial-registration retry re-opens its link's startup grace, so
+//! the links are never all timed out at the same time for long. And when the
+//! receiver name answers with a stale address first and a live one after it,
+//! drift (2) never holds either, because the stale address is still listed.
+//! Such a sender would stay dead for the whole session.
+//!
+//! [`try_leave_unregistered`] covers exactly that case. While no registration
+//! has ever succeeded (`has_connected` is false) and the bond has been pinned
+//! to its address for [`UNREGISTERED_MOVE_MS`], it looks the name up under the
+//! same rate limit, and if a pinned family offers another address it moves
+//! the whole bond to the next answer after its own ([`next_untried_answer`]).
+//! With nothing ever registered there is no receiver instance to protect. Once
+//! any registration has succeeded it never applies again, so a registered
+//! stream behind GeoDNS or round-robin is never moved by a reordered answer.
+//!
 //! Nothing about the wire changes: the move is a plain RTT probe followed by the
 //! standard REG1/REG2/REG3 flow, indistinguishable to the C reference receiver,
 //! BELABOX, or irlserver `srtla_rec` from a sender that just started.
@@ -77,6 +95,12 @@ pub const REHOME_MIN_INTERVAL_MS: u64 = 60_000;
 /// up a bond that is already dead. A reload only reaches DNS when it adds an
 /// uplink in an address family the bond has no receiver address for.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a sender that has never registered stays on the address it dialled
+/// before it tries the next answer: the startup grace plus the all-failed
+/// window, so a live receiver behind a slow or lossy first handshake keeps
+/// several full REG1/REG2 rounds before the bond is moved away from it.
+pub const UNREGISTERED_MOVE_MS: u64 = 15_000;
 
 /// Addresses a receiver hostname currently answers with.
 pub type ResolvedAddrs = SmallVec<SocketAddr, 4>;
@@ -133,6 +157,10 @@ pub struct RehomeGate {
     /// is a published JSON/Prometheus contract and this counter is not worth
     /// widening it for.
     rehomes: u64,
+    /// When the bond was first seen on its current address (the first
+    /// housekeeping pass, or the last move). Only read while nothing has ever
+    /// registered.
+    pinned_since_ms: Option<u64>,
 }
 
 impl RehomeGate {
@@ -142,6 +170,7 @@ impl RehomeGate {
             resolver: Arc::new(DnsResolver),
             last_probe_ms: None,
             rehomes: 0,
+            pinned_since_ms: None,
         }
     }
 
@@ -171,6 +200,7 @@ impl RehomeGate {
             resolver,
             last_probe_ms: None,
             rehomes: 0,
+            pinned_since_ms: None,
         }
     }
 
@@ -263,6 +293,25 @@ pub(super) async fn try_rehome(
     };
 
     if !receiver_moved(&current, &fresh) {
+        if !reg.has_connected {
+            // The lookup is spent either way: let a sender that never
+            // registered use it to move on (see `try_leave_unregistered`).
+            return move_to_next_answer(
+                gate,
+                connections,
+                conn_io,
+                reg,
+                seq_tracker,
+                reader_handles,
+                packet_tx,
+                receiver_host,
+                &current,
+                &fresh,
+                dead_for_ms,
+                now,
+            )
+            .await;
+        }
         debug!(
             "bond down for {dead_for_ms}ms but {receiver_host} still resolves to it; not \
              re-homing, normal reconnects continue"
@@ -304,7 +353,147 @@ pub(super) async fn try_rehome(
     )
     .await;
     gate.rehomes = gate.rehomes.saturating_add(1);
+    gate.pinned_since_ms = Some(now);
     true
+}
+
+/// Move a sender that has never registered off an address that may be a stale
+/// record (see the module docs). Called on every housekeeping pass; returns
+/// `true` only when the bond was repointed.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn try_leave_unregistered(
+    gate: &mut RehomeGate,
+    connections: &mut SmallVec<SrtlaConnection, 4>,
+    conn_io: &mut ConnIoMap,
+    reg: &mut SrtlaRegistrationManager,
+    seq_tracker: &mut SequenceTracker,
+    reader_handles: &mut HashMap<ConnectionId, ReaderHandle>,
+    packet_tx: &UnboundedSender<UplinkPacket>,
+    receiver_host: &str,
+    now: u64,
+) -> bool {
+    if reg.has_connected {
+        return false;
+    }
+    let pinned_since = *gate.pinned_since_ms.get_or_insert(now);
+    let unregistered_ms = now.saturating_sub(pinned_since);
+    if unregistered_ms < UNREGISTERED_MOVE_MS {
+        return false;
+    }
+    let current: ResolvedAddrs = pinned_remotes(connections, conn_io);
+    let Some(&pinned) = current.first() else {
+        return false;
+    };
+    if !gate.claim_probe(now) {
+        return false;
+    }
+    let Some(fresh) = gate
+        .resolver
+        .resolve(receiver_host.to_string(), pinned.port())
+        .await
+    else {
+        return false;
+    };
+    move_to_next_answer(
+        gate,
+        connections,
+        conn_io,
+        reg,
+        seq_tracker,
+        reader_handles,
+        packet_tx,
+        receiver_host,
+        &current,
+        &fresh,
+        unregistered_ms,
+        now,
+    )
+    .await
+}
+
+/// The move itself, once a lookup has been spent on a sender that never
+/// registered: the whole bond to [`next_untried_answer`], if there is one.
+#[allow(clippy::too_many_arguments)]
+async fn move_to_next_answer(
+    gate: &mut RehomeGate,
+    connections: &mut SmallVec<SrtlaConnection, 4>,
+    conn_io: &mut ConnIoMap,
+    reg: &mut SrtlaRegistrationManager,
+    seq_tracker: &mut SequenceTracker,
+    reader_handles: &mut HashMap<ConnectionId, ReaderHandle>,
+    packet_tx: &UnboundedSender<UplinkPacket>,
+    receiver_host: &str,
+    current: &[SocketAddr],
+    fresh: &[SocketAddr],
+    unregistered_ms: u64,
+    now: u64,
+) -> bool {
+    let Some(&pinned) = current.first() else {
+        return false;
+    };
+    let Some(next) = next_untried_answer(current, fresh) else {
+        debug!(
+            "no registration at {pinned} in {unregistered_ms}ms, and {receiver_host} offers no \
+             other address in its family; staying"
+        );
+        return false;
+    };
+    let to: SmallVec<String, 4> = next.iter().map(ToString::to_string).collect();
+    warn!(
+        "no registration at {pinned} in {unregistered_ms}ms; {receiver_host} also resolves to \
+         other addresses, so moving {} uplink(s) to [{}] and registering from scratch",
+        connections.len(),
+        to.join(", ")
+    );
+    rehome_bond(
+        connections,
+        conn_io,
+        reg,
+        seq_tracker,
+        reader_handles,
+        packet_tx,
+        &next,
+        now,
+    )
+    .await;
+    gate.rehomes = gate.rehomes.saturating_add(1);
+    gate.pinned_since_ms = Some(now);
+    true
+}
+
+/// Where a bond that never registered goes next: for each address it is pinned
+/// to, the answer that follows it among `fresh`'s answers in the same address
+/// family, wrapping around. `None` when no pinned family has another address.
+///
+/// The order is the resolver's, so with a stable answer the bond walks every
+/// address of the family in turn, one per rate-limit window, and comes back to
+/// the first; a resolver that reorders between lookups can make it revisit an
+/// address early, which costs a window, never a split.
+pub(super) fn next_untried_answer(
+    current: &[SocketAddr],
+    fresh: &[SocketAddr],
+) -> Option<ResolvedAddrs> {
+    let mut next = ResolvedAddrs::new();
+    let mut moved = false;
+    for pinned in current {
+        let family: ResolvedAddrs = fresh
+            .iter()
+            .copied()
+            .filter(|addr| addr.is_ipv4() == pinned.is_ipv4())
+            .collect();
+        let Some(&first) = family.first() else {
+            continue;
+        };
+        let after = family
+            .iter()
+            .position(|addr| addr == pinned)
+            .map_or(first, |i| family[(i + 1) % family.len()]);
+        moved |= after != *pinned;
+        if !next.contains(&after) {
+            next.push(after);
+        }
+    }
+    moved.then_some(next)
 }
 
 /// Repoint every uplink at the first `new_remotes` answer in its own address
@@ -519,6 +708,9 @@ mod tests {
     async fn unchanged_dns_does_not_re_home() {
         let old = addr(1);
         let mut bond = Bond::new(old).await;
+        // A stream that was registered and then lost. (A sender that never
+        // registered moves on instead; see the `never_registered` tests.)
+        bond.reg.has_connected = true;
         // A reordered multi-A answer that still lists our address.
         let resolver = StubResolver::new(vec![Some(vec![addr(7), old])]);
         let mut gate = RehomeGate::with_resolver(true, resolver.clone());
@@ -526,6 +718,129 @@ mod tests {
         assert!(!run_try_rehome(&mut bond, &mut gate, now_ms()).await);
         assert_eq!(bond.remotes(), vec![old]);
         assert_eq!(gate.rehome_count(), 0);
+    }
+
+    async fn run_leave_unregistered(bond: &mut Bond, gate: &mut RehomeGate, now: u64) -> bool {
+        let (packet_tx, _packet_rx) = create_uplink_channel();
+        try_leave_unregistered(
+            gate,
+            &mut bond.connections,
+            &mut bond.conn_io,
+            &mut bond.reg,
+            &mut bond.seq_tracker,
+            &mut bond.reader_handles,
+            &packet_tx,
+            "rec.example.com",
+            now,
+        )
+        .await
+    }
+
+    #[test]
+    fn the_next_answer_follows_the_pinned_one_in_its_family_and_wraps() {
+        // Stale first, live second: go to the live one.
+        assert_eq!(
+            next_untried_answer(&[addr(1)], &[addr(1), addr(2)]).as_deref(),
+            Some(&[addr(2)][..])
+        );
+        // At the last answer: back to the first.
+        assert_eq!(
+            next_untried_answer(&[addr(2)], &[addr(1), addr(2)]).as_deref(),
+            Some(&[addr(1)][..])
+        );
+        // The only address in the family: nowhere else to go.
+        assert_eq!(next_untried_answer(&[addr(1)], &[addr(1)]), None);
+        assert_eq!(next_untried_answer(&[addr(1)], &[addr(1), v6(5000)]), None);
+        // Each pinned family walks on its own.
+        let v6b = SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+            5000,
+        );
+        assert_eq!(
+            next_untried_answer(&[addr(1), v6(5000)], &[addr(1), v6(5000), v6b]).as_deref(),
+            Some(&[addr(1), v6b][..])
+        );
+    }
+
+    /// The field case: the receiver name answered with a stale address first
+    /// and a live one second. Every uplink dialled the stale one, so nothing
+    /// ever registered, and because the stale address stays listed the drift
+    /// rule never fired. The bond moves on, whole, after the hold.
+    #[tokio::test]
+    async fn a_sender_that_never_registered_moves_to_the_next_answer() {
+        let stale = addr(1);
+        let live = addr(2);
+        let mut bond = Bond::new(stale).await;
+        let resolver = StubResolver::new(vec![Some(vec![stale, live]), Some(vec![live, stale])]);
+        let mut gate = RehomeGate::with_resolver(true, resolver.clone());
+
+        let t0 = now_ms();
+        assert!(!run_leave_unregistered(&mut bond, &mut gate, t0).await);
+        assert!(
+            !run_leave_unregistered(&mut bond, &mut gate, t0 + UNREGISTERED_MOVE_MS - 1_000).await
+        );
+        assert_eq!(resolver.calls(), 0, "no lookup during the hold");
+
+        let moved_at = t0 + UNREGISTERED_MOVE_MS;
+        assert!(run_leave_unregistered(&mut bond, &mut gate, moved_at).await);
+        assert_eq!(bond.remotes(), vec![live], "every uplink moved together");
+        assert_eq!(gate.rehome_count(), 1);
+        assert!(bond.reg.is_probing(), "and registers from scratch");
+
+        // The same rate limit as a re-home gates the next move and its lookup.
+        assert!(
+            !run_leave_unregistered(&mut bond, &mut gate, moved_at + UNREGISTERED_MOVE_MS).await
+        );
+        assert_eq!(resolver.calls(), 1);
+    }
+
+    /// Once anything registered, a listed address is never left on a
+    /// reordered answer, and the name is not even looked up.
+    #[tokio::test]
+    async fn a_sender_that_registered_once_is_never_moved_this_way() {
+        let pinned = addr(1);
+        let mut bond = Bond::new(pinned).await;
+        bond.reg.has_connected = true;
+        let resolver = StubResolver::new(vec![Some(vec![pinned, addr(2)])]);
+        let mut gate = RehomeGate::with_resolver(true, resolver.clone());
+
+        let t0 = now_ms();
+        for now in [
+            t0,
+            t0 + UNREGISTERED_MOVE_MS,
+            t0 + 10 * UNREGISTERED_MOVE_MS,
+        ] {
+            assert!(!run_leave_unregistered(&mut bond, &mut gate, now).await);
+        }
+        assert_eq!(resolver.calls(), 0);
+        assert_eq!(bond.remotes(), vec![pinned]);
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_never_registered_stays_when_its_address_is_the_only_one() {
+        let pinned = addr(1);
+        let mut bond = Bond::new(pinned).await;
+        let resolver = StubResolver::new(vec![Some(vec![pinned])]);
+        let mut gate = RehomeGate::with_resolver(true, resolver.clone());
+
+        let t0 = now_ms();
+        assert!(!run_leave_unregistered(&mut bond, &mut gate, t0).await);
+        assert!(!run_leave_unregistered(&mut bond, &mut gate, t0 + UNREGISTERED_MOVE_MS).await);
+        assert_eq!(resolver.calls(), 1);
+        assert_eq!(bond.remotes(), vec![pinned]);
+    }
+
+    #[tokio::test]
+    async fn the_opt_out_also_keeps_a_sender_that_never_registered_in_place() {
+        let mut bond = Bond::new(addr(1)).await;
+        let resolver = StubResolver::new(vec![Some(vec![addr(1), addr(2)])]);
+        let mut gate = RehomeGate::with_resolver(false, resolver.clone());
+
+        let t0 = now_ms();
+        assert!(!run_leave_unregistered(&mut bond, &mut gate, t0).await);
+        assert!(!run_leave_unregistered(&mut bond, &mut gate, t0 + UNREGISTERED_MOVE_MS).await);
+        assert_eq!(resolver.calls(), 0);
+        assert_eq!(bond.remotes(), vec![addr(1)]);
     }
 
     #[tokio::test]
