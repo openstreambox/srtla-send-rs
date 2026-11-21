@@ -688,10 +688,10 @@ mod tests {
     }
 
     /// When every link of a sender that never registered does time out, the
-    /// all-failed branch spends the lookup first; it moves on with it rather
-    /// than leaving the bond on the stale answer for another rate-limit window.
+    /// all-failed branch must not spend the shared lookup before the hold, or
+    /// the move to the live answer would wait a whole rate-limit window.
     #[tokio::test]
-    async fn the_all_failed_lookup_also_moves_a_sender_that_never_registered() {
+    async fn the_all_failed_branch_leaves_the_lookup_to_the_never_registered_move() {
         let stale = remote(1);
         let live = remote(2);
         let mut fixture = RehomeFixture::new(stale).await;
@@ -705,8 +705,18 @@ mod tests {
             .tick(&mut gate, t0)
             .await
             .expect("arming must not error");
-        fixture
+        // Past the all-failed window but inside the hold: no lookup yet.
+        let _ = fixture
             .tick(&mut gate, t0 + GLOBAL_TIMEOUT_MS + 1_000)
+            .await;
+        assert_eq!(
+            resolver.calls(),
+            0,
+            "the 15 s hold applies on this path too"
+        );
+        assert_eq!(fixture.remotes(), vec![stale]);
+        fixture
+            .tick(&mut gate, t0 + UNREGISTERED_MOVE_MS)
             .await
             .expect("moving on replaces the all-failed error");
         assert_eq!(resolver.calls(), 1);

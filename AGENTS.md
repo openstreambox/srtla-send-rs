@@ -258,10 +258,12 @@ uplink to the new address together and re-register from scratch.
   startup grace, so trigger (1) never holds, and a stale record answered ahead
   of a live one keeps (2) false for the whole session. After
   `UNREGISTERED_MOVE_MS` (15 s) on its address, under the same rate limit, the
-  whole bond moves to the next answer after its own in each pinned family
-  (`next_untried_answer`, wrapping). A lookup the all-failed branch spends on
-  such a sender moves it the same way. Nothing has registered, so there is no
-  receiver instance to protect; once anything has, this never applies again.
+  whole bond moves, per pinned family, to the first answer it has not already
+  left (`next_untried_answer`; once all were tried the walk starts over). A
+  family the lookup omits keeps its address, so its uplinks are never dropped
+  this way. Re-home spends no lookup on such a sender before the same 15 s.
+  Nothing has registered, so there is no receiver instance to protect; once
+  anything has, this never applies again.
 - **Per-family pick.** Every uplink dials the first answer in its own address
   family (`net::select_remote_for_source`); an IPv4-mapped IPv6 source counts
   as IPv4 and gets an IPv4 socket. Startup resolves the receiver once

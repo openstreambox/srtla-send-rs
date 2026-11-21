@@ -44,7 +44,7 @@
 //! has ever succeeded (`has_connected` is false) and the bond has been pinned
 //! to its address for [`UNREGISTERED_MOVE_MS`], it looks the name up under the
 //! same rate limit, and if a pinned family offers another address it moves
-//! the whole bond to the next answer after its own ([`next_untried_answer`]).
+//! the whole bond to an answer it has not tried yet ([`next_untried_answer`]).
 //! With nothing ever registered there is no receiver instance to protect. Once
 //! any registration has succeeded it never applies again, so a registered
 //! stream behind GeoDNS or round-robin is never moved by a reordered answer.
@@ -161,6 +161,9 @@ pub struct RehomeGate {
     /// housekeeping pass, or the last move). Only read while nothing has ever
     /// registered.
     pinned_since_ms: Option<u64>,
+    /// Addresses a bond that never registered has already left, so the next
+    /// move tries one it has not (see [`next_untried_answer`]).
+    tried: ResolvedAddrs,
 }
 
 impl RehomeGate {
@@ -171,6 +174,7 @@ impl RehomeGate {
             last_probe_ms: None,
             rehomes: 0,
             pinned_since_ms: None,
+            tried: ResolvedAddrs::new(),
         }
     }
 
@@ -201,6 +205,7 @@ impl RehomeGate {
             last_probe_ms: None,
             rehomes: 0,
             pinned_since_ms: None,
+            tried: ResolvedAddrs::new(),
         }
     }
 
@@ -280,6 +285,17 @@ pub(super) async fn try_rehome(
         return false;
     };
 
+    // A sender that never registered is `try_leave_unregistered`'s until its
+    // hold has passed; spending the shared lookup slot here first would delay
+    // that move by a whole rate-limit window.
+    if !reg.has_connected
+        && gate
+            .pinned_since_ms
+            .is_some_and(|since| now.saturating_sub(since) < UNREGISTERED_MOVE_MS)
+    {
+        return false;
+    }
+
     if !gate.claim_probe(now) {
         return false;
     }
@@ -293,25 +309,6 @@ pub(super) async fn try_rehome(
     };
 
     if !receiver_moved(&current, &fresh) {
-        if !reg.has_connected {
-            // The lookup is spent either way: let a sender that never
-            // registered use it to move on (see `try_leave_unregistered`).
-            return move_to_next_answer(
-                gate,
-                connections,
-                conn_io,
-                reg,
-                seq_tracker,
-                reader_handles,
-                packet_tx,
-                receiver_host,
-                &current,
-                &fresh,
-                dead_for_ms,
-                now,
-            )
-            .await;
-        }
         debug!(
             "bond down for {dead_for_ms}ms but {receiver_host} still resolves to it; not \
              re-homing, normal reconnects continue"
@@ -431,7 +428,7 @@ async fn move_to_next_answer(
     let Some(&pinned) = current.first() else {
         return false;
     };
-    let Some(next) = next_untried_answer(current, fresh) else {
+    let Some(next) = next_untried_answer(current, fresh, &mut gate.tried) else {
         debug!(
             "no registration at {pinned} in {unregistered_ms}ms, and {receiver_host} offers no \
              other address in its family; staying"
@@ -461,36 +458,49 @@ async fn move_to_next_answer(
     true
 }
 
-/// Where a bond that never registered goes next: for each address it is pinned
-/// to, the answer that follows it among `fresh`'s answers in the same address
-/// family, wrapping around. `None` when no pinned family has another address.
+/// Where a bond that never registered goes next, for each address it is
+/// pinned to:
+/// - the first answer in the same family, in `fresh`'s order, that the bond
+///   has not already left without registering (`tried`);
+/// - once every other answer of the family has been tried, the first of them
+///   again, and the family's memory starts over;
+/// - its own address when the family has no other answer, including a family
+///   this lookup happened to omit, so a transient omission never drops a
+///   family's uplinks from the bond.
 ///
-/// The order is the resolver's, so with a stable answer the bond walks every
-/// address of the family in turn, one per rate-limit window, and comes back to
-/// the first; a resolver that reorders between lookups can make it revisit an
-/// address early, which costs a window, never a split.
+/// `None` when no pinned address would change. Addresses the bond leaves are
+/// added to `tried`. Because the memory, not the answer order, decides, a
+/// resolver that reorders its answers cannot keep the bond cycling between two
+/// dead addresses while a live one is listed.
 pub(super) fn next_untried_answer(
     current: &[SocketAddr],
     fresh: &[SocketAddr],
+    tried: &mut ResolvedAddrs,
 ) -> Option<ResolvedAddrs> {
     let mut next = ResolvedAddrs::new();
     let mut moved = false;
-    for pinned in current {
-        let family: ResolvedAddrs = fresh
+    for &pinned in current {
+        let others: ResolvedAddrs = fresh
             .iter()
             .copied()
-            .filter(|addr| addr.is_ipv4() == pinned.is_ipv4())
+            .filter(|addr| addr.is_ipv4() == pinned.is_ipv4() && *addr != pinned)
             .collect();
-        let Some(&first) = family.first() else {
-            continue;
+        let target = if let Some(&addr) = others.iter().find(|addr| !tried.contains(addr)) {
+            addr
+        } else if let Some(&addr) = others.first() {
+            tried.retain(|addr| addr.is_ipv4() != pinned.is_ipv4());
+            addr
+        } else {
+            pinned
         };
-        let after = family
-            .iter()
-            .position(|addr| addr == pinned)
-            .map_or(first, |i| family[(i + 1) % family.len()]);
-        moved |= after != *pinned;
-        if !next.contains(&after) {
-            next.push(after);
+        if target != pinned {
+            moved = true;
+            if !tried.contains(&pinned) {
+                tried.push(pinned);
+            }
+        }
+        if !next.contains(&target) {
+            next.push(target);
         }
     }
     moved.then_some(next)
@@ -737,27 +747,79 @@ mod tests {
     }
 
     #[test]
-    fn the_next_answer_follows_the_pinned_one_in_its_family_and_wraps() {
-        // Stale first, live second: go to the live one.
+    fn the_next_answer_is_one_not_tried_yet_in_the_same_family() {
+        let mut tried = ResolvedAddrs::new();
+        // Stale first, live second: go to the live one, and remember the stale.
         assert_eq!(
-            next_untried_answer(&[addr(1)], &[addr(1), addr(2)]).as_deref(),
+            next_untried_answer(&[addr(1)], &[addr(1), addr(2)], &mut tried).as_deref(),
             Some(&[addr(2)][..])
         );
-        // At the last answer: back to the first.
-        assert_eq!(
-            next_untried_answer(&[addr(2)], &[addr(1), addr(2)]).as_deref(),
-            Some(&[addr(1)][..])
-        );
+        assert_eq!(tried.as_slice(), &[addr(1)]);
         // The only address in the family: nowhere else to go.
-        assert_eq!(next_untried_answer(&[addr(1)], &[addr(1)]), None);
-        assert_eq!(next_untried_answer(&[addr(1)], &[addr(1), v6(5000)]), None);
+        let mut none = ResolvedAddrs::new();
+        assert_eq!(next_untried_answer(&[addr(1)], &[addr(1)], &mut none), None);
+        assert_eq!(
+            next_untried_answer(&[addr(1)], &[addr(1), v6(5000)], &mut none),
+            None
+        );
+        assert!(none.is_empty());
+    }
+
+    /// Dead A and B, live C. A resolver that alternates `[A, B, C]` and
+    /// `[B, A, C]` used to bounce the bond between A and B for ever.
+    #[test]
+    fn a_reordering_resolver_cannot_keep_the_bond_off_a_listed_live_address() {
+        let (a, b, c) = (addr(1), addr(2), addr(3));
+        let mut tried = ResolvedAddrs::new();
+        let mut pinned = a;
+        let orders = [
+            [a, b, c],
+            [b, a, c],
+            [a, b, c],
+            [b, a, c],
+            [a, b, c],
+            [b, a, c],
+        ];
+        let mut visited = vec![pinned];
+        for order in &orders[..2] {
+            pinned = next_untried_answer(&[pinned], order, &mut tried).unwrap()[0];
+            visited.push(pinned);
+        }
+        assert_eq!(
+            visited,
+            vec![a, b, c],
+            "every answer is tried before any twice"
+        );
+        // After every other answer was tried, the walk starts over instead of
+        // giving up, still one address per window.
+        let mut after = vec![];
+        for order in &orders[2..] {
+            pinned = next_untried_answer(&[pinned], order, &mut tried).unwrap()[0];
+            after.push(pinned);
+        }
+        assert!(
+            after.contains(&c),
+            "the live answer comes round again: {after:?}"
+        );
+    }
+
+    /// A lookup that omits one family must not drop that family's uplinks.
+    #[test]
+    fn a_family_missing_from_one_answer_keeps_its_address() {
+        let v6a = v6(5000);
+        let mut tried = ResolvedAddrs::new();
+        assert_eq!(
+            next_untried_answer(&[addr(1), v6a], &[addr(1), addr(2)], &mut tried).as_deref(),
+            Some(&[addr(2), v6a][..])
+        );
         // Each pinned family walks on its own.
         let v6b = SocketAddr::new(
             IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
             5000,
         );
+        let mut tried = ResolvedAddrs::new();
         assert_eq!(
-            next_untried_answer(&[addr(1), v6(5000)], &[addr(1), v6(5000), v6b]).as_deref(),
+            next_untried_answer(&[addr(1), v6a], &[addr(1), v6a, v6b], &mut tried).as_deref(),
             Some(&[addr(1), v6b][..])
         );
     }
@@ -828,6 +890,43 @@ mod tests {
         assert!(!run_leave_unregistered(&mut bond, &mut gate, t0 + UNREGISTERED_MOVE_MS).await);
         assert_eq!(resolver.calls(), 1);
         assert_eq!(bond.remotes(), vec![pinned]);
+    }
+
+    /// A dual-stack sender whose lookup omits AAAA once moves its IPv4
+    /// uplinks on and keeps its IPv6 uplink, socket and all, on its address.
+    #[tokio::test]
+    async fn a_move_keeps_a_family_the_lookup_omitted() {
+        use crate::net::{SourceIpBinder, UplinkBinder};
+        use crate::sender::connections::create_connections_from_ips;
+
+        let v6_remote: SocketAddr = "[::1]:5000".parse().unwrap();
+        let mut bond = Bond::new(addr(1)).await;
+        let binder: Arc<dyn UplinkBinder> = Arc::new(SourceIpBinder);
+        let added = create_connections_from_ips(
+            &[IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
+            &[],
+            &[v6_remote],
+            "::1",
+            5000,
+            &binder,
+            &mut bond.conn_io,
+        )
+        .await;
+        let v6_id = added[0].conn_id;
+        bond.connections.extend(added);
+
+        let resolver = StubResolver::new(vec![Some(vec![addr(1), addr(2)])]);
+        let mut gate = RehomeGate::with_resolver(true, resolver);
+        let t0 = now_ms();
+        assert!(!run_leave_unregistered(&mut bond, &mut gate, t0).await);
+        assert!(run_leave_unregistered(&mut bond, &mut gate, t0 + UNREGISTERED_MOVE_MS).await);
+
+        assert_eq!(bond.connections.len(), 3, "no uplink was dropped");
+        assert_eq!(bond.conn_io.get(&v6_id).unwrap().remote, v6_remote);
+        assert_eq!(bond.remotes(), vec![addr(2), v6_remote]);
+        for conn in &bond.connections {
+            assert!(bond.conn_io.contains_key(&conn.conn_id));
+        }
     }
 
     #[tokio::test]
