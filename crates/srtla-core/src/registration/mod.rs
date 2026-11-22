@@ -153,7 +153,8 @@ impl SrtlaRegistrationManager {
         }
     }
 
-    fn revoke_reg3_grant(&mut self, conn_idx: usize) {
+    /// Discard any pending REG3 grant before using a replacement socket.
+    pub fn revoke_reg3_grant(&mut self, conn_idx: usize) {
         self.awaiting_reg3.retain(|&idx| idx != conn_idx);
     }
 

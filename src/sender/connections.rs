@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use smallvec::SmallVec;
 use srtla_core::connection::SrtlaConnection;
+use srtla_core::registration::SrtlaRegistrationManager;
 use srtla_core::utils::now_ms;
 use tracing::{debug, info, warn};
 
@@ -332,6 +333,7 @@ async fn connect_uplink(
     let route_health = observe_route_for(spec);
     let io = ConnIo {
         socket,
+        socket_generation: 0,
         binder: link_binder,
         remote,
         spec: spec.clone(),
@@ -389,8 +391,11 @@ pub async fn reconnect_uplink(
     receiver_host: &str,
     seq_tracker: &mut SequenceTracker,
     now: u64,
+    registration: (&mut SrtlaRegistrationManager, usize),
 ) -> Result<()> {
     rebuild_uplink_socket(conn, io, seq_tracker, now)?;
+    let (reg, idx) = registration;
+    reg.revoke_reg3_grant(idx);
     spawn_receiver_dns_drift_check(receiver_host, io.remote, now);
     Ok(())
 }
@@ -422,6 +427,7 @@ pub(super) fn rebuild_uplink_socket(
     io.binder.bind(&sock, conn.local_ip)?;
     sock.set_nonblocking(true)?;
     io.socket = Arc::new(BatchUdpSocket::new(sock, io.remote)?);
+    io.socket_generation += 1;
 
     conn.reset_for_reconnect(now);
     // A reconnected link comes back with an empty packet log, so the tracker

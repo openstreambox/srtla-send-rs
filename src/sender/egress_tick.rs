@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use srtla_core::connection::SrtlaConnection;
+use srtla_core::registration::SrtlaRegistrationManager;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
@@ -42,6 +43,7 @@ pub async fn handle_egress(
     seq_tracker: &mut SequenceTracker,
     receiver_host: &str,
     now_ms: u64,
+    registration: (&mut SrtlaRegistrationManager, usize),
 ) -> TickFlow {
     let route_before = io.route_health;
     match io.egress.poll(&SystemIfaceResolver) {
@@ -72,11 +74,13 @@ pub async fn handle_egress(
 
     let label = conn.label.clone();
     conn.record_reconnect_attempt(now_ms);
-    if let Err(e) = reconnect_uplink(conn, io, receiver_host, seq_tracker, now_ms).await {
+    if let Err(e) =
+        reconnect_uplink(conn, io, receiver_host, seq_tracker, now_ms, registration).await
+    {
         warn!("{label}: failed to rebind after an egress fault: {e}");
         recover_connection(conn, seq_tracker);
     } else {
-        restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx);
+        restart_reader_for(conn, io, reader_handles, packet_tx);
     }
     TickFlow::Skip
 }

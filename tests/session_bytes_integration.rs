@@ -55,6 +55,7 @@ struct MiniReceiver {
     port: u16,
     data_packets: Arc<AtomicU64>,
     registrations: mpsc::Receiver<(SocketAddr, [u8; SRTLA_ID_LEN])>,
+    all_reg2: mpsc::Receiver<SocketAddr>,
     replacement_keepalives: mpsc::Receiver<SocketAddr>,
     socket: UdpSocket,
     stop: Arc<AtomicBool>,
@@ -73,6 +74,7 @@ impl MiniReceiver {
         let stop = Arc::new(AtomicBool::new(false));
 
         let (registration_tx, registrations) = mpsc::channel();
+        let (reg2_tx, all_reg2) = mpsc::channel();
         let (keepalive_tx, replacement_keepalives) = mpsc::channel();
         let reply_socket = socket.try_clone().expect("clone receiver socket");
         let counter = data_packets.clone();
@@ -86,6 +88,9 @@ impl MiniReceiver {
                 };
                 if n < 2 {
                     continue;
+                }
+                if buf[..2] == SRTLA_TYPE_REG2.to_be_bytes() {
+                    let _ = reg2_tx.send(peer);
                 }
                 let is_replacement = peer.ip() == REPLACEMENT_IP;
                 if is_replacement && buf[..2] == SRTLA_TYPE_KEEPALIVE.to_be_bytes() {
@@ -108,6 +113,7 @@ impl MiniReceiver {
             port,
             data_packets,
             registrations,
+            all_reg2,
             replacement_keepalives,
             socket: reply_socket,
             stop,
@@ -419,6 +425,8 @@ fn reloaded_link_joins_promptly_after_reordering_during_registration() {
     .expect("sender must have accepted both REG3 replies");
 
     assert!(receiver.registrations.try_iter().count() == 0);
+    // Discard the startup RTT probes and the initial registration.
+    receiver.all_reg2.try_iter().for_each(drop);
     std::fs::write(&ips, "127.0.0.1\n127.0.0.3\n").expect("replace second source");
     sender.sighup();
     // A reload can land on the next one-second housekeeping tick. Three seconds
@@ -464,8 +472,9 @@ fn reloaded_link_joins_promptly_after_reordering_during_registration() {
         replacement,
         "the same socket must complete its original handshake",
     );
-    assert!(
-        receiver.registrations.try_iter().next().is_none(),
-        "neither link should register again after the reordering reload",
+    assert_eq!(
+        receiver.all_reg2.try_iter().collect::<Vec<_>>(),
+        [replacement],
+        "only the replacement may send REG2 after the first reload, including probes",
     );
 }

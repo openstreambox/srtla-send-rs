@@ -108,6 +108,7 @@ pub async fn handle_housekeeping(
                 seq_tracker,
                 receiver_host,
                 current_ms,
+                (reg, i),
             )
             .await
                 == egress_tick::TickFlow::Skip
@@ -129,14 +130,21 @@ pub async fn handle_housekeeping(
                 // I/O map; the connection itself owns no socket).
                 match conn_io.get_mut(&conn.conn_id) {
                     Some(io) => {
-                        if let Err(e) =
-                            reconnect_uplink(conn, io, receiver_host, seq_tracker, current_ms).await
+                        if let Err(e) = reconnect_uplink(
+                            conn,
+                            io,
+                            receiver_host,
+                            seq_tracker,
+                            current_ms,
+                            (reg, i),
+                        )
+                        .await
                         {
                             warn!("{} failed to reconnect: {}", label, e);
                             // Fall back to recovery if reconnect fails
                             recover_connection(conn, seq_tracker);
                         } else {
-                            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx);
+                            restart_reader_for(conn, io, reader_handles, packet_tx);
                         }
                     }
                     None => {
@@ -211,7 +219,7 @@ pub async fn handle_housekeeping(
             .is_some_and(|reader| reader.handle.is_finished());
         if reader_dead && let Some(io) = conn_io.get(&conn.conn_id) {
             warn!("{}: uplink reader task ended; restarting", conn.label);
-            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx);
+            restart_reader_for(conn, io, reader_handles, packet_tx);
         }
     }
 
