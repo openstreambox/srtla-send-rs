@@ -89,6 +89,10 @@ struct Cli {
     #[arg(long = "bind-map")]
     bind_map: Option<String>,
 
+    /// Apply a coherent empty bind-map reload without stopping the sender.
+    #[arg(long, requires = "bind_map")]
+    allow_empty_bond: bool,
+
     /// Unix domain socket path for remote toggle control (e.g.,
     /// /tmp/srtla.sock)
     #[arg(long = "control-socket")]
@@ -405,6 +409,7 @@ async fn main() -> Result<()> {
         receiver_port,
         ips_file,
         args.bind_map.as_deref(),
+        args.allow_empty_bond,
         config,
         shared_stats,
         critical_window,

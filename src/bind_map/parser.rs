@@ -229,7 +229,6 @@ struct WireDoc {
     schema_version: u32,
     generation: u64,
     ips_file_sha256: String,
-    #[serde(default)]
     links: Vec<RawRow>,
 }
 

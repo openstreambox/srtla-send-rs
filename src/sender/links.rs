@@ -70,6 +70,8 @@ pub struct LinkSource {
     sidecar: Option<String>,
     last_valid: Option<MappedPool>,
     report: BindMapReport,
+    #[cfg(unix)]
+    reload_serial: u64,
 }
 
 impl LinkSource {
@@ -79,6 +81,8 @@ impl LinkSource {
             ips_file: paths.ips_file.to_string(),
             sidecar: paths.bind_map.map(ToString::to_string),
             last_valid: None,
+            #[cfg(unix)]
+            reload_serial: 0,
             // A legacy run never resolves, so the default is what it reports for
             // its whole lifetime: absent, running legacy, nothing excluded.
             report: BindMapReport::default(),
@@ -124,6 +128,57 @@ impl LinkSource {
         };
         let read = read_bind_map(ips_file, sidecar, prior).await;
         Ok(self.adopt(read))
+    }
+
+    #[cfg(unix)]
+    pub fn next_reload(&mut self) -> u64 {
+        self.reload_serial += 1;
+        self.reload_serial
+    }
+
+    /// Keep newer reload decisions authoritative across overlapping reads.
+    #[cfg(unix)]
+    pub fn adopt_reload(
+        &mut self,
+        serial: u64,
+        read: PairReadResult,
+        allow_empty: bool,
+    ) -> Option<SmallVec<UplinkSpec, 4>> {
+        if serial != self.reload_serial {
+            return None;
+        }
+
+        // SHA-256 of the zero-byte IP list. Blank or all-invalid content is
+        // distinct even when it also parses to zero addresses.
+        const EMPTY_DIGEST: &str =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let intentional_empty = if let Ok(PairRead { map: Ok(pool), .. }) = &read {
+            if allow_empty
+                && self.last_valid.as_ref().is_some_and(|prior| {
+                    pool.generation < prior.generation
+                        || (pool.generation == prior.generation && pool != prior)
+                })
+            {
+                warn!("ignoring an out-of-order bind-map reload");
+                return None;
+            }
+            if pool.rows.is_empty() {
+                if !allow_empty || pool.ips_file_sha256 != EMPTY_DIGEST {
+                    warn!(
+                        "bind-map reload produced no usable uplinks; keeping current connections"
+                    );
+                    return None;
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let links = self.adopt(read);
+        (intentional_empty || !links.is_empty()).then_some(links)
     }
 
     /// Turn a completed pair read into the uplink set, remembering the mapping
@@ -175,5 +230,81 @@ fn log_outcome(status: BindMapStatus, disposition: BindMapDisposition) {
         BindMapStatus::Degraded(reason) => {
             warn!("bind-map degraded: {reason} ({disposition})");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::bind_map::IpsFile;
+
+    fn empty_pair(generation: u64, bytes: &[u8]) -> PairReadResult {
+        let ips = IpsFile::from_bytes(bytes).unwrap();
+        Ok(PairRead {
+            map: Ok(MappedPool {
+                generation,
+                ips_file_sha256: ips.sha256().into(),
+                rows: vec![],
+            }),
+            ips,
+        })
+    }
+
+    #[test]
+    fn delayed_reload_read_cannot_overwrite_the_latest_decision() {
+        let mut source = LinkSource::new(&SenderPaths {
+            ips_file: "unused",
+            bind_map: Some("unused-map"),
+        });
+        let old = source.next_reload();
+        let latest = source.next_reload();
+        assert!(
+            source
+                .adopt_reload(latest, empty_pair(4, b""), true)
+                .unwrap()
+                .is_empty()
+        );
+        // Even a larger generation from an older off-loop read is superseded.
+        assert!(source.adopt_reload(old, empty_pair(5, b""), true).is_none());
+        assert_eq!(source.last_valid.as_ref().unwrap().generation, 4);
+    }
+
+    #[test]
+    fn malformed_blank_and_stale_pairs_never_install_an_empty_publication() {
+        let mut source = LinkSource::new(&SenderPaths {
+            ips_file: "unused",
+            bind_map: Some("unused-map"),
+        });
+        let serial = source.next_reload();
+        assert!(
+            source
+                .adopt_reload(serial, empty_pair(1, b"\n"), true)
+                .is_none()
+        );
+        let serial = source.next_reload();
+        assert!(
+            source
+                .adopt_reload(serial, empty_pair(1, b"malformed address"), true)
+                .is_none()
+        );
+        let serial = source.next_reload();
+        assert!(
+            source
+                .adopt_reload(serial, empty_pair(2, b""), true)
+                .is_some()
+        );
+        let serial = source.next_reload();
+        let malformed = Ok(PairRead {
+            ips: IpsFile::from_bytes(b"").unwrap(),
+            map: Err(BindMapError::MalformedJson("missing links".into())),
+        });
+        assert!(source.adopt_reload(serial, malformed, true).is_none());
+        let serial = source.next_reload();
+        assert!(
+            source
+                .adopt_reload(serial, empty_pair(1, b""), true)
+                .is_none()
+        );
+        assert_eq!(source.last_valid.as_ref().unwrap().generation, 2);
     }
 }

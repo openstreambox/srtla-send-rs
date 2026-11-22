@@ -129,6 +129,7 @@ pub async fn run_sender_with_config(
     receiver_port: u16,
     ips_file: &str,
     bind_map: Option<&str>,
+    allow_empty_bond: bool,
     config: DynamicConfig,
     shared_stats: SharedStats,
     critical_window: srtla_core::priority::CriticalWindow,
@@ -284,7 +285,7 @@ pub async fn run_sender_with_config(
     // Answers from the off-loop ADR-003 pair read a SIGHUP spawns.
     #[cfg(unix)]
     let (bind_map_tx, mut bind_map_rx) =
-        tokio::sync::mpsc::unbounded_channel::<links::PairReadResult>();
+        tokio::sync::mpsc::unbounded_channel::<(u64, links::PairReadResult)>();
 
     // Main loop - run housekeeping frequently like C version
     // Run housekeeping once before entering the main event loop so we start in a clean state.
@@ -456,6 +457,11 @@ pub async fn run_sender_with_config(
                                 &binder,
                             ).await;
                             reg.remap_connections(&previous_order, &connections);
+                            if connections.is_empty() && !previous_order.is_empty() {
+                                // No socket can inherit a pending grant or a completed
+                                // probe. Reuse the registration bootstrap on resume.
+                                reg.reset_for_rehome();
+                            }
                             info!("connection changes applied successfully");
                             sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
                             housekeeping::register_reloaded_links(
@@ -526,9 +532,10 @@ pub async fn run_sender_with_config(
             // loop for that long would stall packet forwarding, so the read goes
             // to a spawned task and answers back through `bind_map_rx`.
             if let Some((ips_path, sidecar, prior)) = link_source.read_args() {
+                let serial = link_source.next_reload();
                 let tx = bind_map_tx.clone();
                 tokio::spawn(async move {
-                    let _ = tx.send(links::read_bind_map(ips_path, sidecar, prior).await);
+                    let _ = tx.send((serial, links::read_bind_map(ips_path, sidecar, prior).await));
                 });
             } else {
                 // Legacy reload guard: refuse a reload that resolves to zero
@@ -576,16 +583,10 @@ pub async fn run_sender_with_config(
             )
             .await;
         }
-        Some(read) = bind_map_rx.recv() => {
-            let new_links = link_source.adopt(read);
+        Some((serial, read)) = bind_map_rx.recv() => {
+            let new_links = link_source.adopt_reload(serial, read, allow_empty_bond);
             shared_stats.set_bind_map(link_source.report().clone());
-            if new_links.is_empty() {
-                // Every degraded arm that still has something to run returns a
-                // non-empty set, so an empty one means the ips file itself was
-                // unusable. Tearing down a live bond for that would be worse
-                // than ignoring the reload.
-                warn!("bind-map reload produced no usable uplinks; keeping current connections");
-            } else {
+            if let Some(new_links) = new_links {
                 pending_changes = Some(PendingConnectionChanges {
                     new_links: Some(new_links),
                     receiver_host: receiver_host.to_string(),
@@ -607,7 +608,10 @@ pub async fn run_sender_with_config(
     }
 
     #[cfg(not(unix))]
-    event_loop! {}
+    {
+        let _ = allow_empty_bond;
+        event_loop! {}
+    }
 }
 
 /// The ADR-003 identity echo for every live uplink, keyed by `conn_id`.

@@ -478,3 +478,148 @@ fn reloaded_link_joins_promptly_after_reordering_during_registration() {
         "only the replacement may send REG2 after the first reload, including probes",
     );
 }
+
+fn publish_mapped_bond(
+    ips: &std::path::Path,
+    map: &std::path::Path,
+    generation: u64,
+    link: Option<&str>,
+) {
+    use srtla_send::bind_map::IpsFile;
+
+    let content = link.map_or_else(String::new, |ip| format!("{ip}\n"));
+    let links = link.map_or_else(Vec::new, |ip| {
+        vec![serde_json::json!({
+            "link_id": "loopback-uplink", "ip": ip, "iface": "lo"
+        })]
+    });
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "generation": generation,
+        "ips_file_sha256": IpsFile::from_bytes(content.as_bytes()).unwrap().sha256(),
+        "links": links
+    });
+    std::fs::write(ips, content).unwrap();
+    // Same permissions the producer requires, independent of the test umask.
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let next = map.with_extension("next");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&next)
+        .unwrap();
+    file.write_all(document.to_string().as_bytes()).unwrap();
+    drop(file);
+    std::fs::rename(next, map).unwrap();
+}
+
+fn run_empty_bond_reload(allow_empty: bool) {
+    let receiver = MiniReceiver::start(false);
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("bind.json");
+    let stats = dir.path().join("stats.json");
+    let port = free_udp_port();
+    publish_mapped_bond(&ips, &map, 1, Some("127.0.0.1"));
+    let sender = Sender {
+        child: Command::new(BIN)
+            .args([
+                &port.to_string(),
+                "127.0.0.1",
+                &receiver.port.to_string(),
+                ips.to_str().unwrap(),
+                "--bind-map",
+                map.to_str().unwrap(),
+                "--stats-file",
+                stats.to_str().unwrap(),
+                "--stats-file-interval",
+                &STATS_INTERVAL_MS.to_string(),
+            ])
+            .args(allow_empty.then_some("--allow-empty-bond"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    };
+    wait_for(READY_TIMEOUT, || {
+        read_stats(&stats).filter(all_links_active)
+    })
+    .expect("initial uplink registers");
+    inject(port, 10_000, 32);
+    let before = wait_for(SNAPSHOT_TIMEOUT, || {
+        let snapshot = read_stats(&stats)?;
+        (bond_total(&snapshot) > 0).then_some(bond_total(&snapshot))
+    })
+    .expect("initial link forwarded data");
+
+    // Simulate the writer's incomplete pair. The old map still names the old IP file.
+    std::fs::write(&ips, "").unwrap();
+    sender.sighup();
+    inject(port, 20_000, 32);
+    wait_for(SNAPSHOT_TIMEOUT, || {
+        let snapshot = read_stats(&stats)?;
+        (all_links_active(&snapshot) && bond_total(&snapshot) > before).then_some(())
+    })
+    .expect("partial empty publication retains the link");
+
+    publish_mapped_bond(&ips, &map, 2, None);
+    sender.sighup();
+    if !allow_empty {
+        // Wait through at least one publication cycle, then check the link
+        // can still forward on a build with the opt-in off.
+        thread::sleep(Duration::from_millis(1300));
+        let prior = receiver.data_packets.load(Ordering::Relaxed);
+        inject(port, 30_000, 32);
+        wait_for(SNAPSHOT_TIMEOUT, || {
+            (receiver.data_packets.load(Ordering::Relaxed) > prior).then_some(())
+        })
+        .expect("a sender without the option retains its link");
+        return;
+    }
+    let paused = wait_for(SNAPSHOT_TIMEOUT, || {
+        let snapshot = read_stats(&stats)?;
+        snapshot["connections"]
+            .as_array()?
+            .is_empty()
+            .then_some(bond_total(&snapshot))
+    })
+    .expect("coherent empty publication withdraws every link");
+    assert!(paused >= before);
+    let received = receiver.data_packets.load(Ordering::Relaxed);
+    publish_mapped_bond(&ips, &map, 1, Some("127.0.0.1"));
+    sender.sighup();
+    inject(port, 30_000, 32);
+    thread::sleep(Duration::from_millis(1300));
+    assert_eq!(receiver.data_packets.load(Ordering::Relaxed), received);
+    assert!(
+        read_stats(&stats).unwrap()["connections"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    publish_mapped_bond(&ips, &map, 3, Some("127.0.0.3"));
+    sender.sighup();
+    wait_for(READY_TIMEOUT, || {
+        read_stats(&stats).filter(all_links_active)
+    })
+    .expect("new link registers after the empty pool");
+    inject(port, 40_000, 32);
+    wait_for(SNAPSHOT_TIMEOUT, || {
+        let snapshot = read_stats(&stats)?;
+        (bond_total(&snapshot) > paused).then_some(())
+    })
+    .expect("the original listener resumed forwarding");
+}
+
+#[test]
+fn intentional_empty_bond_pauses_and_resumes_without_restarting() {
+    run_empty_bond_reload(true);
+}
+
+#[test]
+fn empty_mapped_reload_keeps_the_live_link_by_default() {
+    run_empty_bond_reload(false);
+}
