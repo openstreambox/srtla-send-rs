@@ -226,8 +226,10 @@ A supervisor has to decide **before spawning** whether the installed binary unde
 
 ```bash
 $ srtla_send --capabilities-json
-{"schema_version":1,"binary":"srtla_send","version":"4.2.0","capabilities":{"bind_map":true,"stats_file":true,"dry_run":true,"control_socket_jsonrpc":true,"conn_timeout_ms":true,"modes":["classic","enhanced"]}}
+{"schema_version":1,"binary":"srtla_send","version":"4.2.0","capabilities":{"bind_map":true,"allow_empty_bond":true,"stats_file":true,"dry_run":true,"control_socket_jsonrpc":true,"conn_timeout_ms":true,"modes":["classic","enhanced"]}}
 ```
+
+A supervisor can pass `--allow-empty-bond` with `--bind-map` when `allow_empty_bond` is explicitly true.
 
 The `get_capabilities` JSON-RPC method on `--control-socket` returns the same document plus a `methods` array. A binary that predates the flag rejects it with a usage error and a non-zero exit; callers treat **any** non-zero exit, unparseable output, or timeout as "no support" and fall back to the plain spawn. See [ADR-004](docs/adr/ADR-004-control-dialect.md).
 
@@ -239,7 +241,7 @@ The control dialect is upstream's JSON-RPC 2.0 exactly as documented in [docs/CO
 
 - The local `SRT_LISTEN_PORT` listener is bound before the IP list is read and before any uplink is dialed, so an encoder that connects immediately after spawn never hits a closed port.
 - A missing, empty, or all-invalid `BIND_IPS_FILE` at startup is not fatal: the sender starts with no uplinks and waits for a `SIGHUP`.
-- A `SIGHUP` reload that resolves to zero valid source IPs is refused with a specific log line and the existing links keep running.
+- A `SIGHUP` reload that resolves to zero valid source IPs keeps the existing links running unless `--allow-empty-bond` is set and the publication explicitly describes a coherent empty bond.
 - `SIGTERM`/`SIGINT` exit `0` promptly and remove the stats file.
 - Control-plane frames (keepalive, REG1/REG2) are zero-padded to at least 32 bytes so carrier NATs do not drop them. Data is never padded.
 

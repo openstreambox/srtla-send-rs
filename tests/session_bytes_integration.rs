@@ -526,6 +526,7 @@ fn run_empty_bond_reload(allow_empty: bool) {
     let ips = dir.path().join("ips");
     let map = dir.path().join("bind.json");
     let stats = dir.path().join("stats.json");
+    let log = dir.path().join("sender.log");
     let port = free_udp_port();
     publish_mapped_bond(&ips, &map, 1, Some("127.0.0.1"));
     let sender = Sender {
@@ -543,7 +544,8 @@ fn run_empty_bond_reload(allow_empty: bool) {
                 &STATS_INTERVAL_MS.to_string(),
             ])
             .args(allow_empty.then_some("--allow-empty-bond"))
-            .stdout(Stdio::null())
+            .env("RUST_LOG", "srtla_send::sender=debug")
+            .stdout(std::fs::File::create(&log).unwrap())
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
@@ -572,6 +574,23 @@ fn run_empty_bond_reload(allow_empty: bool) {
             .then_some(())
     })
     .expect("partial empty publication retains the link");
+    if allow_empty {
+        // An implicit empty list parses successfully but is not a request
+        // to withdraw the uplinks. Exercise the actual rejection branch.
+        publish_mapped_bond(&ips, &map, 2, None);
+        let mut implicit: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+        implicit.as_object_mut().unwrap().remove("links");
+        std::fs::write(&map, implicit.to_string()).unwrap();
+        sender.sighup();
+        wait_for(SNAPSHOT_TIMEOUT, || {
+            let contents = std::fs::read_to_string(&log).ok()?;
+            contents
+                .contains("bind-map reload rejected; keeping current connections")
+                .then_some(())
+        })
+        .expect("a rejected opt-in reload emits a debug log");
+    }
 
     receiver.registrations.try_iter().for_each(drop);
     receiver.all_reg2.try_iter().for_each(drop);

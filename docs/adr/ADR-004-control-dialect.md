@@ -66,7 +66,7 @@ honestly (it has no socket to enumerate), and a live consumer needs it to featur
 in one round trip.
 
 ```json
-{"schema_version":1,"binary":"srtla_send","version":"4.0.1","capabilities":{"bind_map":true,"stats_file":true,"dry_run":true,"control_socket_jsonrpc":true,"conn_timeout_ms":true,"modes":["classic","enhanced"]}}
+{"schema_version":1,"binary":"srtla_send","version":"4.2.0","capabilities":{"bind_map":true,"allow_empty_bond":true,"stats_file":true,"dry_run":true,"control_socket_jsonrpc":true,"conn_timeout_ms":true,"modes":["classic","enhanced"]}}
 ```
 
 Apart from `methods`, the runtime result and the probe output are the **same document**.
@@ -75,14 +75,15 @@ socket can never be told two different things. This is pinned by
 `get_capabilities_matches_the_pre_spawn_probe_document` (`src/control.rs`), which removes
 `methods` from the RPC result and asserts equality with `capabilities::capability_json()`.
 
-The capability key set is **frozen**: `bind_map`, `stats_file`, `dry_run`,
+The capability key set is **frozen**: `bind_map`, `allow_empty_bond`, `stats_file`, `dry_run`,
 `control_socket_jsonrpc`, `conn_timeout_ms`, `modes`. Nothing speculative is added. The
 set may grow later — a consumer ignores keys it does not know — but growth is a deliberate
 decision, and `capability_key_set_is_frozen` fails on an accidental one.
 
-Two entries are platform-derived rather than constant, because a build that cannot honor
-a feature must not claim it can: `bind_map` is `SO_BINDTODEVICE`, which is Linux-only, and
-`control_socket_jsonrpc` needs a Unix domain socket. On the device target (Linux) both are
+Three entries are platform-derived rather than constant, because a build that cannot honor
+a feature must not claim it can: `bind_map` is `SO_BINDTODEVICE`, which is Linux-only,
+`allow_empty_bond` requires Linux bind-map support, and
+`control_socket_jsonrpc` needs a Unix domain socket. On the device target (Linux) all three are
 `true`.
 
 ### The failure contract belongs to the caller
