@@ -445,7 +445,7 @@ pub async fn run_sender_with_config(
                             && let Some(new_links) = changes.new_links
                         {
                             info!("applying queued connection changes: {} uplinks", new_links.len());
-                            apply_connection_changes(
+                            let (previous_order, new_indices) = apply_connection_changes(
                                 &mut connections,
                                 &mut conn_io,
                                 &new_links,
@@ -455,8 +455,16 @@ pub async fn run_sender_with_config(
                                 &mut seq_tracker,
                                 &binder,
                             ).await;
+                            reg.remap_connections(&previous_order, &connections);
                             info!("connection changes applied successfully");
                             sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
+                            housekeeping::register_reloaded_links(
+                                &mut connections,
+                                &conn_io,
+                                &mut reg,
+                                &new_indices,
+                                srtla_core::utils::now_ms(),
+                            ).await;
                             // Bootstrap registration when a reload populated an
                             // empty pool. `start_probing` self-guards (no-op once
                             // probing has begun), so this only fires on the

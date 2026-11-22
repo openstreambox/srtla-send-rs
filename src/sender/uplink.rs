@@ -28,6 +28,8 @@ pub type ConnectionId = u64;
 /// an uplink can be pinned to a device at all.
 pub struct ConnIo {
     pub socket: Arc<BatchUdpSocket>,
+    /// Changes only when the socket is replaced, not when its reader restarts.
+    pub socket_generation: u64,
     pub binder: Arc<dyn UplinkBinder>,
     pub remote: SocketAddr,
     /// Identity (`link_id`) plus current socket key (`ip`, `iface`).
@@ -53,6 +55,7 @@ impl ConnIo {
     ) -> Self {
         Self {
             socket,
+            socket_generation: 0,
             binder,
             remote,
             spec: UplinkSpec::unmapped(ip),
@@ -87,6 +90,7 @@ pub type ConnIoMap = HashMap<ConnectionId, ConnIo>;
 
 pub struct UplinkPacket {
     pub conn_id: ConnectionId,
+    pub socket_generation: u64,
     pub bytes: SmallVec<u8, 64>,
 }
 
@@ -100,12 +104,14 @@ pub struct ReaderHandle {
 /// per syscall, significantly reducing syscall overhead at high packet rates.
 ///
 /// On non-Unix: Falls back to tokio's async recv_from (one packet per call).
-pub fn spawn_reader(
+fn spawn_reader(
     conn_id: ConnectionId,
     label: String,
-    socket: Arc<BatchUdpSocket>,
+    io: &ConnIo,
     packet_tx: UnboundedSender<UplinkPacket>,
 ) -> ReaderHandle {
+    let socket = io.socket.clone();
+    let socket_generation = io.socket_generation;
     let handle = tokio::spawn(async move {
         // Allocate batch receive buffer on heap (large structure ~50KB on Unix)
         let mut recv_buffer = RecvMmsgBuffer::new();
@@ -123,6 +129,7 @@ pub fn spawn_reader(
                         if packet_tx
                             .send(UplinkPacket {
                                 conn_id,
+                                socket_generation,
                                 bytes: packet,
                             })
                             .is_err()
@@ -140,6 +147,7 @@ pub fn spawn_reader(
                     if packet_tx
                         .send(UplinkPacket {
                             conn_id,
+                            socket_generation,
                             bytes: SmallVec::new(),
                         })
                         .is_err()
@@ -171,12 +179,7 @@ pub fn sync_readers(
         // reader until one exists.
         if let Some(io) = conn_io.get(&conn.conn_id) {
             readers.entry(conn.conn_id).or_insert_with(|| {
-                spawn_reader(
-                    conn.conn_id,
-                    conn.label.clone(),
-                    io.socket.clone(),
-                    packet_tx.clone(),
-                )
+                spawn_reader(conn.conn_id, conn.label.clone(), io, packet_tx.clone())
             });
         }
     }
@@ -193,7 +196,7 @@ pub fn sync_readers(
 
 pub fn restart_reader_for(
     conn: &SrtlaConnection,
-    socket: Arc<BatchUdpSocket>,
+    io: &ConnIo,
     readers: &mut HashMap<ConnectionId, ReaderHandle>,
     packet_tx: &UnboundedSender<UplinkPacket>,
 ) {
@@ -202,7 +205,7 @@ pub fn restart_reader_for(
     }
     readers.insert(
         conn.conn_id,
-        spawn_reader(conn.conn_id, conn.label.clone(), socket, packet_tx.clone()),
+        spawn_reader(conn.conn_id, conn.label.clone(), io, packet_tx.clone()),
     );
 }
 

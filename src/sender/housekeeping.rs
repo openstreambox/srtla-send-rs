@@ -14,6 +14,45 @@ use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart
 
 pub const GLOBAL_TIMEOUT_MS: u64 = 10_000;
 
+/// Join freshly opened sockets to the group while a sibling still confirms it.
+/// The startup grace reserves time for a first handshake. It should not delay
+/// sending the first REG2 on a reloaded socket with a known group to join.
+pub async fn register_reloaded_links(
+    connections: &mut [SrtlaConnection],
+    conn_io: &ConnIoMap,
+    reg: &mut SrtlaRegistrationManager,
+    new_indices: &[usize],
+    now_ms: u64,
+) {
+    if !reg.has_connected || reg.pending_reg2_idx().is_some() {
+        return;
+    }
+
+    for &idx in new_indices {
+        let Some(io) = conn_io.get(&connections[idx].conn_id) else {
+            continue;
+        };
+        // Each socket can resolve the host independently. A sibling confirms
+        // the group only at the receiver address it already uses.
+        let same_receiver_is_live = connections.iter().any(|peer| {
+            peer.connected
+                && !peer.is_timed_out(now_ms)
+                && conn_io
+                    .get(&peer.conn_id)
+                    .is_some_and(|live| live.remote == io.remote)
+        });
+        if !same_receiver_is_live {
+            continue;
+        }
+
+        let pkt = reg.build_reg2(idx);
+        match io.send_control_padded(&pkt).await {
+            Ok(_) => connections[idx].note_sent(now_ms),
+            Err(err) => debug!("Failed to send initial REG2 on reloaded uplink #{idx}: {err:?}"),
+        }
+    }
+}
+
 /// Handle periodic housekeeping tasks.
 ///
 /// With the ring buffer sequence tracker, we no longer need periodic cleanup
@@ -69,6 +108,7 @@ pub async fn handle_housekeeping(
                 seq_tracker,
                 receiver_host,
                 current_ms,
+                (reg, i),
             )
             .await
                 == egress_tick::TickFlow::Skip
@@ -90,14 +130,21 @@ pub async fn handle_housekeeping(
                 // I/O map; the connection itself owns no socket).
                 match conn_io.get_mut(&conn.conn_id) {
                     Some(io) => {
-                        if let Err(e) =
-                            reconnect_uplink(conn, io, receiver_host, seq_tracker, current_ms).await
+                        if let Err(e) = reconnect_uplink(
+                            conn,
+                            io,
+                            receiver_host,
+                            seq_tracker,
+                            current_ms,
+                            (reg, i),
+                        )
+                        .await
                         {
                             warn!("{} failed to reconnect: {}", label, e);
                             // Fall back to recovery if reconnect fails
                             recover_connection(conn, seq_tracker);
                         } else {
-                            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx);
+                            restart_reader_for(conn, io, reader_handles, packet_tx);
                         }
                     }
                     None => {
@@ -172,7 +219,7 @@ pub async fn handle_housekeeping(
             .is_some_and(|reader| reader.handle.is_finished());
         if reader_dead && let Some(io) = conn_io.get(&conn.conn_id) {
             warn!("{}: uplink reader task ended; restarting", conn.label);
-            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx);
+            restart_reader_for(conn, io, reader_handles, packet_tx);
         }
     }
 

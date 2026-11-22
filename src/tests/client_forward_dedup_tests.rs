@@ -46,6 +46,7 @@ mod tests {
 
     struct Bond {
         connections: SmallVec<SrtlaConnection, 4>,
+        conn_io: ConnIoMap,
         reg: SrtlaRegistrationManager,
         instant_tx: UnboundedSender<Instant>,
         instant_rx: UnboundedReceiver<Instant>,
@@ -59,8 +60,19 @@ mod tests {
     impl Bond {
         async fn new(links: usize) -> Self {
             let (instant_tx, instant_rx) = unbounded_channel();
+            let connections = create_test_connections(links).await;
+            let conn_io = connections
+                .iter()
+                .map(|conn| {
+                    (
+                        conn.conn_id,
+                        crate::test_helpers::create_test_conn_io_for(conn.local_ip),
+                    )
+                })
+                .collect();
             Self {
-                connections: create_test_connections(links).await,
+                connections,
+                conn_io,
                 reg: SrtlaRegistrationManager::new(),
                 instant_tx,
                 instant_rx,
@@ -75,13 +87,14 @@ mod tests {
         async fn receive_on(&mut self, link: usize, data: &[u8]) {
             let packet = UplinkPacket {
                 conn_id: self.connections[link].conn_id,
+                socket_generation: self.conn_io[&self.connections[link].conn_id].socket_generation,
                 bytes: SmallVec::from_slice_copy(data),
             };
             let client_addr = self.client.local_addr().unwrap();
             handle_uplink_packet(
                 packet,
                 &mut self.connections,
-                &ConnIoMap::new(),
+                &self.conn_io,
                 &mut self.reg,
                 &self.instant_tx,
                 &mut self.dedup,

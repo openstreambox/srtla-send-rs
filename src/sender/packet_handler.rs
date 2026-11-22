@@ -144,7 +144,12 @@ pub async fn handle_uplink_packet(
     config_snap: &ConfigSnapshot,
     config: &DynamicConfig,
 ) {
-    if packet.bytes.is_empty() {
+    // Aborting the old reader cannot retract datagrams it already queued.
+    if packet.bytes.is_empty()
+        || conn_io
+            .get(&packet.conn_id)
+            .is_none_or(|io| io.socket_generation != packet.socket_generation)
+    {
         return;
     }
     if let Some(idx) = connections.iter().position(|c| c.conn_id == packet.conn_id) {
@@ -655,6 +660,71 @@ mod tests {
     use crate::net::{BatchUdpSocket, SourceIpBinder};
     use crate::test_helpers::create_test_connection;
 
+    #[tokio::test]
+    async fn rebound_socket_rejects_old_reg3_after_reload_reorder() {
+        use srtla_protocol::SRTLA_TYPE_REG3;
+
+        let mut connections = [
+            create_test_connection().await,
+            create_test_connection().await,
+        ];
+        let old_order = connections.each_ref().map(|conn| conn.conn_id);
+        let mut reg = SrtlaRegistrationManager::new();
+        reg.build_reg2(0);
+        let mut io = crate::test_helpers::create_test_conn_io_for(connections[0].local_ip);
+        let old_generation = io.socket_generation;
+        let mut sequences = SequenceTracker::new();
+        super::super::connections::reconnect_uplink(
+            &mut connections[0],
+            &mut io,
+            "127.0.0.1",
+            &mut sequences,
+            1,
+            (&mut reg, 0),
+        )
+        .await
+        .unwrap();
+        let current_generation = io.socket_generation;
+        assert_ne!(old_generation, current_generation);
+
+        connections.swap(0, 1);
+        reg.remap_connections(&old_order, &connections);
+        assert!(
+            !reg.is_awaiting_reg3(1),
+            "rebind must revoke the retired socket's grant"
+        );
+        reg.build_reg2(1);
+
+        let conn_io = ConnIoMap::from([(old_order[0], io)]);
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut dedup = ClientDedup::default();
+        let config = DynamicConfig::new();
+        for (socket_generation, connected) in [(old_generation, false), (current_generation, true)]
+        {
+            handle_uplink_packet(
+                UplinkPacket {
+                    conn_id: old_order[0],
+                    socket_generation,
+                    bytes: SmallVec::from_slice_copy(&SRTLA_TYPE_REG3.to_be_bytes()),
+                },
+                &mut connections,
+                &conn_io,
+                &mut reg,
+                &tx,
+                &mut dedup,
+                None,
+                &listener,
+                &sequences,
+                &config.snapshot(),
+                &config,
+            )
+            .await;
+            assert_eq!(connections[1].connected, connected);
+            assert_eq!(reg.is_awaiting_reg3(1), !connected);
+        }
+    }
+
     /// An uplink whose socket can never send: an IPv4 socket pinned to an IPv6
     /// peer, so `sendmmsg`/`sendto` fails immediately (EAFNOSUPPORT / EINVAL)
     /// rather than blocking or succeeding. That is the whole fake-socket seam
@@ -719,6 +789,7 @@ mod tests {
             let iface = iface.map(|name| IfaceName::parse(name).expect("fixture interface name"));
             ConnIo {
                 socket: Arc::new(BatchUdpSocket::new(socket, remote).unwrap()),
+                socket_generation: 0,
                 binder: Arc::new(SourceIpBinder),
                 remote,
                 spec: UplinkSpec {
