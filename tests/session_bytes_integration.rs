@@ -565,28 +565,35 @@ fn run_empty_bond_reload(allow_empty: bool) {
     inject(port, 20_000, 32);
     wait_for(SNAPSHOT_TIMEOUT, || {
         let snapshot = read_stats(&stats)?;
-        (all_links_active(&snapshot) && bond_total(&snapshot) > before).then_some(())
+        (all_links_active(&snapshot)
+            && bond_total(&snapshot) > before
+            && snapshot["bind_map_status"]["reason"] == "retry_exhausted"
+            && snapshot["disposition"]["state"] == "retained_last_valid")
+            .then_some(())
     })
     .expect("partial empty publication retains the link");
 
     receiver.registrations.try_iter().for_each(drop);
+    receiver.all_reg2.try_iter().for_each(drop);
     publish_mapped_bond(&ips, &map, 2, None);
     sender.sighup();
     if !allow_empty {
-        // Wait through at least one publication cycle, then check the link
-        // can still forward on a build with the opt-in off.
-        thread::sleep(Duration::from_millis(1300));
+        wait_for(SNAPSHOT_TIMEOUT, || {
+            let snapshot = read_stats(&stats)?;
+            (all_links_active(&snapshot)
+                && snapshot["bind_map_status"]["state"] == "active"
+                && snapshot["disposition"]["state"] == "mapped")
+                .then_some(())
+        })
+        .expect("a coherent empty map restores mapped telemetry and keeps the active link");
         let prior = receiver.data_packets.load(Ordering::Relaxed);
         inject(port, 30_000, 32);
         wait_for(SNAPSHOT_TIMEOUT, || {
             (receiver.data_packets.load(Ordering::Relaxed) > prior).then_some(())
         })
         .expect("a sender without the option retains its link");
-        let snapshot = read_stats(&stats).unwrap();
-        assert!(all_links_active(&snapshot));
-        assert_eq!(snapshot["bind_map_status"]["state"], "active");
-        assert_eq!(snapshot["disposition"]["state"], "mapped");
         assert_eq!(receiver.registrations.try_iter().count(), 0);
+        assert_eq!(receiver.all_reg2.try_iter().count(), 0);
         return;
     }
     let paused = wait_for(SNAPSHOT_TIMEOUT, || {
