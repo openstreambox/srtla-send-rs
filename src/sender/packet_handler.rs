@@ -475,10 +475,21 @@ pub async fn forward_via_connection(
         seq_tracker.insert(s, conn_id, packet_time_ms);
     }
 
-    // Flush if batch threshold reached
-    if needs_flush && let Some(io) = conn_io.get_mut(&conn_id) {
+    // A retransmission fills a hole in the receiver's playout buffer.
+    // Each repair can trigger at most one extra flush. A full batch takes
+    // priority, and a batch fits in one sendmmsg on a writable Linux socket
+    // when the kernel accepts all datagrams. Partial sends and backpressure
+    // still follow the usual retry path.
+    let reason = if needs_flush {
+        "batch flush"
+    } else if srtla_protocol::is_srt_data_retransmit(pkt) {
+        "retransmit flush"
+    } else {
+        return;
+    };
+    if let Some(io) = conn_io.get_mut(&conn_id) {
         let conn = &mut connections[sel_idx];
-        flush_connection(conn, io, seq_tracker, "batch flush").await;
+        flush_connection(conn, io, seq_tracker, reason).await;
     }
 }
 
@@ -722,6 +733,80 @@ mod tests {
             .await;
             assert_eq!(connections[1].connected, connected);
             assert_eq!(reg.is_awaiting_reg3(1), !connected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retransmit_flushes_its_link_before_the_periodic_tick() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = receiver.local_addr().unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut connections = [create_test_connection().await];
+        let conn_id = connections[0].conn_id;
+        let mut conn_io = ConnIoMap::new();
+        conn_io.insert(
+            conn_id,
+            ConnIo::unmapped(
+                Arc::new(BatchUdpSocket::new(socket.into(), remote).unwrap()),
+                Arc::new(SourceIpBinder),
+                remote,
+                connections[0].local_ip,
+            ),
+        );
+        let mut tracker = SequenceTracker::new();
+        let mut last_selected = None;
+        let now = srtla_core::utils::now_ms();
+        let mut ordinary = [0u8; 16];
+        ordinary[..4].copy_from_slice(&1u32.to_be_bytes());
+        let mut repair = ordinary;
+        repair[..4].copy_from_slice(&2u32.to_be_bytes());
+        srtla_protocol::set_srt_data_retransmit(&mut repair);
+
+        let mut control = [0u8; 16];
+        control[..2].copy_from_slice(&srtla_protocol::SRT_TYPE_ACK.to_be_bytes());
+        control[4] = 0x04; // These bits belong to the control header.
+
+        for (packet, seq) in [(&ordinary, Some(1)), (&control, None)] {
+            forward_via_connection(
+                0,
+                packet,
+                seq,
+                &mut connections,
+                &mut conn_io,
+                &mut last_selected,
+                &mut tracker,
+                now,
+            )
+            .await;
+            assert!(
+                connections[0].has_queued_packets(),
+                "only a retransmission should flush a partial batch"
+            );
+        }
+
+        forward_via_connection(
+            0,
+            &repair,
+            Some(2),
+            &mut connections,
+            &mut conn_io,
+            &mut last_selected,
+            &mut tracker,
+            now,
+        )
+        .await;
+        assert!(!connections[0].has_queued_packets());
+
+        for expected in [ordinary, control, repair] {
+            let mut buf = [0; 16];
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv(&mut buf))
+                    .await
+                    .expect("timer-free flush should already have sent the whole batch")
+                    .unwrap();
+            assert_eq!(n, expected.len());
+            assert_eq!(buf, expected);
         }
     }
 
