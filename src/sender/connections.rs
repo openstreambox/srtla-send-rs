@@ -58,7 +58,8 @@ pub fn specs_from_effective_links(links: &[EffectiveLink]) -> SmallVec<UplinkSpe
 /// Survival is decided by **identity**, not by socket key: a mapped link whose
 /// `link_id` is unchanged survives even when its IP or interface moved — but it
 /// survives as a *fresh socket*, because every piece of state the old socket
-/// held is scoped to an ifindex that no longer describes it.
+/// held is scoped to an ifindex that no longer describes it. Returns the
+/// indices of the sockets created by this reload.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_connection_changes(
     connections: &mut SmallVec<SrtlaConnection, 4>,
@@ -69,7 +70,7 @@ pub async fn apply_connection_changes(
     last_selected_idx: &mut Option<usize>,
     seq_tracker: &mut SequenceTracker,
     binder: &Arc<dyn UplinkBinder>,
-) {
+) -> SmallVec<usize, 4> {
     // Dedup on the SOCKET KEY, not on the IP: that is what tells two twin
     // modems sharing 192.168.8.100 apart. Without a bind-map the key has no
     // interface and degenerates to the IP, which is the legacy behavior.
@@ -104,6 +105,7 @@ pub async fn apply_connection_changes(
     // cannot be misattributed to whichever uplink later reuses that index.
     let removed = survivors.retire(seq_tracker, conn_io);
 
+    let mut new_indices = SmallVec::new();
     for (spec, existing) in desired.iter().zip(claimed) {
         match existing {
             Some(mut conn) => {
@@ -121,6 +123,7 @@ pub async fn apply_connection_changes(
             }
             None => {
                 if let Some(conn) = fresh.remove(&spec.socket_key()) {
+                    new_indices.push(connections.len());
                     connections.push(conn);
                 }
             }
@@ -141,6 +144,7 @@ pub async fn apply_connection_changes(
     if previous_order != new_order {
         *last_selected_idx = None;
     }
+    new_indices
 }
 
 /// The pre-reload pool, indexed both ways so a link can be matched by identity

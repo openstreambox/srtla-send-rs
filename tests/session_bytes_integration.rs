@@ -1,5 +1,6 @@
 //! ADR-002 end-to-end: the bond-level `bytes_sent_total` is monotonic across a
-//! SIGHUP that removes an uplink.
+//! SIGHUP that removes an uplink. The same receiver also checks when a
+//! replacement joins an established group.
 //!
 //! This is the regression a naive `links.map(bytes_sent_total).sum()` ships: the
 //! removed link's bytes leave the sum and the operator's "total transferred"
@@ -16,16 +17,16 @@
 //! binaries. It therefore runs in the ordinary gate, unlike `tests/netns_*`.
 #![cfg(all(unix, target_os = "linux"))]
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use srtla_protocol::{
-    SRTLA_ID_LEN, SRTLA_TYPE_ACK, SRTLA_TYPE_KEEPALIVE, SRTLA_TYPE_REG1, SRTLA_TYPE_REG2,
-    SRTLA_TYPE_REG3,
+    SRTLA_ID_LEN, SRTLA_TYPE_ACK, SRTLA_TYPE_KEEPALIVE, SRTLA_TYPE_REG_NGP, SRTLA_TYPE_REG1,
+    SRTLA_TYPE_REG2, SRTLA_TYPE_REG3,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_srtla_send");
@@ -52,6 +53,7 @@ const INJECT_SEQ_BASE: u32 = 1_000;
 struct MiniReceiver {
     port: u16,
     data_packets: Arc<AtomicU64>,
+    registrations: mpsc::Receiver<(SocketAddr, [u8; SRTLA_ID_LEN])>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -67,10 +69,12 @@ impl MiniReceiver {
         let data_packets = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
 
+        let (registration_tx, registrations) = mpsc::channel();
         let counter = data_packets.clone();
         let halt = stop.clone();
         let handle = thread::spawn(move || {
             let mut buf = [0u8; 2048];
+            let mut group = None;
             while !halt.load(Ordering::Relaxed) {
                 let Ok((n, peer)) = socket.recv_from(&mut buf) else {
                     continue;
@@ -78,13 +82,16 @@ impl MiniReceiver {
                 if n < 2 {
                     continue;
                 }
-                serve(&socket, &buf[..n], peer, &counter);
+                if let Some(id) = serve(&socket, &buf[..n], peer, &counter, &mut group) {
+                    let _ = registration_tx.send((peer, id));
+                }
             }
         });
 
         Self {
             port,
             data_packets,
+            registrations,
             stop,
             handle: Some(handle),
         }
@@ -100,7 +107,13 @@ impl Drop for MiniReceiver {
     }
 }
 
-fn serve(socket: &UdpSocket, pkt: &[u8], peer: SocketAddr, data_packets: &AtomicU64) {
+fn serve(
+    socket: &UdpSocket,
+    pkt: &[u8],
+    peer: SocketAddr,
+    data_packets: &AtomicU64,
+    group: &mut Option<[u8; SRTLA_ID_LEN]>,
+) -> Option<[u8; SRTLA_ID_LEN]> {
     // SRT data packets carry a clear high bit; everything else is SRTLA control.
     if pkt[0] & 0x80 == 0 {
         data_packets.fetch_add(1, Ordering::Relaxed);
@@ -111,7 +124,7 @@ fn serve(socket: &UdpSocket, pkt: &[u8], peer: SocketAddr, data_packets: &Atomic
             ack[4..8].copy_from_slice(&seq.to_be_bytes());
             let _ = socket.send_to(&ack, peer);
         }
-        return;
+        return None;
     }
 
     match u16::from_be_bytes([pkt[0], pkt[1]]) {
@@ -122,18 +135,23 @@ fn serve(socket: &UdpSocket, pkt: &[u8], peer: SocketAddr, data_packets: &Atomic
             reply[0..2].copy_from_slice(&SRTLA_TYPE_REG2.to_be_bytes());
             reply[2..2 + SRTLA_ID_LEN].copy_from_slice(&pkt[2..2 + SRTLA_ID_LEN]);
             reply[2 + SRTLA_ID_LEN / 2..].fill(0xab);
+            *group = Some(reply[2..].try_into().unwrap());
             let _ = socket.send_to(&reply, peer);
         }
-        SRTLA_TYPE_REG2 => {
-            let mut reply = [0u8; 2];
-            reply.copy_from_slice(&SRTLA_TYPE_REG3.to_be_bytes());
-            let _ = socket.send_to(&reply, peer);
+        SRTLA_TYPE_REG2 if pkt.len() == 2 + SRTLA_ID_LEN => {
+            let id = pkt[2..].try_into().unwrap();
+            if *group == Some(id) {
+                let _ = socket.send_to(&SRTLA_TYPE_REG3.to_be_bytes(), peer);
+                return Some(id);
+            }
+            let _ = socket.send_to(&SRTLA_TYPE_REG_NGP.to_be_bytes(), peer);
         }
         SRTLA_TYPE_KEEPALIVE => {
             let _ = socket.send_to(pkt, peer);
         }
         _ => {}
     }
+    None
 }
 
 // ---- Driving the sender -----------------------------------------------------
@@ -239,20 +257,17 @@ fn inject(port: u16, first_seq: u32, count: u32) {
     }
 }
 
-#[test]
-fn bond_bytes_sent_total_is_monotonic_across_a_sighup_link_removal() {
-    let receiver = MiniReceiver::start();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let ips = dir.path().join("ips.txt");
-    let stats = dir.path().join("stats.json");
-    std::fs::write(&ips, "127.0.0.1\n127.0.0.2\n").expect("write ips file");
-
-    let srt_port = free_udp_port();
+fn spawn_sender(
+    ips: &std::path::Path,
+    stats: &std::path::Path,
+    srt_port: u16,
+    receiver_port: u16,
+) -> Sender {
     let child = Command::new(BIN)
         .args([
             &srt_port.to_string(),
             "127.0.0.1",
-            &receiver.port.to_string(),
+            &receiver_port.to_string(),
             ips.to_str().unwrap(),
             "--stats-file",
             stats.to_str().unwrap(),
@@ -265,7 +280,19 @@ fn bond_bytes_sent_total_is_monotonic_across_a_sighup_link_removal() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn srtla_send");
-    let sender = Sender { child };
+    Sender { child }
+}
+
+#[test]
+fn bond_bytes_sent_total_is_monotonic_across_a_sighup_link_removal() {
+    let receiver = MiniReceiver::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ips = dir.path().join("ips.txt");
+    let stats = dir.path().join("stats.json");
+    std::fs::write(&ips, "127.0.0.1\n127.0.0.2\n").expect("write ips file");
+
+    let srt_port = free_udp_port();
+    let sender = spawn_sender(&ips, &stats, srt_port, receiver.port);
 
     // Given: BOTH uplinks have finished REG1/REG2/REG3 and are schedulable.
     let ready = wait_for(READY_TIMEOUT, || {
@@ -342,4 +369,56 @@ fn bond_bytes_sent_total_is_monotonic_across_a_sighup_link_removal() {
         receiver.data_packets.load(Ordering::Relaxed) > 0,
         "the mini receiver never saw forwarded data; the bond was not actually carrying"
     );
+}
+
+#[test]
+fn reloaded_link_joins_the_live_group_before_startup_grace_expires() {
+    let receiver = MiniReceiver::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ips = dir.path().join("ips.txt");
+    let stats = dir.path().join("stats.json");
+    std::fs::write(&ips, "127.0.0.1\n127.0.0.2\n").expect("write ips file");
+    let sender = spawn_sender(&ips, &stats, free_udp_port(), receiver.port);
+
+    let first = receiver
+        .registrations
+        .recv_timeout(READY_TIMEOUT)
+        .expect("first link REG2");
+    let second = receiver
+        .registrations
+        .recv_timeout(READY_TIMEOUT)
+        .expect("second link REG2");
+    assert_ne!(first.0.ip(), second.0.ip(), "both sources must register");
+    assert_eq!(first.1, second.1, "both sources must join one group");
+    wait_for(READY_TIMEOUT, || {
+        let snapshot = read_stats(&stats)?;
+        (snapshot["connections"].as_array()?.len() == 2 && all_links_active(&snapshot))
+            .then_some(())
+    })
+    .expect("sender must have accepted both REG3 replies");
+
+    std::fs::write(&ips, "127.0.0.1\n127.0.0.3\n").expect("replace second source");
+    sender.sighup();
+    // A reload can land on the next one-second housekeeping tick. Three seconds
+    // allows scheduling headroom but stays below the five-second startup grace.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let group_id = loop {
+        let (peer, group_id) = receiver
+            .registrations
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("replacement must send REG2 before the startup grace expires");
+        if peer.ip() == Ipv4Addr::new(127, 0, 0, 3) {
+            break group_id;
+        }
+    };
+    assert_eq!(
+        group_id, first.1,
+        "replacement must join the existing group"
+    );
+    wait_for(Duration::from_secs(3), || {
+        let snapshot = read_stats(&stats)?;
+        (snapshot["connections"].as_array()?.len() == 2 && all_links_active(&snapshot))
+            .then_some(())
+    })
+    .expect("sender must accept the replacement REG3");
 }
