@@ -61,7 +61,7 @@ pub struct SrtlaRegistrationManager {
     /// reconnect re-arms the gate through [`Self::build_reg2`].
     ///
     /// Indices are positional into the shell's connection vector, exactly like
-    /// `pending_reg2_idx` / `reg1_target_idx`.
+    /// `pending_reg2_idx` / `reg1_target_idx`. Reload remaps them by socket ID.
     awaiting_reg3: SmallVec<usize, 4>,
     /// `connected` flags snapshotted by [`Self::update_active_connections`],
     /// indexed the same way. Used only to keep a REG2 broadcast from re-arming
@@ -433,6 +433,37 @@ impl SrtlaRegistrationManager {
         }
     }
 
+    /// Rebase in-flight registration onto the rebuilt pool before handling
+    /// replies. Only the same socket can inherit its old handshake state.
+    pub fn remap_connections(&mut self, previous_order: &[u64], connections: &[SrtlaConnection]) {
+        let new_index = |old_index| {
+            let id = previous_order.get(old_index)?;
+            connections.iter().position(|conn| conn.conn_id == *id)
+        };
+
+        self.awaiting_reg3 = self
+            .awaiting_reg3
+            .iter()
+            .filter_map(|&idx| new_index(idx))
+            .collect();
+        self.reg1_target_idx = self.reg1_target_idx.and_then(new_index);
+        if let Some(idx) = self.pending_reg2_idx {
+            self.pending_reg2_idx = new_index(idx);
+            if self.pending_reg2_idx.is_none() {
+                self.pending_timeout_at_ms = 0;
+                self.reg1_next_send_at_ms = 0;
+            }
+        }
+        self.probe_results.retain_mut(|result| {
+            let Some(idx) = new_index(result.conn_idx) else {
+                return false;
+            };
+            result.conn_idx = idx;
+            true
+        });
+        self.update_active_connections(connections);
+    }
+
     pub fn update_active_connections(&mut self, connections: &[SrtlaConnection]) {
         // Match C implementation: recalculate from scratch each housekeeping cycle
         // We count connections that are actually connected (received REG3), not just within grace period
@@ -560,5 +591,33 @@ impl SrtlaRegistrationManager {
     /// want to start from "a REG2 is in flight on this uplink".
     pub fn arm_reg3_gate(&mut self, conn_idx: usize) {
         self.arm_reg3_grant(conn_idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_remaps_grants_by_socket_and_drops_retired_grants() {
+        let mut reg = SrtlaRegistrationManager::new();
+        reg.build_reg2(0);
+        reg.build_reg2(2);
+        reg.build_reg1_for(1, 1);
+
+        let ip = std::net::Ipv4Addr::LOCALHOST.into();
+        let connections =
+            [8, 10, 7].map(|id| SrtlaConnection::new_registering(id, id.to_string(), ip, 1));
+        reg.remap_connections(&[7, 8, 9], &connections);
+
+        assert_eq!(reg.pending_reg2_idx(), Some(0));
+        let reg3 = SRTLA_TYPE_REG3.to_be_bytes();
+        assert!(reg.process_registration_packet(0, &reg3, 2).is_none());
+        assert!(reg.process_registration_packet(1, &reg3, 2).is_none());
+        assert!(matches!(
+            reg.process_registration_packet(2, &reg3, 2),
+            Some(RegistrationEvent::Reg3)
+        ));
+        assert!(reg.process_registration_packet(2, &reg3, 2).is_none());
     }
 }

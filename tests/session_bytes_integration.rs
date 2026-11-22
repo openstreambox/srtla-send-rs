@@ -31,6 +31,7 @@ use srtla_protocol::{
 
 const BIN: &str = env!("CARGO_BIN_EXE_srtla_send");
 const STATS_INTERVAL_MS: u64 = 200;
+const REPLACEMENT_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// SRT payload size the injector uses; every forwarded packet is exactly this
@@ -54,12 +55,14 @@ struct MiniReceiver {
     port: u16,
     data_packets: Arc<AtomicU64>,
     registrations: mpsc::Receiver<(SocketAddr, [u8; SRTLA_ID_LEN])>,
+    replacement_keepalives: mpsc::Receiver<SocketAddr>,
+    socket: UdpSocket,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl MiniReceiver {
-    fn start() -> Self {
+    fn start(delay_replacement: bool) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("bind mini receiver");
         let port = socket.local_addr().expect("receiver addr").port();
         socket
@@ -70,6 +73,8 @@ impl MiniReceiver {
         let stop = Arc::new(AtomicBool::new(false));
 
         let (registration_tx, registrations) = mpsc::channel();
+        let (keepalive_tx, replacement_keepalives) = mpsc::channel();
+        let reply_socket = socket.try_clone().expect("clone receiver socket");
         let counter = data_packets.clone();
         let halt = stop.clone();
         let handle = thread::spawn(move || {
@@ -82,7 +87,18 @@ impl MiniReceiver {
                 if n < 2 {
                     continue;
                 }
-                if let Some(id) = serve(&socket, &buf[..n], peer, &counter, &mut group) {
+                let is_replacement = peer.ip() == REPLACEMENT_IP;
+                if is_replacement && buf[..2] == SRTLA_TYPE_KEEPALIVE.to_be_bytes() {
+                    let _ = keepalive_tx.send(peer);
+                }
+                if let Some(id) = serve(
+                    &socket,
+                    &buf[..n],
+                    peer,
+                    &counter,
+                    &mut group,
+                    delay_replacement && is_replacement,
+                ) {
                     let _ = registration_tx.send((peer, id));
                 }
             }
@@ -92,6 +108,8 @@ impl MiniReceiver {
             port,
             data_packets,
             registrations,
+            replacement_keepalives,
+            socket: reply_socket,
             stop,
             handle: Some(handle),
         }
@@ -113,6 +131,7 @@ fn serve(
     peer: SocketAddr,
     data_packets: &AtomicU64,
     group: &mut Option<[u8; SRTLA_ID_LEN]>,
+    delay_reg3: bool,
 ) -> Option<[u8; SRTLA_ID_LEN]> {
     // SRT data packets carry a clear high bit; everything else is SRTLA control.
     if pkt[0] & 0x80 == 0 {
@@ -141,7 +160,9 @@ fn serve(
         SRTLA_TYPE_REG2 if pkt.len() == 2 + SRTLA_ID_LEN => {
             let id = pkt[2..].try_into().unwrap();
             if *group == Some(id) {
-                let _ = socket.send_to(&SRTLA_TYPE_REG3.to_be_bytes(), peer);
+                if !delay_reg3 {
+                    let _ = socket.send_to(&SRTLA_TYPE_REG3.to_be_bytes(), peer);
+                }
                 return Some(id);
             }
             let _ = socket.send_to(&SRTLA_TYPE_REG_NGP.to_be_bytes(), peer);
@@ -285,7 +306,7 @@ fn spawn_sender(
 
 #[test]
 fn bond_bytes_sent_total_is_monotonic_across_a_sighup_link_removal() {
-    let receiver = MiniReceiver::start();
+    let receiver = MiniReceiver::start(false);
     let dir = tempfile::tempdir().expect("tempdir");
     let ips = dir.path().join("ips.txt");
     let stats = dir.path().join("stats.json");
@@ -372,8 +393,8 @@ fn bond_bytes_sent_total_is_monotonic_across_a_sighup_link_removal() {
 }
 
 #[test]
-fn reloaded_link_joins_the_live_group_before_startup_grace_expires() {
-    let receiver = MiniReceiver::start();
+fn reloaded_link_joins_promptly_after_reordering_during_registration() {
+    let receiver = MiniReceiver::start(true);
     let dir = tempfile::tempdir().expect("tempdir");
     let ips = dir.path().join("ips.txt");
     let stats = dir.path().join("stats.json");
@@ -397,28 +418,54 @@ fn reloaded_link_joins_the_live_group_before_startup_grace_expires() {
     })
     .expect("sender must have accepted both REG3 replies");
 
+    assert!(receiver.registrations.try_iter().count() == 0);
     std::fs::write(&ips, "127.0.0.1\n127.0.0.3\n").expect("replace second source");
     sender.sighup();
     // A reload can land on the next one-second housekeeping tick. Three seconds
     // allows scheduling headroom but stays below the five-second startup grace.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let group_id = loop {
-        let (peer, group_id) = receiver
-            .registrations
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("replacement must send REG2 before the startup grace expires");
-        if peer.ip() == Ipv4Addr::new(127, 0, 0, 3) {
-            break group_id;
-        }
-    };
+    let (replacement, group_id) = receiver
+        .registrations
+        .recv_timeout(Duration::from_secs(3))
+        .expect("replacement must send REG2 before the startup grace expires");
+    assert_eq!(
+        replacement.ip(),
+        REPLACEMENT_IP,
+        "only the replacement should register"
+    );
     assert_eq!(
         group_id, first.1,
         "replacement must join the existing group"
     );
+
+    std::fs::write(&ips, "127.0.0.3\n127.0.0.1\n").expect("move replacement to first slot");
+    sender.sighup();
     wait_for(Duration::from_secs(3), || {
         let snapshot = read_stats(&stats)?;
-        (snapshot["connections"].as_array()?.len() == 2 && all_links_active(&snapshot))
+        let rows = snapshot["connections"].as_array()?;
+        // REG3 is still withheld. The inactive row can move to slot 0 only
+        // once the reorder has applied and the new order has been published.
+        (rows.len() == 2
+            && rows[0]["weight_percent"].as_u64()? == 0
+            && rows[1]["weight_percent"].as_u64()? > 0)
             .then_some(())
     })
-    .expect("sender must accept the replacement REG3");
+    .expect("reorder must move the unregistered socket to the first slot");
+    assert!(receiver.replacement_keepalives.try_recv().is_err());
+
+    receiver
+        .socket
+        .send_to(&SRTLA_TYPE_REG3.to_be_bytes(), replacement)
+        .expect("release delayed REG3");
+    assert_eq!(
+        receiver
+            .replacement_keepalives
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement must send keepalive after accepting delayed REG3"),
+        replacement,
+        "the same socket must complete its original handshake",
+    );
+    assert!(
+        receiver.registrations.try_iter().next().is_none(),
+        "neither link should register again after the reordering reload",
+    );
 }

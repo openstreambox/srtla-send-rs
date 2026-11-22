@@ -445,7 +445,7 @@ pub async fn run_sender_with_config(
                             && let Some(new_links) = changes.new_links
                         {
                             info!("applying queued connection changes: {} uplinks", new_links.len());
-                            let new_indices = apply_connection_changes(
+                            let (previous_order, new_indices) = apply_connection_changes(
                                 &mut connections,
                                 &mut conn_io,
                                 &new_links,
@@ -455,6 +455,7 @@ pub async fn run_sender_with_config(
                                 &mut seq_tracker,
                                 &binder,
                             ).await;
+                            reg.remap_connections(&previous_order, &connections);
                             info!("connection changes applied successfully");
                             sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
                             housekeeping::register_reloaded_links(
