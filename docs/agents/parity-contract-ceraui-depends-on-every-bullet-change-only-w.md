@@ -24,7 +24,7 @@
 - **`--capabilities-json` is the pre-spawn probe.** One line of JSON on stdout, exit
   `0`, before logging is initialized, no socket bound, no file written. Frozen key set:
   `bind_map`, `stats_file`, `dry_run`, `control_socket_jsonrpc`, `conn_timeout_ms`,
-  `modes`. The runtime `get_capabilities` returns the **same document plus `methods`**,
+  `modes`, and `allow_empty_bond` (Linux support for the opt-in below). The runtime `get_capabilities` returns the **same document plus `methods`**,
   pinned by `get_capabilities_matches_the_pre_spawn_probe_document`. The load-bearing
   half is the caller's: any non-zero exit, unparseable output, or timeout means NO
   SUPPORT, so fall back to the legacy spawn. Never match on the code or the message.
@@ -134,3 +134,12 @@
 - **Scheduling modes are upstream's two:** `classic` and `enhanced` (default). No other
   value is accepted, pinned by `mode_accepts_only_the_upstream_value_set`.
 
+
+
+- **Intentional empty mapped reload.** `--allow-empty-bond` requires
+  `--bind-map`. A valid sidecar with an explicit empty `links` array
+  and the digest of a zero-byte IP file can withdraw every uplink while
+  the local listener and process totals stay active. A newer valid
+  publication re-registers the new links. A restarted writer can begin again at
+  generation 1 under ADR-003. A sender with this option off
+  retains its previous connections on an empty reload.

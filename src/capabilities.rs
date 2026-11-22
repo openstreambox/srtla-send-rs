@@ -43,6 +43,8 @@ const MODES: [&str; 2] = ["classic", "enhanced"];
 pub struct Capabilities {
     /// Whether `--bind-map` can actually steer egress on this platform.
     pub bind_map: bool,
+    /// Whether an opt-in mapped sender can apply an intentional empty reload.
+    pub allow_empty_bond: bool,
     /// Whether `--stats-file` publishes the telemetry snapshot document.
     pub stats_file: bool,
     /// Whether `--dry-run` validates the configuration without binding.
@@ -74,6 +76,7 @@ pub fn capability_document() -> CapabilityDocument {
         version: env!("CARGO_PKG_VERSION"),
         capabilities: Capabilities {
             bind_map: cfg!(target_os = "linux"),
+            allow_empty_bond: cfg!(target_os = "linux"),
             stats_file: true,
             dry_run: true,
             control_socket_jsonrpc: cfg!(unix),
@@ -128,6 +131,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "allow_empty_bond",
                 "bind_map",
                 "conn_timeout_ms",
                 "control_socket_jsonrpc",
@@ -168,6 +172,7 @@ mod tests {
     fn linux_claims_bind_map_and_the_control_socket() {
         let doc = capability_document();
         assert!(doc.capabilities.bind_map);
+        assert!(doc.capabilities.allow_empty_bond);
         assert!(doc.capabilities.control_socket_jsonrpc);
     }
 }

@@ -74,6 +74,7 @@ fn probe_carries_the_frozen_document_shape() {
     assert_eq!(
         keys,
         [
+            "allow_empty_bond",
             "bind_map",
             "conn_timeout_ms",
             "control_socket_jsonrpc",
@@ -89,6 +90,7 @@ fn probe_carries_the_frozen_document_shape() {
 #[test]
 fn probe_claims_bind_map_on_linux() {
     assert_eq!(probe_document()["capabilities"]["bind_map"], true);
+    assert_eq!(probe_document()["capabilities"]["allow_empty_bond"], true);
 }
 
 /// The probe must not bind the local SRT listener even when a port is named on

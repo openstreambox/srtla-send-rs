@@ -37,6 +37,7 @@ pub struct BindMapPaths<'a> {
 pub struct PairRead {
     pub ips: IpsFile,
     pub map: Result<MappedPool, BindMapError>,
+    pub explicit_links: bool,
 }
 
 /// Read and validate the pair, retrying only a hash mismatch.
@@ -62,9 +63,9 @@ pub async fn read_pair(
         })?;
         let ips = IpsFile::from_bytes(&ips_bytes)?;
 
-        let map = read_sidecar_bytes(paths.sidecar)
-            .and_then(|bytes| parse_sidecar(&bytes))
-            .and_then(|doc| validate_pair(&ips, doc, ctx));
+        let doc = read_sidecar_bytes(paths.sidecar).and_then(|bytes| parse_sidecar(&bytes));
+        let explicit_links = doc.as_ref().is_ok_and(|doc| doc.explicit_links);
+        let map = doc.and_then(|doc| validate_pair(&ips, doc, ctx));
 
         if matches!(map, Err(BindMapError::HashMismatch { .. })) {
             if attempt < BIND_MAP_RETRY_ATTEMPTS {
@@ -91,11 +92,16 @@ pub async fn read_pair(
             );
             return Ok(PairRead {
                 ips,
+                explicit_links: false,
                 map: Err(BindMapError::RetryExhausted { attempts: attempt }),
             });
         }
 
-        return Ok(PairRead { ips, map });
+        return Ok(PairRead {
+            ips,
+            map,
+            explicit_links,
+        });
     }
 }
 

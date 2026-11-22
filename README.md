@@ -151,7 +151,7 @@ srtla_send [OPTIONS] SRT_LISTEN_PORT SRTLA_HOST SRTLA_PORT BIND_IPS_FILE
 - `--metrics-bind <ADDR:PORT>`: Expose a Prometheus scrape endpoint at `/metrics`
 - `-v, --version`: Print version and exit (see [Version output](#version-output))
 
-The CERALIVE fork adds `--verbose`, `--dry-run`, `--stats-file`, `--stats-file-interval`, `--bind-map`, and `--capabilities-json`. They are documented in [The CERALIVE layer](#the-ceralive-layer).
+The CERALIVE fork adds `--verbose`, `--dry-run`, `--stats-file`, `--stats-file-interval`, `--bind-map`, `--allow-empty-bond`, and `--capabilities-json`. They are documented in [The CERALIVE layer](#the-ceralive-layer).
 
 ### Version output
 
@@ -190,6 +190,7 @@ The fork is based on upstream `df0b3938791ff24eced4aed8b29e3d49d0efb639` (v4.0.1
 - `--stats-file <PATH>`: publish the telemetry snapshot described below to this path. Opt-in: omit the flag and no file is ever written.
 - `--stats-file-interval <MS>`: publish cadence for `--stats-file` (default `1000`).
 - `--bind-map <PATH>`: an optional sidecar that adds interface binding and stable link identity to `BIND_IPS_FILE`, described below.
+- `--allow-empty-bond`: with `--bind-map`, apply a coherent zero-byte IP file with an explicit empty sidecar on reload. This pauses sending until a later publication registers new links. During a long pause, the SRT peer can time out and the encoder reconnects after links return.
 - `--capabilities-json`: print one line of JSON describing what this build supports and exit `0`, before logging starts and without binding anything.
 
 Two upstream defaults matter to the device integration and are left as upstream ships them: whole-bond re-home and stalled-link deselect are **on** (`--no-rehome`, `--no-stall-deselect` to opt out), and the per-link liveness timeout defaults to 5 s. CeraUI passes `--conn-timeout-ms 15000` on the command line to match the bonding receiver's own timeout; the binary does not bake that value in.
@@ -225,8 +226,10 @@ A supervisor has to decide **before spawning** whether the installed binary unde
 
 ```bash
 $ srtla_send --capabilities-json
-{"schema_version":1,"binary":"srtla_send","version":"4.2.0","capabilities":{"bind_map":true,"stats_file":true,"dry_run":true,"control_socket_jsonrpc":true,"conn_timeout_ms":true,"modes":["classic","enhanced"]}}
+{"schema_version":1,"binary":"srtla_send","version":"4.2.0","capabilities":{"bind_map":true,"allow_empty_bond":true,"stats_file":true,"dry_run":true,"control_socket_jsonrpc":true,"conn_timeout_ms":true,"modes":["classic","enhanced"]}}
 ```
+
+A supervisor can pass `--allow-empty-bond` with `--bind-map` when `allow_empty_bond` is explicitly true.
 
 The `get_capabilities` JSON-RPC method on `--control-socket` returns the same document plus a `methods` array. A binary that predates the flag rejects it with a usage error and a non-zero exit; callers treat **any** non-zero exit, unparseable output, or timeout as "no support" and fall back to the plain spawn. See [ADR-004](docs/adr/ADR-004-control-dialect.md).
 
@@ -238,7 +241,7 @@ The control dialect is upstream's JSON-RPC 2.0 exactly as documented in [docs/CO
 
 - The local `SRT_LISTEN_PORT` listener is bound before the IP list is read and before any uplink is dialed, so an encoder that connects immediately after spawn never hits a closed port.
 - A missing, empty, or all-invalid `BIND_IPS_FILE` at startup is not fatal: the sender starts with no uplinks and waits for a `SIGHUP`.
-- A `SIGHUP` reload that resolves to zero valid source IPs is refused with a specific log line and the existing links keep running.
+- A `SIGHUP` reload that resolves to zero valid source IPs keeps the existing links running unless `--allow-empty-bond` is set and the publication explicitly describes a coherent empty bond.
 - `SIGTERM`/`SIGINT` exit `0` promptly and remove the stats file.
 - Control-plane frames (keepalive, REG1/REG2) are zero-padded to at least 32 bytes so carrier NATs do not drop them. Data is never padded.
 

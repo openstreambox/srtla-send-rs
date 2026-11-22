@@ -431,7 +431,7 @@ exits `0`.** It is one-shot, side-effect free (no logging init, no sockets, no f
 writes, no positional arguments required), and returns immediately.
 
 ```json
-{"schema_version":1,"binary":"srtla_send","version":"4.0.1","capabilities":{"bind_map":true,"stats_file":true,"dry_run":true,"control_socket_jsonrpc":true,"conn_timeout_ms":true,"modes":["classic","enhanced"]}}
+{"schema_version":1,"binary":"srtla_send","version":"4.2.0","capabilities":{"bind_map":true,"allow_empty_bond":true,"stats_file":true,"dry_run":true,"control_socket_jsonrpc":true,"conn_timeout_ms":true,"modes":["classic","enhanced"]}}
 ```
 
 The key set is this build's (`src/capabilities.rs`); it is an **open map** and
@@ -444,6 +444,7 @@ version, so it moves with every release and is never part of the contract.
 | `binary` | Always `srtla_send`. |
 | `version` | The crate version. |
 | `capabilities.bind_map` | `true` on Linux builds; `false` elsewhere, because egress pinning is `SO_BINDTODEVICE`. |
+| `capabilities.allow_empty_bond` | `true` on Linux builds that support `--allow-empty-bond` with `--bind-map`. Missing or false leaves ordinary empty-reload behavior. |
 | `capabilities.dry_run` / `stats_file` / `control_socket_jsonrpc` / `conn_timeout_ms` / `modes` | Existing surfaces, declared so a caller can probe once instead of version-sniffing. |
 
 ### 7.1 Caller contract (this is the load-bearing half)

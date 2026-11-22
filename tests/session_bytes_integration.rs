@@ -54,6 +54,7 @@ const INJECT_SEQ_BASE: u32 = 1_000;
 struct MiniReceiver {
     port: u16,
     data_packets: Arc<AtomicU64>,
+    all_packets: Arc<AtomicU64>,
     registrations: mpsc::Receiver<(SocketAddr, [u8; SRTLA_ID_LEN])>,
     all_reg2: mpsc::Receiver<SocketAddr>,
     replacement_keepalives: mpsc::Receiver<SocketAddr>,
@@ -78,6 +79,8 @@ impl MiniReceiver {
         let (keepalive_tx, replacement_keepalives) = mpsc::channel();
         let reply_socket = socket.try_clone().expect("clone receiver socket");
         let counter = data_packets.clone();
+        let all_packets = Arc::new(AtomicU64::new(0));
+        let total = all_packets.clone();
         let halt = stop.clone();
         let handle = thread::spawn(move || {
             let mut buf = [0u8; 2048];
@@ -86,6 +89,7 @@ impl MiniReceiver {
                 let Ok((n, peer)) = socket.recv_from(&mut buf) else {
                     continue;
                 };
+                total.fetch_add(1, Ordering::Relaxed);
                 if n < 2 {
                     continue;
                 }
@@ -112,6 +116,7 @@ impl MiniReceiver {
         Self {
             port,
             data_packets,
+            all_packets,
             registrations,
             all_reg2,
             replacement_keepalives,
@@ -477,4 +482,183 @@ fn reloaded_link_joins_promptly_after_reordering_during_registration() {
         [replacement],
         "only the replacement may send REG2 after the first reload, including probes",
     );
+}
+
+fn publish_mapped_bond(
+    ips: &std::path::Path,
+    map: &std::path::Path,
+    generation: u64,
+    link: Option<&str>,
+) {
+    use srtla_send::bind_map::IpsFile;
+
+    let content = link.map_or_else(String::new, |ip| format!("{ip}\n"));
+    let links = link.map_or_else(Vec::new, |ip| {
+        vec![serde_json::json!({
+            "link_id": "loopback-uplink", "ip": ip, "iface": "lo"
+        })]
+    });
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "generation": generation,
+        "ips_file_sha256": IpsFile::from_bytes(content.as_bytes()).unwrap().sha256(),
+        "links": links
+    });
+    std::fs::write(ips, content).unwrap();
+    // Same permissions the producer requires, independent of the test umask.
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let next = map.with_extension("next");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&next)
+        .unwrap();
+    file.write_all(document.to_string().as_bytes()).unwrap();
+    drop(file);
+    std::fs::rename(next, map).unwrap();
+}
+
+fn run_empty_bond_reload(allow_empty: bool) {
+    let receiver = MiniReceiver::start(false);
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let map = dir.path().join("bind.json");
+    let stats = dir.path().join("stats.json");
+    let log = dir.path().join("sender.log");
+    let port = free_udp_port();
+    publish_mapped_bond(&ips, &map, 1, Some("127.0.0.1"));
+    let sender = Sender {
+        child: Command::new(BIN)
+            .args([
+                &port.to_string(),
+                "127.0.0.1",
+                &receiver.port.to_string(),
+                ips.to_str().unwrap(),
+                "--bind-map",
+                map.to_str().unwrap(),
+                "--stats-file",
+                stats.to_str().unwrap(),
+                "--stats-file-interval",
+                &STATS_INTERVAL_MS.to_string(),
+            ])
+            .args(allow_empty.then_some("--allow-empty-bond"))
+            .env("RUST_LOG", "srtla_send::sender=debug")
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    };
+    wait_for(READY_TIMEOUT, || {
+        read_stats(&stats).filter(all_links_active)
+    })
+    .expect("initial uplink registers");
+    inject(port, 10_000, 32);
+    let before = wait_for(SNAPSHOT_TIMEOUT, || {
+        let snapshot = read_stats(&stats)?;
+        (bond_total(&snapshot) > 0).then_some(bond_total(&snapshot))
+    })
+    .expect("initial link forwarded data");
+
+    // Simulate the writer's incomplete pair. The old map still names the old IP file.
+    std::fs::write(&ips, "").unwrap();
+    sender.sighup();
+    inject(port, 20_000, 32);
+    wait_for(SNAPSHOT_TIMEOUT, || {
+        let snapshot = read_stats(&stats)?;
+        (all_links_active(&snapshot)
+            && bond_total(&snapshot) > before
+            && snapshot["bind_map_status"]["reason"] == "retry_exhausted"
+            && snapshot["disposition"]["state"] == "retained_last_valid")
+            .then_some(())
+    })
+    .expect("partial empty publication retains the link");
+    if allow_empty {
+        // An implicit empty list parses successfully but is not a request
+        // to withdraw the uplinks. Exercise the actual rejection branch.
+        publish_mapped_bond(&ips, &map, 2, None);
+        let mut implicit: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+        implicit.as_object_mut().unwrap().remove("links");
+        std::fs::write(&map, implicit.to_string()).unwrap();
+        sender.sighup();
+        wait_for(SNAPSHOT_TIMEOUT, || {
+            let contents = std::fs::read_to_string(&log).ok()?;
+            contents
+                .contains("bind-map reload rejected; keeping current connections")
+                .then_some(())
+        })
+        .expect("a rejected opt-in reload emits a debug log");
+    }
+
+    receiver.registrations.try_iter().for_each(drop);
+    receiver.all_reg2.try_iter().for_each(drop);
+    publish_mapped_bond(&ips, &map, 2, None);
+    sender.sighup();
+    if !allow_empty {
+        wait_for(SNAPSHOT_TIMEOUT, || {
+            let snapshot = read_stats(&stats)?;
+            (all_links_active(&snapshot)
+                && snapshot["bind_map_status"]["state"] == "active"
+                && snapshot["disposition"]["state"] == "mapped")
+                .then_some(())
+        })
+        .expect("a coherent empty map restores mapped telemetry and keeps the active link");
+        let prior = receiver.data_packets.load(Ordering::Relaxed);
+        inject(port, 30_000, 32);
+        wait_for(SNAPSHOT_TIMEOUT, || {
+            (receiver.data_packets.load(Ordering::Relaxed) > prior).then_some(())
+        })
+        .expect("a sender without the option retains its link");
+        assert_eq!(receiver.registrations.try_iter().count(), 0);
+        assert_eq!(receiver.all_reg2.try_iter().count(), 0);
+        return;
+    }
+    let paused = wait_for(SNAPSHOT_TIMEOUT, || {
+        let snapshot = read_stats(&stats)?;
+        snapshot["connections"]
+            .as_array()?
+            .is_empty()
+            .then_some(bond_total(&snapshot))
+    })
+    .expect("coherent empty publication withdraws every link");
+    assert!(paused >= before);
+    // Once the retired socket has drained, neither traffic nor registration
+    // or keepalive control packets should reach the receiver while paused.
+    thread::sleep(Duration::from_millis(150));
+    let received = receiver.all_packets.load(Ordering::Relaxed);
+    inject(port, 30_000, 32);
+    thread::sleep(Duration::from_millis(1300));
+    assert_eq!(receiver.all_packets.load(Ordering::Relaxed), received);
+    assert!(
+        read_stats(&stats).unwrap()["connections"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // A fresh publication from a restarted writer begins at generation 1.
+    publish_mapped_bond(&ips, &map, 1, Some("127.0.0.3"));
+    sender.sighup();
+    wait_for(READY_TIMEOUT, || {
+        read_stats(&stats).filter(all_links_active)
+    })
+    .expect("new link registers after the empty pool");
+    inject(port, 40_000, 32);
+    wait_for(SNAPSHOT_TIMEOUT, || {
+        let snapshot = read_stats(&stats)?;
+        (bond_total(&snapshot) > paused).then_some(())
+    })
+    .expect("the original listener resumed forwarding");
+}
+
+#[test]
+fn intentional_empty_bond_pauses_and_resumes_without_restarting() {
+    run_empty_bond_reload(true);
+}
+
+#[test]
+fn empty_mapped_reload_keeps_the_live_link_by_default() {
+    run_empty_bond_reload(false);
 }
