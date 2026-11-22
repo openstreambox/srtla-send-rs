@@ -92,6 +92,19 @@ async fn a_coherently_published_pair_reads_as_valid() {
 }
 
 #[tokio::test]
+async fn a_sidecar_without_links_still_decodes_as_an_empty_mapping() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    publish(&dir.path().join("srtla_ips"), "");
+    let sidecar = format!(
+        r#"{{"schema_version":1,"generation":1,"ips_file_sha256":"{}"}}"#,
+        sha_of("")
+    );
+    publish(&dir.path().join("bind_map.json"), &sidecar);
+    let pool = read(dir.path()).await.unwrap().unwrap();
+    assert!(pool.rows.is_empty());
+}
+
+#[tokio::test]
 async fn bind_map_weighted_pair_preserves_raw_bytes_and_row_weights() {
     let contents = "192.168.8.100 3\r\ninvalid\r\n192.168.8.100\t1\r\n";
     let dir = tempfile::tempdir().expect("tempdir");

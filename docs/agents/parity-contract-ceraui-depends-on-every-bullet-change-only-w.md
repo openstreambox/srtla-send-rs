@@ -140,6 +140,6 @@
   `--bind-map`. A valid sidecar with an explicit empty `links` array
   and the digest of a zero-byte IP file can withdraw every uplink while
   the local listener and process totals stay active. A newer valid
-  publication re-registers the new links. Opted-in generations must be
-  monotonic for the sender lifetime. A sender with this option off
+  publication re-registers the new links. A restarted writer can begin again at
+  generation 1 under ADR-003. A sender with this option off
   retains its previous connections on an empty reload.

@@ -203,6 +203,7 @@ pub struct BindMapDoc {
     pub generation: u64,
     pub ips_file_sha256: String,
     pub(super) links: Vec<RawRow>,
+    pub(super) explicit_links: bool,
 }
 
 impl BindMapDoc {
@@ -229,7 +230,12 @@ struct WireDoc {
     schema_version: u32,
     generation: u64,
     ips_file_sha256: String,
-    links: Vec<RawRow>,
+    #[serde(default, deserialize_with = "explicit_rows")]
+    links: Option<Vec<RawRow>>,
+}
+
+fn explicit_rows<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<RawRow>>, D::Error> {
+    Vec::deserialize(d).map(Some)
 }
 
 /// Parse a sidecar document and validate its header.
@@ -271,6 +277,7 @@ pub fn parse_sidecar(bytes: &[u8]) -> Result<BindMapDoc, BindMapError> {
     Ok(BindMapDoc {
         generation: wire.generation,
         ips_file_sha256: wire.ips_file_sha256,
-        links: wire.links,
+        explicit_links: wire.links.is_some(),
+        links: wire.links.unwrap_or_default(),
     })
 }

@@ -54,6 +54,7 @@ const INJECT_SEQ_BASE: u32 = 1_000;
 struct MiniReceiver {
     port: u16,
     data_packets: Arc<AtomicU64>,
+    all_packets: Arc<AtomicU64>,
     registrations: mpsc::Receiver<(SocketAddr, [u8; SRTLA_ID_LEN])>,
     all_reg2: mpsc::Receiver<SocketAddr>,
     replacement_keepalives: mpsc::Receiver<SocketAddr>,
@@ -78,6 +79,8 @@ impl MiniReceiver {
         let (keepalive_tx, replacement_keepalives) = mpsc::channel();
         let reply_socket = socket.try_clone().expect("clone receiver socket");
         let counter = data_packets.clone();
+        let all_packets = Arc::new(AtomicU64::new(0));
+        let total = all_packets.clone();
         let halt = stop.clone();
         let handle = thread::spawn(move || {
             let mut buf = [0u8; 2048];
@@ -86,6 +89,7 @@ impl MiniReceiver {
                 let Ok((n, peer)) = socket.recv_from(&mut buf) else {
                     continue;
                 };
+                total.fetch_add(1, Ordering::Relaxed);
                 if n < 2 {
                     continue;
                 }
@@ -112,6 +116,7 @@ impl MiniReceiver {
         Self {
             port,
             data_packets,
+            all_packets,
             registrations,
             all_reg2,
             replacement_keepalives,
@@ -564,6 +569,7 @@ fn run_empty_bond_reload(allow_empty: bool) {
     })
     .expect("partial empty publication retains the link");
 
+    receiver.registrations.try_iter().for_each(drop);
     publish_mapped_bond(&ips, &map, 2, None);
     sender.sighup();
     if !allow_empty {
@@ -576,6 +582,11 @@ fn run_empty_bond_reload(allow_empty: bool) {
             (receiver.data_packets.load(Ordering::Relaxed) > prior).then_some(())
         })
         .expect("a sender without the option retains its link");
+        let snapshot = read_stats(&stats).unwrap();
+        assert!(all_links_active(&snapshot));
+        assert_eq!(snapshot["bind_map_status"]["state"], "active");
+        assert_eq!(snapshot["disposition"]["state"], "mapped");
+        assert_eq!(receiver.registrations.try_iter().count(), 0);
         return;
     }
     let paused = wait_for(SNAPSHOT_TIMEOUT, || {
@@ -587,12 +598,13 @@ fn run_empty_bond_reload(allow_empty: bool) {
     })
     .expect("coherent empty publication withdraws every link");
     assert!(paused >= before);
-    let received = receiver.data_packets.load(Ordering::Relaxed);
-    publish_mapped_bond(&ips, &map, 1, Some("127.0.0.1"));
-    sender.sighup();
+    // Once the retired socket has drained, neither traffic nor registration
+    // or keepalive control packets should reach the receiver while paused.
+    thread::sleep(Duration::from_millis(150));
+    let received = receiver.all_packets.load(Ordering::Relaxed);
     inject(port, 30_000, 32);
     thread::sleep(Duration::from_millis(1300));
-    assert_eq!(receiver.data_packets.load(Ordering::Relaxed), received);
+    assert_eq!(receiver.all_packets.load(Ordering::Relaxed), received);
     assert!(
         read_stats(&stats).unwrap()["connections"]
             .as_array()
@@ -600,7 +612,8 @@ fn run_empty_bond_reload(allow_empty: bool) {
             .is_empty()
     );
 
-    publish_mapped_bond(&ips, &map, 3, Some("127.0.0.3"));
+    // A fresh publication from a restarted writer begins at generation 1.
+    publish_mapped_bond(&ips, &map, 1, Some("127.0.0.3"));
     sender.sighup();
     wait_for(READY_TIMEOUT, || {
         read_stats(&stats).filter(all_links_active)

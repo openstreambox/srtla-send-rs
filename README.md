@@ -151,7 +151,7 @@ srtla_send [OPTIONS] SRT_LISTEN_PORT SRTLA_HOST SRTLA_PORT BIND_IPS_FILE
 - `--metrics-bind <ADDR:PORT>`: Expose a Prometheus scrape endpoint at `/metrics`
 - `-v, --version`: Print version and exit (see [Version output](#version-output))
 
-The CERALIVE fork adds `--verbose`, `--dry-run`, `--stats-file`, `--stats-file-interval`, `--bind-map`, and `--capabilities-json`. They are documented in [The CERALIVE layer](#the-ceralive-layer).
+The CERALIVE fork adds `--verbose`, `--dry-run`, `--stats-file`, `--stats-file-interval`, `--bind-map`, `--allow-empty-bond`, and `--capabilities-json`. They are documented in [The CERALIVE layer](#the-ceralive-layer).
 
 ### Version output
 
@@ -190,6 +190,7 @@ The fork is based on upstream `df0b3938791ff24eced4aed8b29e3d49d0efb639` (v4.0.1
 - `--stats-file <PATH>`: publish the telemetry snapshot described below to this path. Opt-in: omit the flag and no file is ever written.
 - `--stats-file-interval <MS>`: publish cadence for `--stats-file` (default `1000`).
 - `--bind-map <PATH>`: an optional sidecar that adds interface binding and stable link identity to `BIND_IPS_FILE`, described below.
+- `--allow-empty-bond`: with `--bind-map`, apply a coherent zero-byte IP file with an explicit empty sidecar on reload. This pauses sending until a later publication registers new links. During a long pause, the SRT peer can time out and the encoder reconnects after links return.
 - `--capabilities-json`: print one line of JSON describing what this build supports and exit `0`, before logging starts and without binding anything.
 
 Two upstream defaults matter to the device integration and are left as upstream ships them: whole-bond re-home and stalled-link deselect are **on** (`--no-rehome`, `--no-stall-deselect` to opt out), and the per-link liveness timeout defaults to 5 s. CeraUI passes `--conn-timeout-ms 15000` on the command line to match the bonding receiver's own timeout; the binary does not bake that value in.

@@ -593,6 +593,8 @@ pub async fn run_sender_with_config(
                     receiver_port,
                 });
                 info!("uplink changes queued for next processing cycle");
+            } else if !allow_empty_bond {
+                warn!("bind-map reload produced no usable uplinks; keeping current connections");
             }
         }
         _ = sigterm.recv() => {
