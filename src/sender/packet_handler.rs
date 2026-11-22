@@ -523,10 +523,15 @@ async fn send_stall_probes(
         if i == sel_idx {
             continue;
         }
-        if !(conn.is_stall_gated() || conn.is_quality_excluded()) || !conn.connected {
+        if !conn.connected || conn.is_timed_out(packet_time_ms) {
             continue;
         }
-        if !conn.stall_probe_due() {
+        let probe_due = if conn.probation_held() {
+            conn.probation_probe_due(packet_time_ms)
+        } else {
+            (conn.is_stall_gated() || conn.is_quality_excluded()) && conn.stall_probe_due()
+        };
+        if !probe_due {
             continue;
         }
         trace!(

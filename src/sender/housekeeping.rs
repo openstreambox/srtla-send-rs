@@ -92,6 +92,12 @@ pub async fn handle_housekeeping(
         }
     }
 
+    let has_delivering_path = connections.iter().any(|conn| {
+        conn.connected
+            && !conn.is_timed_out(current_ms)
+            && !conn.is_stall_gated()
+            && conn.has_delivered_data()
+    });
     // housekeeping: drive registration, send keepalives
     for (i, conn) in connections.iter_mut().enumerate() {
         // Re-resolve the egress interface by NAME and re-read the route
@@ -118,6 +124,9 @@ pub async fn handle_housekeeping(
 
         // Simple reconnect-on-timeout, then allow reg driver to proceed
         if conn.is_timed_out(current_ms) {
+            if conn.defer_no_data_timeout(current_ms, has_delivering_path) {
+                continue;
+            }
             if conn.should_attempt_reconnect(current_ms) {
                 let label = conn.label.clone();
                 conn.record_reconnect_attempt(current_ms);

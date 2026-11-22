@@ -26,7 +26,11 @@ static NEXT_TEST_CONN_ID: AtomicU64 = AtomicU64::new(1000);
 /// no longer need a real UDP socket. Tests that need to drive I/O construct a
 /// `ConnIo` separately (that half lives in the parent srtla_send crate).
 fn build_connection(local_ip: IpAddr, label: String) -> SrtlaConnection {
+    let mut probation = crate::connection::DeliveryProbation::default();
+    probation.note_attempt();
+    probation.note_delivery();
     SrtlaConnection {
+        probation,
         conn_id: NEXT_TEST_CONN_ID.fetch_add(1, Ordering::Relaxed),
         local_ip,
         label,
