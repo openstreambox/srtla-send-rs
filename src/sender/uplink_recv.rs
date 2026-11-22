@@ -123,9 +123,6 @@ pub async fn process_uplink_packet(
         } else if pt == SRTLA_TYPE_ACK {
             let ack_list = parse_srtla_ack(data);
             if !ack_list.is_empty() {
-                if conn.connected {
-                    conn.note_uplink_delivery();
-                }
                 debug!(
                     "🎯 SRTLA ACK received from {}: {} sequences",
                     conn.label,

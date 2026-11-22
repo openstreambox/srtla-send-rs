@@ -102,12 +102,24 @@ pub async fn process_connection_events(
         // cleared its log).
         let found_on_arrival =
             connections[idx].handle_srtla_ack_specific(*srtla_ack as i32, classic, current_time_ms);
+        // A faster sibling can prune this link's packet with a cumulative
+        // SRT ACK before its own SRTLA ACK arrives. The sequence tracker
+        // still identifies the owner. Neither this check nor the cross-link
+        // accounting fallback treats an ACK as delivery by a different link.
+        if found_on_arrival
+            || seq_tracker.get(*srtla_ack, current_time_ms) == Some(connections[idx].conn_id)
+        {
+            connections[idx].note_uplink_delivery(current_time_ms);
+        }
         if !found_on_arrival {
             for (i, c) in connections.iter_mut().enumerate() {
-                if i == idx {
-                    continue;
-                }
-                if c.handle_srtla_ack_specific(*srtla_ack as i32, classic, current_time_ms) {
+                if i != idx
+                    && c.handle_srtla_ack_from_other_link(
+                        *srtla_ack as i32,
+                        classic,
+                        current_time_ms,
+                    )
+                {
                     break;
                 }
             }

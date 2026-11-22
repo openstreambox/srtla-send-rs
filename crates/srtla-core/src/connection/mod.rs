@@ -921,8 +921,11 @@ impl SrtlaConnection {
         self.probation.delivered
     }
 
-    pub fn note_uplink_delivery(&mut self) {
-        self.probation.note_delivery();
+    pub fn note_uplink_delivery(&mut self, now_ms: u64) {
+        if self.connected {
+            self.probation.note_delivery();
+            self.last_ack_or_rtt_sample_ms = now_ms;
+        }
     }
 
     pub fn probation_held(&self) -> bool {

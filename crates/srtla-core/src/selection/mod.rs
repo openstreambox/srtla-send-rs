@@ -183,8 +183,8 @@ mod tests {
             );
             assert!(connections[0].probation_held());
             assert!(connections[0].probation_probe_due(now));
-            assert!(!connections[0].probation_probe_due(now + 199));
-            assert!(connections[0].probation_probe_due(now + 200));
+            assert!(!connections[0].probation_probe_due(now + 19));
+            assert!(connections[0].probation_probe_due(now + 20));
 
             connections[1].connected = false;
             assert_eq!(
@@ -194,10 +194,10 @@ mod tests {
             assert!(!connections[0].probation_held());
 
             connections[1].connected = true;
-            connections[0].note_uplink_delivery();
+            connections[0].note_uplink_delivery(now);
             assert!(!connections[0].has_delivered_data());
             connections[0].probation.note_attempt();
-            connections[0].note_uplink_delivery();
+            connections[0].note_uplink_delivery(now);
             assert_eq!(
                 select_connection_idx(&mut connections, None, now, &config),
                 Some(0)
