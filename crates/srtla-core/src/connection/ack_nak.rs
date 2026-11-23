@@ -135,20 +135,37 @@ impl SrtlaConnection {
             return true;
         }
 
+        self.settle_srtla_ack(seq, classic_mode, now_ms, true)
+    }
+
+    /// Account for a packet ACKed on another socket without crediting this
+    /// path with delivery or consuming a duplicate probe's ACK.
+    pub fn handle_srtla_ack_from_other_link(
+        &mut self,
+        seq: i32,
+        classic_mode: bool,
+        now_ms: u64,
+    ) -> bool {
+        self.settle_srtla_ack(seq, classic_mode, now_ms, false)
+    }
+
+    fn settle_srtla_ack(
+        &mut self,
+        seq: i32,
+        classic_mode: bool,
+        now_ms: u64,
+        arrived_here: bool,
+    ) -> bool {
         let sent_ms = self.packet_log.remove(&seq);
         if let Some(sent_ms) = sent_ms {
             self.in_flight_packets = self.packet_log.len() as i32;
 
-            // Delivery proof for `stall_deselect`: this link OWNED the acked seq,
-            // the strongest per-link proof it is still moving data. Stamped here
-            // and at the keepalive-RTT site only (see `packet_io.rs`), never on
-            // generic inbound bytes, so a stalled-but-echoing link stays stale.
-            self.last_ack_or_rtt_sample_ms = now_ms;
-
-            // Retransmitted sequences still earn delivery proof and accounting,
-            // but the ACK may belong to an older copy (Karn's ambiguity).
-            if let Some(sent_ms) = sent_ms {
-                self.rtt.record_round_trip(sent_ms, now_ms);
+            if arrived_here {
+                self.last_ack_or_rtt_sample_ms = now_ms;
+                // Retransmits still earn proof, but not an ambiguous RTT sample.
+                if let Some(sent_ms) = sent_ms {
+                    self.rtt.record_round_trip(sent_ms, now_ms);
+                }
             }
 
             if classic_mode {

@@ -55,7 +55,18 @@ pub fn select_connection_idx(
     // hysteresis — no blind reprobe, no single-sample flap). Recomputed for
     // every link on every call so the flag can never go stale; collapses to
     // clearing flag and latch when the guard is off.
+    for conn in conns.iter_mut() {
+        conn.probation.held = false;
+    }
     apply_stall_gate(conns, current_time_ms, config);
+    let has_delivering_path = conns
+        .iter()
+        .any(|conn| conn.can_carry_proven_data(current_time_ms));
+    if has_delivering_path {
+        for conn in conns.iter_mut() {
+            conn.probation.held = !conn.has_delivered_data();
+        }
+    }
 
     match config.mode {
         SchedulingMode::Classic => {
@@ -149,6 +160,46 @@ mod tests {
     use super::*;
     use crate::test_helpers::create_test_connections;
     use crate::utils::now_ms;
+
+    #[test]
+    fn a_fresh_link_stays_out_of_rotation_while_a_sibling_delivers() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for mode in [SchedulingMode::Classic, SchedulingMode::Enhanced] {
+            let mut connections = rt.block_on(create_test_connections(2));
+            connections[0].probation.reset_socket();
+            connections[0].window = 60_000;
+            let config = ConfigSnapshot {
+                mode,
+                ..ConfigSnapshot::default()
+            };
+            let now = now_ms();
+            assert_eq!(
+                select_connection_idx(&mut connections, None, now, &config),
+                Some(1)
+            );
+            assert!(connections[0].probation_held());
+            assert!(connections[0].probation_probe_due(now));
+            assert!(!connections[0].probation_probe_due(now + 19));
+            assert!(connections[0].probation_probe_due(now + 20));
+
+            connections[1].connected = false;
+            assert_eq!(
+                select_connection_idx(&mut connections, None, now, &config),
+                Some(0)
+            );
+            assert!(!connections[0].probation_held());
+
+            connections[1].connected = true;
+            connections[0].note_uplink_delivery(now);
+            assert!(!connections[0].has_delivered_data());
+            connections[0].probation.note_attempt();
+            connections[0].note_uplink_delivery(now);
+            assert_eq!(
+                select_connection_idx(&mut connections, None, now, &config),
+                Some(0)
+            );
+        }
+    }
 
     #[test]
     fn test_select_connection_idx_classic() {

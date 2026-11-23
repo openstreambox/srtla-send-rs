@@ -23,6 +23,68 @@ const SLOW_RETRY_DELAY_MS: u64 = 5000;
 /// cadence has the same shape and shares it.
 pub(super) const TICK_SLACK_MS: u64 = 500;
 
+/// Delivery and retry state for an individual uplink across UDP sockets.
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryProbation {
+    pub(crate) held: bool,
+    pub(crate) delivered: bool,
+    attempted: bool,
+    next_probe_ms: u64,
+    no_data_stops: u32,
+    retry_at_ms: Option<u64>,
+}
+
+impl DeliveryProbation {
+    pub(crate) fn reset_socket(&mut self) {
+        *self = Self {
+            no_data_stops: self.no_data_stops,
+            ..Self::default()
+        };
+    }
+
+    pub(crate) fn note_attempt(&mut self) {
+        self.attempted = true;
+    }
+
+    pub(crate) fn note_delivery(&mut self) {
+        if !self.attempted {
+            return;
+        }
+        self.delivered = true;
+        self.no_data_stops = 0;
+        self.retry_at_ms = None;
+    }
+
+    pub(crate) fn probe_due(&mut self, now_ms: u64) -> bool {
+        if self.delivered || now_ms < self.next_probe_ms {
+            return false;
+        }
+        self.next_probe_ms =
+            now_ms.saturating_add(crate::config_snapshot::PROBATION_PROBE_INTERVAL_MS);
+        true
+    }
+
+    pub(crate) fn defer_timeout(
+        &mut self,
+        now_ms: u64,
+        registered: bool,
+        has_alternative: bool,
+    ) -> bool {
+        if registered && self.retry_at_ms.is_none() && self.attempted && !self.delivered {
+            self.no_data_stops = (self.no_data_stops + 1).min(5);
+            let delay = match self.no_data_stops {
+                2 => 10_000,
+                3 => 20_000,
+                4 => 40_000,
+                5 => 60_000,
+                _ => 0,
+            };
+            self.retry_at_ms = Some(now_ms.saturating_add(delay));
+        }
+        has_alternative && self.retry_at_ms.is_some_and(|deadline| now_ms < deadline)
+    }
+}
+
 /// Reconnection state and retry pacing
 #[derive(Debug, Clone, Default)]
 pub struct ReconnectionState {
@@ -186,5 +248,33 @@ mod tests {
         state.record_attempt("test", 10_001);
         assert_eq!(state.reconnect_failure_count, 0);
         assert!(state.should_attempt_reconnect(11_000));
+    }
+}
+
+#[cfg(test)]
+mod probation_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_registered_no_data_timeouts_back_off_until_delivery() {
+        let mut probation = DeliveryProbation::default();
+        let mut now = 1;
+        for delay in [0, 10_000, 20_000, 40_000, 60_000, 60_000] {
+            probation.reset_socket();
+            assert!(!probation.defer_timeout(now, false, true));
+            assert!(!probation.defer_timeout(now, true, true));
+            probation.note_attempt();
+            assert_eq!(probation.defer_timeout(now, true, true), delay > 0);
+            if delay > 0 {
+                assert!(probation.defer_timeout(now + delay - 1, true, true));
+                assert!(!probation.defer_timeout(now + 1, true, false));
+            }
+            assert!(!probation.defer_timeout(now + delay, true, true));
+            now += delay + 1;
+        }
+        probation.note_delivery();
+        probation.reset_socket();
+        probation.note_attempt();
+        assert!(!probation.defer_timeout(now, true, true));
     }
 }

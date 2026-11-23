@@ -290,6 +290,16 @@ fn spawn_sender(
     srt_port: u16,
     receiver_port: u16,
 ) -> Sender {
+    spawn_sender_with_options(ips, stats, srt_port, receiver_port, &[])
+}
+
+fn spawn_sender_with_options(
+    ips: &std::path::Path,
+    stats: &std::path::Path,
+    srt_port: u16,
+    receiver_port: u16,
+    options: &[&str],
+) -> Sender {
     let child = Command::new(BIN)
         .args([
             &srt_port.to_string(),
@@ -301,6 +311,7 @@ fn spawn_sender(
             "--stats-file-interval",
             &STATS_INTERVAL_MS.to_string(),
         ])
+        .args(options)
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -477,4 +488,185 @@ fn reloaded_link_joins_promptly_after_reordering_during_registration() {
         [replacement],
         "only the replacement may send REG2 after the first reload, including probes",
     );
+}
+
+#[test]
+fn probation_requires_batched_delivery_after_reload_and_falls_back_to_the_last_link() {
+    exercise_probation_after_reload(450, 1000);
+}
+
+#[test]
+fn probation_retains_the_first_ack_batch_across_a_three_second_delay() {
+    exercise_probation_after_reload(3000, 6000);
+}
+
+fn exercise_probation_after_reload(ack_delay_ms: u64, timeout_ms: u64) {
+    use std::collections::HashMap;
+
+    const INITIAL: Ipv4Addr = Ipv4Addr::LOCALHOST;
+    const REMAINDER: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+    let socket = UdpSocket::bind((INITIAL, 0)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(3)))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("ips");
+    let stats = dir.path().join("stats.json");
+    let port = free_udp_port();
+    std::fs::write(&ips, "127.0.0.1\n").unwrap();
+    let sender = spawn_sender_with_options(
+        &ips,
+        &stats,
+        port,
+        socket.local_addr().unwrap().port(),
+        &[
+            "--mode",
+            "classic",
+            "--conn-timeout-ms",
+            &timeout_ms.to_string(),
+        ],
+    );
+    let source = UdpSocket::bind((INITIAL, 0)).unwrap();
+    let mut group = None;
+    let mut registration = HashMap::<Ipv4Addr, Instant>::new();
+    let mut batches = HashMap::<SocketAddr, Vec<u32>>::new();
+    let mut unique = HashMap::<Ipv4Addr, usize>::new();
+    let mut probes = HashMap::<Ipv4Addr, usize>::new();
+    let mut delayed = None;
+    let mut replacement_proved_at = None;
+    let mut seq = 0u32;
+    let mut next_send = Instant::now();
+    let ignored_counter = AtomicU64::new(0);
+    let mut buffer = [0u8; 2048];
+    let mut tick = |stage| {
+        let now = Instant::now();
+        if now >= next_send {
+            seq += 1;
+            let mut packet = [0; PAYLOAD_LEN];
+            packet[..4].copy_from_slice(&seq.to_be_bytes());
+            source.send_to(&packet, (INITIAL, port)).unwrap();
+            next_send = now + Duration::from_millis(2);
+        }
+        if delayed.as_ref().is_some_and(|(when, _, _)| now >= *when) {
+            let (_, peer, ack): (_, _, Vec<u32>) = delayed.take().unwrap();
+            socket
+                .send_to(&srtla_protocol::create_ack_packet(&ack), peer)
+                .unwrap();
+            replacement_proved_at = Some(now);
+        }
+        if let Ok((n, peer)) = socket.recv_from(&mut buffer) {
+            let SocketAddr::V4(peer_v4) = peer else {
+                unreachable!()
+            };
+            let ip = *peer_v4.ip();
+            if stage == 3 && ip == INITIAL {
+                return false;
+            }
+            let packet = &buffer[..n];
+            if packet.len() >= 16 && packet[0] & 128 == 0 {
+                if !registration.contains_key(&ip) {
+                    return false;
+                }
+                if srtla_protocol::is_srt_data_retransmit(packet) {
+                    *probes.entry(ip).or_default() += 1;
+                } else {
+                    *unique.entry(ip).or_default() += 1;
+                }
+                if ip == REMAINDER && stage == 2 {
+                    assert!(
+                        srtla_protocol::is_srt_data_retransmit(packet),
+                        "unproved link received unique payload while a proven sibling survived"
+                    );
+                }
+                if ip == REPLACEMENT_IP && replacement_proved_at.is_none() {
+                    assert!(
+                        srtla_protocol::is_srt_data_retransmit(packet),
+                        "replacement received unique payload before its own ACK"
+                    );
+                    if probes.get(&ip) == Some(&1) {
+                        socket
+                            .send_to(&srtla_protocol::create_ack_packet(&[0x7fff_0000]), peer)
+                            .unwrap();
+                    }
+                }
+                let batch = batches.entry(peer).or_default();
+                batch.push(u32::from_be_bytes(packet[..4].try_into().unwrap()));
+                if batch.len() == 10 {
+                    if ip == REPLACEMENT_IP && replacement_proved_at.is_none() {
+                        if delayed.is_none() {
+                            delayed = Some((
+                                now + Duration::from_millis(ack_delay_ms),
+                                peer,
+                                batch.clone(),
+                            ));
+                        }
+                    } else if ip == INITIAL || (ip == REPLACEMENT_IP && stage > 1) {
+                        if ip == INITIAL {
+                            // Let the cumulative ACK prune the send log before the
+                            // per-link ACK arrives. Socket ownership must still prove A.
+                            let mut cumulative_ack = [0u8; 20];
+                            cumulative_ack[..2]
+                                .copy_from_slice(&srtla_protocol::SRT_TYPE_ACK.to_be_bytes());
+                            cumulative_ack[16..].copy_from_slice(&(batch[9] + 1).to_be_bytes());
+                            socket.send_to(&cumulative_ack, peer).unwrap();
+                        }
+                        socket
+                            .send_to(&srtla_protocol::create_ack_packet(batch), peer)
+                            .unwrap();
+                    }
+                    batch.clear();
+                }
+            } else if packet.len() >= 2
+                && !(ip == REPLACEMENT_IP
+                    && packet[..2] == SRTLA_TYPE_KEEPALIVE.to_be_bytes()
+                    && replacement_proved_at.is_none())
+                && serve(&socket, packet, peer, &ignored_counter, &mut group, false).is_some()
+            {
+                assert!(
+                    registration.insert(ip, now).is_none(),
+                    "{ip} unexpectedly re-registered"
+                );
+            }
+        }
+        match stage {
+            0 => unique.get(&INITIAL).is_some_and(|count| *count >= 20),
+            1 => {
+                if let Some(grant) = registration.get(&REPLACEMENT_IP) {
+                    assert!(
+                        now.duration_since(*grant) < Duration::from_millis(timeout_ms - 25),
+                        "batched proof and admission must complete inside the receive timeout"
+                    );
+                }
+                let admitted = unique.get(&REPLACEMENT_IP).is_some_and(|count| *count >= 3);
+                if admitted {
+                    let elapsed = now.duration_since(registration[&REPLACEMENT_IP]);
+                    println!("replacement normal share after {} ms", elapsed.as_millis());
+                }
+                admitted
+            }
+            2 => probes.get(&REMAINDER).is_some_and(|count| *count >= 3),
+            _ => unique.contains_key(&REMAINDER),
+        }
+    };
+
+    let mut drive = |stage, timeout| {
+        let until = Instant::now() + timeout;
+        while Instant::now() < until {
+            if tick(stage) {
+                return;
+            }
+        }
+        panic!("probation regression timed out in stage {stage}");
+    };
+    drive(0, READY_TIMEOUT);
+    std::fs::write(&ips, "127.0.0.1\n127.0.0.3\n").unwrap();
+    sender.sighup();
+    drive(1, Duration::from_millis(timeout_ms + 2000));
+    std::fs::write(&ips, "127.0.0.1\n127.0.0.2\n").unwrap();
+    sender.sighup();
+    drive(2, Duration::from_secs(3));
+    // Drop all traffic on the already proven leg and stop acknowledging the
+    // other leg's probes. The latter must become a unique carrier anyway.
+    drive(3, Duration::from_millis(timeout_ms + 2000));
+    assert!(replacement_proved_at.is_some());
 }

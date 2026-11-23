@@ -12,7 +12,7 @@ pub use batch_send::{BATCH_SEND_SIZE, BatchSender, DrainedPacket};
 pub use bitrate::BitrateTracker;
 pub use congestion::CongestionControl;
 pub use incoming::SrtlaIncoming;
-pub use reconnection::ReconnectionState;
+pub use reconnection::{DeliveryProbation, ReconnectionState};
 pub use rtt::RttTracker;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -289,6 +289,7 @@ pub fn delivery_proof_is_timely(smooth_rtt_ms: f64, budget_ms: u32) -> bool {
 }
 
 pub struct SrtlaConnection {
+    pub(crate) probation: DeliveryProbation,
     pub conn_id: u64,
     #[allow(dead_code)]
     // Shell production API: the sender binds egress sockets to this IP and
@@ -519,6 +520,7 @@ impl SrtlaConnection {
     /// tracker; `conn_id` is generated shell-side so it can key the I/O map.
     pub fn new_registering(conn_id: u64, label: String, local_ip: IpAddr, now: u64) -> Self {
         Self {
+            probation: DeliveryProbation::default(),
             conn_id,
             local_ip,
             label,
@@ -601,6 +603,9 @@ impl SrtlaConnection {
     #[inline]
     pub fn queue_data_packet(&mut self, data: &[u8], seq: Option<u32>, send_time_ms: u64) -> bool {
         // Track bytes for bitrate calculation (tracked at queue time)
+        if self.connected && seq.is_some() {
+            self.probation.note_attempt();
+        }
         self.bitrate.update_on_send(data.len() as u64);
         self.batch_sender.queue_packet(data, seq, send_time_ms)
     }
@@ -620,6 +625,7 @@ impl SrtlaConnection {
     /// attributed to the link that actually carried the stream data.
     pub fn queue_probe_packet(&mut self, data: &[u8], seq: u32, send_time_ms: u64) -> bool {
         self.bitrate.update_on_send(data.len() as u64);
+        self.probation.note_attempt();
         self.record_probe(seq as i32, send_time_ms);
         self.batch_sender.queue_packet(data, None, send_time_ms)
     }
@@ -908,7 +914,42 @@ impl SrtlaConnection {
 
     /// Whether this link is eligible for packet scheduling.
     pub fn is_schedulable(&self) -> bool {
-        self.phase.is_schedulable()
+        self.phase.is_schedulable() && !self.probation.held
+    }
+
+    pub fn has_delivered_data(&self) -> bool {
+        self.probation.delivered
+    }
+
+    /// Whether this socket can keep an unproved sibling on probation or in backoff.
+    /// The last link may still be schedulable even while its stall latch is set.
+    pub fn can_carry_proven_data(&self, now_ms: u64) -> bool {
+        self.connected
+            && self.is_schedulable()
+            && !self.is_timed_out(now_ms)
+            && !self.stall_latched()
+            && !self.silence_pulled
+            && self.has_delivered_data()
+    }
+
+    pub fn note_uplink_delivery(&mut self, now_ms: u64) {
+        if self.connected {
+            self.probation.note_delivery();
+            self.last_ack_or_rtt_sample_ms = now_ms;
+        }
+    }
+
+    pub fn probation_held(&self) -> bool {
+        self.probation.held
+    }
+
+    pub fn probation_probe_due(&mut self, now_ms: u64) -> bool {
+        self.probation.probe_due(now_ms)
+    }
+
+    pub fn defer_no_data_timeout(&mut self, now_ms: u64, has_alternative: bool) -> bool {
+        self.probation
+            .defer_timeout(now_ms, self.connected, has_alternative)
     }
 
     /// Scheduling weight contributed by this link's phase
@@ -1351,6 +1392,7 @@ impl SrtlaConnection {
     /// Reset core connection state (window, packet tracking, batch queue).
     /// Used by both mark_for_recovery and reset_state.
     fn reset_core_state(&mut self) {
+        self.probation.reset_socket();
         self.connected = false;
         self.window = WINDOW_DEF * WINDOW_MULT;
         self.in_flight_packets = 0;

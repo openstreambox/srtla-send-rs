@@ -66,11 +66,13 @@ pub const STALL_REJOIN_BACKOFF_MAX: u32 = 16;
 /// not the backed-off one, so the bar to clear does not rise with the penalty.
 pub const STALL_REJOIN_PROBATION_MULT: u64 = STALL_REJOIN_DWELL_MULT + 1;
 
-/// Size at which the outstanding-probe log starts expiring entries. A probe is
-/// only removed by its own SRTLA ACK, which may never arrive, so the log needs
-/// a bound. Well above the number a link can have outstanding at the 1-in-N
-/// probe rate even at a multi-second RTT.
-pub const PROBE_LOG_SOFT_CAP: usize = 128;
+/// Minimum interval between duplicates sent to a freshly registered link.
+pub(crate) const PROBATION_PROBE_INTERVAL_MS: u64 = 20;
+
+/// Start sweeping only after the log can hold the full age window at the
+/// probation probe rate, including both endpoints of the retained interval.
+pub const PROBE_LOG_SOFT_CAP: usize =
+    (PROBE_LOG_MAX_AGE_MS / PROBATION_PROBE_INTERVAL_MS) as usize + 2;
 
 /// Age at which an unanswered probe is dropped from that log. Matches the
 /// longest round trip the RTT estimator will accept: past it, no arriving ACK
