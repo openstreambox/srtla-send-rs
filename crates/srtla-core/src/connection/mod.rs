@@ -921,6 +921,17 @@ impl SrtlaConnection {
         self.probation.delivered
     }
 
+    /// Whether this socket can keep an unproved sibling on probation or in backoff.
+    /// The last link may still be schedulable even while its stall latch is set.
+    pub fn can_carry_proven_data(&self, now_ms: u64) -> bool {
+        self.connected
+            && self.is_schedulable()
+            && !self.is_timed_out(now_ms)
+            && !self.stall_latched()
+            && !self.silence_pulled
+            && self.has_delivered_data()
+    }
+
     pub fn note_uplink_delivery(&mut self, now_ms: u64) {
         if self.connected {
             self.probation.note_delivery();

@@ -59,7 +59,8 @@ impl DeliveryProbation {
         if self.delivered || now_ms < self.next_probe_ms {
             return false;
         }
-        self.next_probe_ms = now_ms.saturating_add(20);
+        self.next_probe_ms =
+            now_ms.saturating_add(crate::config_snapshot::PROBATION_PROBE_INTERVAL_MS);
         true
     }
 

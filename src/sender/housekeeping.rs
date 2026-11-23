@@ -92,12 +92,9 @@ pub async fn handle_housekeeping(
         }
     }
 
-    let has_delivering_path = connections.iter().any(|conn| {
-        conn.connected
-            && !conn.is_timed_out(current_ms)
-            && !conn.is_stall_gated()
-            && conn.has_delivered_data()
-    });
+    let has_delivering_path = connections
+        .iter()
+        .any(|conn| conn.can_carry_proven_data(current_ms));
     // housekeeping: drive registration, send keepalives
     for (i, conn) in connections.iter_mut().enumerate() {
         // Re-resolve the egress interface by NAME and re-read the route
@@ -584,6 +581,54 @@ mod tests {
 
     fn remote(last: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, last)), 5000)
+    }
+
+    #[tokio::test]
+    async fn probation_retry_resumes_when_the_only_proven_link_stalls() {
+        use srtla_core::config_snapshot::ConfigSnapshot;
+        use srtla_core::selection::select_connection_idx;
+
+        let mut fixture = RehomeFixture::new(SocketAddr::from(([127, 0, 0, 1], 5000))).await;
+        let mut gate = RehomeGate::new(false);
+        let config = ConfigSnapshot::default();
+        let now = 50_000;
+        fixture.keep_all_uplinks_live(now);
+
+        let backup = &mut fixture.connections[1];
+        backup.mark_for_recovery();
+        backup.connected = true;
+        backup.queue_probe_packet(&[0; 16], 1, now - 5_000);
+        assert!(!backup.defer_no_data_timeout(now - 4_000, true));
+        backup.mark_for_recovery();
+        backup.connected = true;
+        backup.last_received = Some(now - config.conn_timeout_ms);
+        backup.queue_probe_packet(&[0; 16], 2, now - 1_000);
+        assert!(backup.is_timed_out(now));
+
+        fixture.tick(&mut gate, now).await.unwrap();
+        assert_eq!(
+            fixture.connections[1]
+                .reconnection
+                .last_reconnect_attempt_ms,
+            0
+        );
+
+        let carrier = &mut fixture.connections[0];
+        carrier.in_flight_packets = config.stall_min_in_flight;
+        carrier.note_uplink_delivery(now - config.stall_ack_stale_ms);
+        carrier.last_received = Some(now + 1_000);
+        select_connection_idx(&mut fixture.connections, None, now + 1_000, &config);
+        assert!(fixture.connections[0].stall_latched());
+        assert!(!fixture.connections[0].is_stall_gated());
+
+        fixture.tick(&mut gate, now + 1_000).await.unwrap();
+        assert_eq!(
+            fixture.connections[1]
+                .reconnection
+                .last_reconnect_attempt_ms,
+            now + 1_000,
+            "the stalled link must not hold the backup in retry backoff"
+        );
     }
 
     /// The most important half of the policy: a bond with a live uplink is never

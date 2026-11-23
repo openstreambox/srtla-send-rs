@@ -59,13 +59,9 @@ pub fn select_connection_idx(
         conn.probation.held = false;
     }
     apply_stall_gate(conns, current_time_ms, config);
-    let has_delivering_path = conns.iter().any(|conn| {
-        conn.connected
-            && conn.is_schedulable()
-            && !conn.is_timed_out(current_time_ms)
-            && !conn.is_stall_gated()
-            && conn.has_delivered_data()
-    });
+    let has_delivering_path = conns
+        .iter()
+        .any(|conn| conn.can_carry_proven_data(current_time_ms));
     if has_delivering_path {
         for conn in conns.iter_mut() {
             conn.probation.held = !conn.has_delivered_data();

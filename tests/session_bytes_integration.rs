@@ -492,6 +492,15 @@ fn reloaded_link_joins_promptly_after_reordering_during_registration() {
 
 #[test]
 fn probation_requires_batched_delivery_after_reload_and_falls_back_to_the_last_link() {
+    exercise_probation_after_reload(450, 1000);
+}
+
+#[test]
+fn probation_retains_the_first_ack_batch_across_a_three_second_delay() {
+    exercise_probation_after_reload(3000, 6000);
+}
+
+fn exercise_probation_after_reload(ack_delay_ms: u64, timeout_ms: u64) {
     use std::collections::HashMap;
 
     const INITIAL: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -510,7 +519,12 @@ fn probation_requires_batched_delivery_after_reload_and_falls_back_to_the_last_l
         &stats,
         port,
         socket.local_addr().unwrap().port(),
-        &["--mode", "classic", "--conn-timeout-ms", "1000"],
+        &[
+            "--mode",
+            "classic",
+            "--conn-timeout-ms",
+            &timeout_ms.to_string(),
+        ],
     );
     let source = UdpSocket::bind((INITIAL, 0)).unwrap();
     let mut group = None;
@@ -580,9 +594,13 @@ fn probation_requires_batched_delivery_after_reload_and_falls_back_to_the_last_l
                 if batch.len() == 10 {
                     if ip == REPLACEMENT_IP && replacement_proved_at.is_none() {
                         if delayed.is_none() {
-                            delayed = Some((now + Duration::from_millis(450), peer, batch.clone()));
+                            delayed = Some((
+                                now + Duration::from_millis(ack_delay_ms),
+                                peer,
+                                batch.clone(),
+                            ));
                         }
-                    } else if ip != REMAINDER {
+                    } else if ip == INITIAL || (ip == REPLACEMENT_IP && stage > 1) {
                         if ip == INITIAL {
                             // Let the cumulative ACK prune the send log before the
                             // per-link ACK arrives. Socket ownership must still prove A.
@@ -615,8 +633,8 @@ fn probation_requires_batched_delivery_after_reload_and_falls_back_to_the_last_l
             1 => {
                 if let Some(grant) = registration.get(&REPLACEMENT_IP) {
                     assert!(
-                        now.duration_since(*grant) < Duration::from_millis(975),
-                        "batched proof and admission must complete inside the 1 s receive timeout"
+                        now.duration_since(*grant) < Duration::from_millis(timeout_ms - 25),
+                        "batched proof and admission must complete inside the receive timeout"
                     );
                 }
                 let admitted = unique.get(&REPLACEMENT_IP).is_some_and(|count| *count >= 3);
@@ -643,12 +661,12 @@ fn probation_requires_batched_delivery_after_reload_and_falls_back_to_the_last_l
     drive(0, READY_TIMEOUT);
     std::fs::write(&ips, "127.0.0.1\n127.0.0.3\n").unwrap();
     sender.sighup();
-    drive(1, Duration::from_secs(3));
+    drive(1, Duration::from_millis(timeout_ms + 2000));
     std::fs::write(&ips, "127.0.0.1\n127.0.0.2\n").unwrap();
     sender.sighup();
     drive(2, Duration::from_secs(3));
     // Drop all traffic on the already proven leg and stop acknowledging the
     // other leg's probes. The latter must become a unique carrier anyway.
-    drive(3, Duration::from_secs(3));
+    drive(3, Duration::from_millis(timeout_ms + 2000));
     assert!(replacement_proved_at.is_some());
 }
