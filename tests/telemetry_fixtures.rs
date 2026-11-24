@@ -424,8 +424,9 @@ fn the_golden_fixture_carries_no_payload_report() {
 fn the_delivery_report_fixture_tells_a_delivering_link_from_a_black_holed_one() {
     // Given: link 0 carries payload and its last SRTLA ACK came 120 ms before
     // the snapshot, 4 packets ago. Link 1 also carries payload, but 412
-    // packets have gone out since its last ACK 6.4 s ago. Link 2 was just
-    // re-established and has had no ACK yet.
+    // packets have gone out since its last ACK 6.4 s ago, while the scheduler
+    // still counts it as healthy: only the ACK evidence shows the black hole.
+    // Link 2 was just re-established, has had no ACK yet and is not healthy.
     let carrying = |c: TelemetryConn| TelemetryConn {
         payload_age_ms: Some(10),
         payload_held_out: Some(false),
@@ -439,6 +440,7 @@ fn the_delivery_report_fixture_tells_a_delivering_link_from_a_black_holed_one() 
             srtla_acked_packets_total: Some(61_090),
             packets_since_srtla_ack: Some(4),
             last_srtla_ack_age_ms: Some(120),
+            routing_healthy: Some(true),
             ..carrying(conn(0, Some("modem-a"), Some("wwan0")))
         },
         TelemetryConn {
@@ -448,6 +450,7 @@ fn the_delivery_report_fixture_tells_a_delivering_link_from_a_black_holed_one() 
             srtla_acked_packets_total: Some(30_000),
             packets_since_srtla_ack: Some(412),
             last_srtla_ack_age_ms: Some(6_400),
+            routing_healthy: Some(true),
             ..carrying(conn(1, Some("modem-b"), Some("wwan1")))
         },
         TelemetryConn {
@@ -456,6 +459,7 @@ fn the_delivery_report_fixture_tells_a_delivering_link_from_a_black_holed_one() 
             packets_sent_total: Some(905),
             srtla_acked_packets_total: Some(890),
             packets_since_srtla_ack: Some(7),
+            routing_healthy: Some(false),
             payload_held_out: Some(true),
             ..conn(2, Some("modem-c"), Some("wwan2"))
         },
@@ -485,6 +489,8 @@ fn the_delivery_report_fixture_tells_a_delivering_link_from_a_black_holed_one() 
         "no ACK since the link was re-established: the age is omitted, not 0"
     );
     assert_eq!(c[2]["packets_since_srtla_ack"], 7);
+    assert_eq!(c[1]["routing_healthy"], true);
+    assert_eq!(c[2]["routing_healthy"], false);
 }
 
 #[test]
@@ -499,6 +505,7 @@ fn earlier_fixtures_carry_no_delivery_evidence() {
             "srtla_acked_packets_total",
             "packets_since_srtla_ack",
             "last_srtla_ack_age_ms",
+            "routing_healthy",
         ] {
             assert!(!text.contains(key), "`{key}` in `{name}`");
         }

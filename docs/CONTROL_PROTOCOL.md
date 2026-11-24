@@ -123,6 +123,7 @@ ACK over a sibling does not hide delivery.
 | `packets_sent_total` | SRT data datagrams queued on the link: payload, SRT retransmissions and duplicate probes, the datagrams the receiver can acknowledge. SRT control datagrams forwarded from the caller are not counted, although `bytes_sent_total` includes their bytes. |
 | `srtla_acked_packets_total` | Sequence numbers listed in SRTLA ACKs that arrived on the link: delivery over that path as the receiver saw it. |
 | `packets_since_srtla_ack` | SRT data datagrams (payload and probes, no SRT control) queued on the link since its last SRTLA ACK arrived, or since the link was last (re)established when none has arrived since. A delivering link cycles through about 10 divided by its delivery ratio; a black-holed one only grows. |
+| `routing_healthy` | The last scheduling pass (one per SRT packet) counted the link as a healthy sibling: not timed out, schedulable, stall latch off and silence pull off. The silence pull takes a loaded link that has heard nothing for max(250 ms, 2 x SRTT) out of payload; from then on it gets only duplicate probes, so its gap barely grows and its ACK age is the only other sign. Unlike `payload_held_out`, it also reads `false` for a pulled or latched link that carries payload because no healthy link is left. |
 | `last_srtla_ack_age_ms` | Time from the last SRTLA ACK on the link to the moment the snapshot was built. Absent before the first, and again after recovery or a socket replacement until the next one. Keepalive replies do not reset it. |
 
 `packets_sent_total` and `srtla_acked_packets_total` are monotonic per sender
@@ -132,8 +133,9 @@ follows a silent path, and a replaced socket starts a fresh ACK batch at the
 receiver, which keys batches by source address, so both clear until the next
 ACK.
 
-Use `packets_since_srtla_ack` with `last_srtla_ack_age_ms` to judge from one
-sample whether a link delivers: count packets, not seconds, because a link that
+Use `packets_since_srtla_ack` with `last_srtla_ack_age_ms`, and require
+`routing_healthy` and not `payload_held_out`, to judge from one sample whether a
+link delivers: count packets, not seconds, because a link that
 gets only probes (1 in 100 packets) sees an ACK every 1,000 stream packets. For
 a delivered byte rate, take deltas of `srtla_acked_packets_total` over time and
 scale by the link's mean data packet size, `payload_bytes_total /
@@ -143,7 +145,7 @@ to 9 packets per link before it sends an ACK, so the count trails the wire by
 that batch.
 
 The freshness rules above apply unchanged. The `--stats-file` document carries
-the same four fields under the same names; a reader that knows only
+the same five fields under the same names; a reader that knows only
 `payload_report` 1 ignores them.
 
 ## Subscriptions

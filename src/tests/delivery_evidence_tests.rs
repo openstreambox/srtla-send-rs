@@ -19,7 +19,7 @@ mod tests {
     use srtla_core::priority::CriticalWindow;
     use srtla_core::utils::now_ms;
 
-    use crate::config::ConfigSnapshot;
+    use crate::config::{ConfigSnapshot, STALL_MIN_IN_FLIGHT_PACKETS};
     use crate::sender::{ConnIoMap, SequenceTracker, handle_srt_packet, process_connection_events};
     use crate::stats::SharedStats;
     use crate::telemetry_doc::build_telemetry_json_from_stats;
@@ -43,9 +43,9 @@ mod tests {
         }
     }
 
-    /// The consumer's `delivering(L)` on one row of a snapshot, as the
-    /// contract states it (report age is checked separately as freshness).
-    fn delivering(report: &serde_json::Value, row: &serde_json::Value) -> bool {
+    /// The ACK clauses of `delivering(L)`: a recent SRTLA ACK and a short gap
+    /// since it (report age is checked separately as freshness).
+    fn ack_evidence(report: &serde_json::Value, row: &serde_json::Value) -> bool {
         let Some(version) = report["payload_report"].as_u64() else {
             return false;
         };
@@ -56,6 +56,31 @@ mod tests {
             return false;
         };
         version >= 2 && age <= D_DELIVERING_MS && since < N_DELIVERING
+    }
+
+    /// The consumer's `delivering(L)` on one row of a snapshot, as the
+    /// contract states it: the ACK evidence, and the scheduler still counts
+    /// the link as a healthy sibling and does not hold it out of payload.
+    fn delivering(report: &serde_json::Value, row: &serde_json::Value) -> bool {
+        ack_evidence(report, row)
+            && row["routing_healthy"].as_bool() == Some(true)
+            && row["payload_held_out"].as_bool() == Some(false)
+    }
+
+    /// Make a loaded link silent: nothing received for a second with a full
+    /// backlog, so the next scheduling pass engages its silence pull. Its
+    /// SRT-level delivery proof stays fresh, so the slower stall latch does
+    /// not engage: the pull alone acts.
+    fn go_silent(conn: &mut SrtlaConnection, now: u64) {
+        conn.last_received = Some(now.saturating_sub(1_000));
+        conn.in_flight_packets = conn.in_flight_packets.max(STALL_MIN_IN_FLIGHT_PACKETS);
+        conn.last_ack_or_rtt_sample_ms = now;
+    }
+
+    /// A link that keeps speaking (something arrives on it all the time).
+    fn keep_speaking(conn: &mut SrtlaConnection, now: u64) {
+        conn.last_received = Some(now);
+        conn.last_ack_or_rtt_sample_ms = now;
     }
 
     fn stats_json(conns: &[SrtlaConnection]) -> serde_json::Value {
@@ -289,6 +314,87 @@ mod tests {
         );
     }
 
+    /// Review case: witness M dies while its sibling K keeps speaking. The
+    /// silence pull takes M out of payload within max(250 ms, 2 x SRTT); from
+    /// then on M gets only duplicate probes, so its gap stays far below the
+    /// threshold and its last ACK is recent. On the ACK clauses alone M still
+    /// reads carrying and delivering until the ACK ages past D. The report
+    /// must show that the scheduler no longer counts M as healthy.
+    #[tokio::test]
+    async fn a_silence_pulled_witness_is_not_delivering_although_its_gap_is_short() {
+        let mut conns = create_test_connections(2).await;
+        let mut path = Path::new(&conns);
+        let mut rx = Receiver::new(2);
+        for _ in 0..200 {
+            let now = now_ms();
+            keep_speaking(&mut conns[0], now);
+            keep_speaking(&mut conns[1], now);
+            let (seq, link) = path.send_one(&mut conns).await;
+            rx.arrive(&mut conns, seq, link).await;
+        }
+        assert!(rx.acked[0] >= RECV_ACK_INT, "precondition: M delivered");
+
+        // M dies: nothing arrives on it any more, its packets are lost.
+        rx.black_holed[0] = true;
+        for _ in 0..25 {
+            let now = now_ms();
+            go_silent(&mut conns[0], now);
+            keep_speaking(&mut conns[1], now);
+            let (seq, link) = path.send_one(&mut conns).await;
+            rx.arrive(&mut conns, seq, link).await;
+        }
+
+        let v = stats_json(&conns);
+        let (m, k) = (&v["links"][0], &v["links"][1]);
+        assert!(
+            m["payload_age_ms"].as_u64().is_some_and(|a| a < 1_000),
+            "precondition: M carried payload within the window: {m}"
+        );
+        assert!(
+            ack_evidence(&v, m),
+            "precondition: on the ACK clauses alone M still reads delivering: {m}"
+        );
+        assert_eq!(m["routing_healthy"], false, "M is silence-pulled: {m}");
+        assert_eq!(m["payload_held_out"], true);
+        assert!(!delivering(&v, m), "M is no witness: {m}");
+        assert_eq!(k["routing_healthy"], true, "K keeps speaking: {k}");
+        assert!(delivering(&v, k), "K delivers: {k}");
+    }
+
+    /// With no healthy link left the stall gate lifts and a pulled link
+    /// carries payload again, so `payload_held_out` reads false. The
+    /// scheduler still does not count the link as healthy, and the report must
+    /// say so.
+    #[tokio::test]
+    async fn a_pulled_link_carrying_for_want_of_a_healthy_one_is_not_healthy() {
+        let mut conns = create_test_connections(1).await;
+        let mut path = Path::new(&conns);
+        let mut rx = Receiver::new(1);
+        for _ in 0..20 {
+            keep_speaking(&mut conns[0], now_ms());
+            let (seq, link) = path.send_one(&mut conns).await;
+            rx.arrive(&mut conns, seq, link).await;
+        }
+        rx.black_holed[0] = true;
+        for _ in 0..5 {
+            go_silent(&mut conns[0], now_ms());
+            let (seq, link) = path.send_one(&mut conns).await;
+            rx.arrive(&mut conns, seq, link).await;
+        }
+        let v = stats_json(&conns);
+        let m = &v["links"][0];
+        assert_eq!(
+            m["payload_held_out"], false,
+            "precondition: the gate lifted: {m}"
+        );
+        assert!(
+            ack_evidence(&v, m),
+            "precondition: gap and age still look fine: {m}"
+        );
+        assert_eq!(m["routing_healthy"], false, "{m}");
+        assert!(!delivering(&v, m));
+    }
+
     /// SRT control datagrams the caller sends (SRT ACKs, NAKs, keepalives) are
     /// forwarded over a link like data, but carry no sequence number, so the
     /// receiver never lists them in an SRTLA ACK. They must not grow the gap
@@ -388,7 +494,7 @@ mod tests {
             row.get("last_srtla_ack_age_ms").is_none(),
             "an ACK on the old socket proves nothing about the new one: {row}"
         );
-        assert!(!delivering(&v, row));
+        assert!(!ack_evidence(&v, row));
 
         // The new socket sends and earns its first ACK.
         for seq in 30..33 {
@@ -402,8 +508,8 @@ mod tests {
         assert_eq!(row["srtla_acked_packets_total"], 30);
         assert_eq!(row["packets_since_srtla_ack"], 0);
         assert!(
-            delivering(&v, row),
-            "delivering again after a fresh ACK: {row}"
+            ack_evidence(&v, row),
+            "ACK evidence again after a fresh ACK: {row}"
         );
 
         // Recovery (same socket, link went silent) clears the evidence too.
@@ -448,6 +554,7 @@ mod tests {
             "srtla_acked_packets_total",
             "packets_since_srtla_ack",
             "last_srtla_ack_age_ms",
+            "routing_healthy",
         ] {
             for i in 0..2 {
                 assert_eq!(

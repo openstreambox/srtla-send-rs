@@ -276,6 +276,16 @@ pub struct LinkStats {
     /// through about 10 / delivery ratio; a black-holed one only grows. Lets a
     /// consumer judge delivery from one sample, with no baseline.
     pub packets_since_srtla_ack: u64,
+    /// Whether the last scheduling pass (one per SRT packet) counted this link
+    /// as a healthy sibling: not timed out, schedulable, stall latch off and
+    /// silence pull off. The silence pull engages within max(250 ms, 2 x SRTT)
+    /// of a loaded link going silent, well before its packet gap or ACK age
+    /// can show it, after which the link gets only duplicate probes and its
+    /// gap stops growing. Unlike `payload_held_out` it also stays false for a
+    /// pulled or latched link that carries payload because no healthy link is
+    /// left. A consumer must not rely on a link that reads false here as
+    /// delivering.
+    pub routing_healthy: bool,
 }
 
 impl Default for LinkStats {
@@ -335,6 +345,7 @@ impl Default for LinkStats {
             srtla_acked_packets_total: 0,
             last_srtla_ack_age_ms: None,
             packets_since_srtla_ack: 0,
+            routing_healthy: false,
         }
     }
 }
@@ -396,8 +407,8 @@ pub struct StatsSnapshot {
     /// Version of the payload routing report. `1` promises the per-link
     /// `payload_*` fields and `snapshot_age_ms`; `2` adds the per-link
     /// delivery evidence (`packets_sent_total`, `srtla_acked_packets_total`,
-    /// `packets_since_srtla_ack`, `last_srtla_ack_age_ms`) in `get_stats` and
-    /// in the stats file. Consumers test `>=`. Absent from older senders. A
+    /// `packets_since_srtla_ack`, `last_srtla_ack_age_ms`, `routing_healthy`)
+    /// in `get_stats` and in the stats file. Consumers test `>=`. Absent from older senders. A
     /// consumer that finds it absent must treat every one of these fields as
     /// unknown, not as zero.
     /// It is present from startup, before the first snapshot is built, so a
@@ -681,6 +692,7 @@ impl SharedStats {
                 srtla_acked_packets_total: conn.srtla_acked_packets_total(),
                 last_srtla_ack_age_ms: conn.last_srtla_ack_age_ms(current_time_ms),
                 packets_since_srtla_ack: conn.packets_since_srtla_ack(),
+                routing_healthy: conn.is_routing_healthy(),
             };
 
             if is_active {

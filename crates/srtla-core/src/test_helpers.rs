@@ -55,6 +55,7 @@ fn build_connection(local_ip: IpAddr, label: String) -> SrtlaConnection {
         sole_carrier_excluded: false,
         sole_carrier_elections: 0,
         silence_pulled: false,
+        routing_healthy: false,
         silence_pulls: 0,
         payload_packets_total: 0,
         payload_bytes_total: 0,

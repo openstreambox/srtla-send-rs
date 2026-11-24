@@ -431,6 +431,13 @@ pub struct SrtlaConnection {
     /// forbids `last_received` for the latch does not apply. Set by
     /// `apply_stall_gate`; read only for rising-edge counting and selection.
     pub(crate) silence_pulled: bool,
+    /// Whether the last scheduling pass counted this link as a healthy
+    /// sibling: not timed out, schedulable, stall latch off and silence pull
+    /// off (the links `apply_stall_gate`'s "any healthy" guard counts). Unlike
+    /// `stall_gated`, it stays false for a latched or pulled link when the
+    /// gate has been lifted because no healthy link is left. False until the
+    /// first pass and after a reset.
+    pub(crate) routing_healthy: bool,
     /// Cumulative silence-pull engagements (rising edges). Expected to tick
     /// on routine cellular HARQ stalls; a high rate is telemetry, not alarm.
     pub(crate) silence_pulls: u64,
@@ -584,6 +591,7 @@ impl SrtlaConnection {
             sole_carrier_excluded: false,
             sole_carrier_elections: 0,
             silence_pulled: false,
+            routing_healthy: false,
             silence_pulls: 0,
             payload_packets_total: 0,
             payload_bytes_total: 0,
@@ -1373,6 +1381,13 @@ impl SrtlaConnection {
         self.silence_pulls
     }
 
+    /// Whether the last scheduling pass counted this link as a healthy
+    /// sibling (see the field).
+    #[inline(always)]
+    pub fn is_routing_healthy(&self) -> bool {
+        self.routing_healthy
+    }
+
     /// Count the sequence numbers of one SRTLA ACK that arrived on this link.
     /// See [`Self::srtla_acked_packets_total`] for why the arrival link is
     /// the delivering link.
@@ -1504,6 +1519,7 @@ impl SrtlaConnection {
         // The sent and acked totals survive like `payload_packets_total`.
         self.last_srtla_ack_ms = 0;
         self.packets_since_srtla_ack = 0;
+        self.routing_healthy = false;
         self.stall_gated = false;
         self.stall_latched_since_ms = 0;
         self.stall_recovery_since_ms = 0;

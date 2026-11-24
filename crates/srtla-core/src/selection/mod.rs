@@ -119,6 +119,7 @@ fn apply_stall_gate(conns: &mut [SrtlaConnection], current_time_ms: u64, config:
             c.stall_gated = false;
             c.silence_pulled = false;
             c.clear_stall_latch();
+            c.routing_healthy = !c.is_timed_out(current_time_ms) && c.is_schedulable();
         }
         return;
     }
@@ -132,12 +133,14 @@ fn apply_stall_gate(conns: &mut [SrtlaConnection], current_time_ms: u64, config:
         c.update_stall_latch(current_time_ms, min_in_flight, stale_ceiling_ms);
     }
 
-    let any_healthy = conns.iter().any(|c| {
-        !c.is_timed_out(current_time_ms)
+    let mut any_healthy = false;
+    for c in conns.iter_mut() {
+        c.routing_healthy = !c.is_timed_out(current_time_ms)
             && c.is_schedulable()
             && !c.stall_latched()
-            && !c.silence_pulled
-    });
+            && !c.silence_pulled;
+        any_healthy |= c.routing_healthy;
+    }
 
     for c in conns.iter_mut() {
         c.stall_gated = any_healthy && (c.stall_latched() || c.silence_pulled);

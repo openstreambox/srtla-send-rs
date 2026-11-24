@@ -44,13 +44,17 @@
 //! ## Delivery evidence
 //!
 //! With `payload_report` `2` or more the sender also writes, per connection,
-//! `packets_sent_total` (SRT data: payload and probes), `srtla_acked_packets_total`,
-//! `packets_since_srtla_ack` and, once an SRTLA ACK has arrived on the link
-//! since it was last (re)established, `last_srtla_ack_age_ms` (to the snapshot
-//! build, like `payload_age_ms`). `srtla_rec` sends one SRTLA ACK per 10 data
-//! packets that arrive on a link, back on that link, so these say what the
-//! receiver confirmed on each path: a link that keeps sending while
-//! `packets_since_srtla_ack` only grows is not delivering. The same freshness
+//! `packets_sent_total` (SRT data: payload and probes),
+//! `srtla_acked_packets_total`, `packets_since_srtla_ack`, `routing_healthy`
+//! and, once an SRTLA ACK has arrived on the link since it was last
+//! (re)established, `last_srtla_ack_age_ms` (to the snapshot build, like
+//! `payload_age_ms`). `srtla_rec` sends one SRTLA ACK per 10 data packets that
+//! arrive on a link, back on that link, so these say what the receiver
+//! confirmed on each path: a link that keeps sending while
+//! `packets_since_srtla_ack` only grows is not delivering. `routing_healthy`
+//! says whether the scheduler's last pass counted the link as a healthy
+//! sibling (no stall latch, no silence pull); the silence pull reacts to a
+//! link going quiet before its gap or ACK age can. The same freshness
 //! rule applies (`snapshot_age_ms` plus the reader's `Date.now() -
 //! last_updated_ms`). A reader of version 1 ignores them.
 //!
@@ -124,6 +128,7 @@ pub struct TelemetryConn {
     pub srtla_acked_packets_total: Option<u64>,
     pub packets_since_srtla_ack: Option<u64>,
     pub last_srtla_ack_age_ms: Option<u64>,
+    pub routing_healthy: Option<bool>,
 }
 
 /// Serialized per-connection record. `conn_id` is a string and `bitrate_bps` is
@@ -160,6 +165,8 @@ struct ConnRecord {
     packets_since_srtla_ack: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_srtla_ack_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_healthy: Option<bool>,
 }
 
 impl From<&TelemetryConn> for ConnRecord {
@@ -185,6 +192,7 @@ impl From<&TelemetryConn> for ConnRecord {
             srtla_acked_packets_total: c.srtla_acked_packets_total,
             packets_since_srtla_ack: c.packets_since_srtla_ack,
             last_srtla_ack_age_ms: c.last_srtla_ack_age_ms,
+            routing_healthy: c.routing_healthy,
         }
     }
 }
@@ -343,6 +351,7 @@ pub fn conns_from_stats(stats: &StatsSnapshot) -> Vec<TelemetryConn> {
                 srtla_acked_packets_total: Some(l.srtla_acked_packets_total),
                 packets_since_srtla_ack: Some(l.packets_since_srtla_ack),
                 last_srtla_ack_age_ms: l.last_srtla_ack_age_ms,
+                routing_healthy: Some(l.routing_healthy),
             }
         })
         .collect()
