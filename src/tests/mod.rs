@@ -35,6 +35,9 @@ pub mod link_delivery_tests;
 pub mod delivery_evidence_tests;
 
 #[cfg(test)]
+pub mod socket_generation_tests;
+
+#[cfg(test)]
 pub mod protocol_tests;
 
 #[cfg(test)]

@@ -153,6 +153,18 @@ pub async fn handle_uplink_packet(
     if packet.bytes.is_empty() {
         return;
     }
+    // A datagram the link's previous socket queued before a rebuild belongs to
+    // a path the link no longer uses. Counting it would credit the new socket
+    // with a late REG3, keepalive echo or SRTLA ACK it never earned.
+    if let Some(io) = conn_io.get(&packet.conn_id)
+        && io.socket.generation() != packet.generation
+    {
+        debug!(
+            "dropping a datagram from a retired socket of uplink {}",
+            packet.conn_id
+        );
+        return;
+    }
     if let Some(idx) = connections.iter().position(|c| c.conn_id == packet.conn_id) {
         match super::uplink_recv::process_uplink_packet(
             &mut connections[idx],
