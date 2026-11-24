@@ -24,7 +24,7 @@ mod tests {
 
     use crate::config::{ConfigSnapshot, STALL_ACK_STALE_MS, STALL_MIN_IN_FLIGHT_PACKETS};
     use crate::sender::{ConnIoMap, SequenceTracker, handle_srt_packet};
-    use crate::stats::SharedStats;
+    use crate::stats::{PAYLOAD_REPORT_VERSION, SharedStats};
     use crate::telemetry_doc::build_current_telemetry_json;
     use crate::test_helpers::{create_test_conn_io_map, create_test_connections};
 
@@ -204,13 +204,13 @@ mod tests {
         let snapshot = stats.get();
 
         let v: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(v["payload_report"], 1);
+        assert_eq!(v["payload_report"], PAYLOAD_REPORT_VERSION);
         assert!(v["snapshot_age_ms"].as_u64().is_some());
 
         let file: serde_json::Value =
             serde_json::from_str(&build_current_telemetry_json(&snapshot)).unwrap();
         assert_eq!(file["schema_version"], 1, "the required shape is unchanged");
-        assert_eq!(file["payload_report"], 1);
+        assert_eq!(file["payload_report"], PAYLOAD_REPORT_VERSION);
         assert!(file["snapshot_age_ms"].as_u64().is_some());
         let conn = &file["connections"][0];
         assert_eq!(conn["payload_packets_total"], 3);

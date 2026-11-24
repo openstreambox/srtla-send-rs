@@ -62,7 +62,7 @@
   never bump it for an additive field. Types are projected from `src/bind_map/report.rs`;
   do not introduce a parallel status type.
 - **Payload routing report: OPTIONAL additive fields, `schema_version` stays 1.**
-  Top level `payload_report` (integer, currently `1`) and `snapshot_age_ms`; per link
+  Top level `payload_report` (integer, currently `2`; readers test `>=`) and `snapshot_age_ms`; per link
   `payload_packets_total`, `payload_bytes_total`, `payload_age_ms` (omitted until the
   link's first payload packet) and `payload_held_out`, in both `get_stats` and the
   `--stats-file` document. Payload is SRT data routed to the link as its unique copy;
@@ -74,6 +74,18 @@
   `stall_gated` keeps its meaning (the stall latch, not the routing gate). Absent
   `payload_report` means every payload field is unknown.
   `src/stats.rs`, `src/telemetry_doc.rs`, `docs/CONTROL_PROTOCOL.md`.
+- **Delivery evidence: `payload_report` >= 2, OPTIONAL additive fields.** Per link, in
+  both `get_stats` and the `--stats-file` document: `packets_sent_total` and
+  `srtla_acked_packets_total` (SRT data only, no SRT control; monotonic per sender
+  connection), `packets_since_srtla_ack` (data sent since the link's last SRTLA ACK),
+  `routing_healthy` (the last scheduling pass counted the link as a healthy sibling: no
+  stall latch, no silence pull, live, schedulable) and `last_srtla_ack_age_ms` (to the
+  snapshot build; OMITTED before the first ACK and again after recovery or a socket
+  replacement until the next one, never `null` or `0`). Recovery and socket replacement
+  reset the age and the gap; SRTLA ACKs queued by a replaced socket are dropped. A
+  reader checks `payload_report >= 2` before reading these and treats them as unknown
+  otherwise; a version 1 reader ignores them. Golden:
+  `tests/fixtures/telemetry-delivery-report.json`.
 - **Fixtures.** `tests/fixtures/*.json` are the producer goldens, written by
   `tests/telemetry_fixtures.rs` (regenerate deliberately with
   `UPDATE_GOLDEN=1 cargo test --test telemetry_fixtures`). `telemetry-legacy-producer.json`

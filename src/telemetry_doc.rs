@@ -26,7 +26,7 @@
 //!
 //! ## Payload routing report
 //!
-//! A sender that writes top-level `payload_report` (currently `1`) also writes,
+//! A sender that writes top-level `payload_report` (`1` or more) also writes,
 //! per connection, `payload_packets_total`, `payload_bytes_total`,
 //! `payload_held_out` and, once the link has carried any, `payload_age_ms`, plus
 //! top-level `snapshot_age_ms`. They say what the scheduler routed, which the
@@ -40,6 +40,23 @@
 //! link's probe trickle never moves these counters. Without `payload_report`
 //! every one of them is unknown; `payload_report` can appear before the first
 //! snapshot, with no `snapshot_age_ms`.
+//!
+//! ## Delivery evidence
+//!
+//! With `payload_report` `2` or more the sender also writes, per connection,
+//! `packets_sent_total` (SRT data: payload and probes),
+//! `srtla_acked_packets_total`, `packets_since_srtla_ack`, `routing_healthy`
+//! and, once an SRTLA ACK has arrived on the link since it was last
+//! (re)established, `last_srtla_ack_age_ms` (to the snapshot build, like
+//! `payload_age_ms`). `srtla_rec` sends one SRTLA ACK per 10 data packets that
+//! arrive on a link, back on that link, so these say what the receiver
+//! confirmed on each path: a link that keeps sending while
+//! `packets_since_srtla_ack` only grows is not delivering. `routing_healthy`
+//! says whether the scheduler's last pass counted the link as a healthy
+//! sibling (no stall latch, no silence pull); the silence pull reacts to a
+//! link going quiet before its gap or ACK age can. The same freshness
+//! rule applies (`snapshot_age_ms` plus the reader's `Date.now() -
+//! last_updated_ms`). A reader of version 1 ignores them.
 //!
 //! ## `schema_version` handling
 //!
@@ -105,6 +122,13 @@ pub struct TelemetryConn {
     pub payload_bytes_total: Option<u64>,
     pub payload_age_ms: Option<u64>,
     pub payload_held_out: Option<bool>,
+    /// Delivery evidence (`payload_report` >= 2, see the module docs); all
+    /// `None` when the producer has nothing to say.
+    pub packets_sent_total: Option<u64>,
+    pub srtla_acked_packets_total: Option<u64>,
+    pub packets_since_srtla_ack: Option<u64>,
+    pub last_srtla_ack_age_ms: Option<u64>,
+    pub routing_healthy: Option<bool>,
 }
 
 /// Serialized per-connection record. `conn_id` is a string and `bitrate_bps` is
@@ -133,6 +157,16 @@ struct ConnRecord {
     payload_age_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload_held_out: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packets_sent_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    srtla_acked_packets_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packets_since_srtla_ack: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_srtla_ack_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_healthy: Option<bool>,
 }
 
 impl From<&TelemetryConn> for ConnRecord {
@@ -154,6 +188,11 @@ impl From<&TelemetryConn> for ConnRecord {
             payload_bytes_total: c.payload_bytes_total,
             payload_age_ms: c.payload_age_ms,
             payload_held_out: c.payload_held_out,
+            packets_sent_total: c.packets_sent_total,
+            srtla_acked_packets_total: c.srtla_acked_packets_total,
+            packets_since_srtla_ack: c.packets_since_srtla_ack,
+            last_srtla_ack_age_ms: c.last_srtla_ack_age_ms,
+            routing_healthy: c.routing_healthy,
         }
     }
 }
@@ -308,6 +347,11 @@ pub fn conns_from_stats(stats: &StatsSnapshot) -> Vec<TelemetryConn> {
                 payload_bytes_total: Some(l.payload_bytes_total),
                 payload_age_ms: l.payload_age_ms,
                 payload_held_out: Some(l.payload_held_out),
+                packets_sent_total: Some(l.packets_sent_total),
+                srtla_acked_packets_total: Some(l.srtla_acked_packets_total),
+                packets_since_srtla_ack: Some(l.packets_since_srtla_ack),
+                last_srtla_ack_age_ms: l.last_srtla_ack_age_ms,
+                routing_healthy: Some(l.routing_healthy),
             }
         })
         .collect()

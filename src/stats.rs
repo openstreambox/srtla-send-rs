@@ -247,6 +247,45 @@ pub struct LinkStats {
     /// silence pulls. Informational: decide whether a link carries the stream
     /// on `payload_age_ms` only.
     pub payload_held_out: bool,
+
+    // --- Delivery evidence (`payload_report` >= 2) ---
+    //
+    // What the receiver confirmed on this link. `srtla_rec` sends one SRTLA
+    // ACK per 10 data packets that arrive on a link, on that link, so these
+    // count delivery over this path whatever the sender's packet logs hold.
+    /// SRT data datagrams queued on this link (payload, retransmits, duplicate
+    /// probes), the ones the receiver can acknowledge. SRT control datagrams
+    /// are excluded, although `bytes_sent_total` includes their bytes.
+    /// Monotonic per sender connection, like `payload_packets_total`.
+    pub packets_sent_total: u64,
+    /// Packets the receiver acknowledged, in SRTLA ACKs arriving on this link,
+    /// as received on this link. Monotonic per sender connection. Scaled by
+    /// the mean data packet size (`payload_bytes_total / payload_packets_total`)
+    /// it gives this path's delivered byte rate as the receiver saw it, which
+    /// the sender's own counters cannot show.
+    pub srtla_acked_packets_total: u64,
+    /// Milliseconds from the last SRTLA ACK that arrived on this link to the
+    /// moment this snapshot was built. Absent before the first one, and again
+    /// after recovery or a socket replacement until the next one: evidence
+    /// from before the link was re-established does not count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_srtla_ack_age_ms: Option<u64>,
+    /// SRT data datagrams (payload and probes) queued on this link since that
+    /// SRTLA ACK, or since recovery, socket replacement or the connection's
+    /// start when `last_srtla_ack_age_ms` is absent. A delivering link cycles
+    /// through about 10 / delivery ratio; a black-holed one only grows. Lets a
+    /// consumer judge delivery from one sample, with no baseline.
+    pub packets_since_srtla_ack: u64,
+    /// Whether the last scheduling pass (one per SRT packet) counted this link
+    /// as a healthy sibling: not timed out, schedulable, stall latch off and
+    /// silence pull off. The silence pull engages within max(250 ms, 2 x SRTT)
+    /// of a loaded link going silent, well before its packet gap or ACK age
+    /// can show it, after which the link gets only duplicate probes and its
+    /// gap stops growing. Unlike `payload_held_out` it also stays false for a
+    /// pulled or latched link that carries payload because no healthy link is
+    /// left. A consumer must not rely on a link that reads false here as
+    /// delivering.
+    pub routing_healthy: bool,
 }
 
 impl Default for LinkStats {
@@ -302,6 +341,11 @@ impl Default for LinkStats {
             payload_bytes_total: 0,
             payload_age_ms: None,
             payload_held_out: false,
+            packets_sent_total: 0,
+            srtla_acked_packets_total: 0,
+            last_srtla_ack_age_ms: None,
+            packets_since_srtla_ack: 0,
+            routing_healthy: false,
         }
     }
 }
@@ -360,9 +404,13 @@ pub struct StatsSnapshot {
     #[serde(flatten)]
     pub bind_map: crate::bind_map::BindMapReport,
 
-    /// Version of the payload routing report: the per-link `payload_*` fields
-    /// and `snapshot_age_ms`. Absent from older senders. A consumer that finds
-    /// it absent must treat every `payload_*` field as unknown, not as zero.
+    /// Version of the payload routing report. `1` promises the per-link
+    /// `payload_*` fields and `snapshot_age_ms`; `2` adds the per-link
+    /// delivery evidence (`packets_sent_total`, `srtla_acked_packets_total`,
+    /// `packets_since_srtla_ack`, `last_srtla_ack_age_ms`, `routing_healthy`)
+    /// in `get_stats` and in the stats file. Consumers test `>=`. Absent from older senders. A
+    /// consumer that finds it absent must treat every one of these fields as
+    /// unknown, not as zero.
     /// It is present from startup, before the first snapshot is built, so a
     /// document can carry it with no links and no `snapshot_age_ms` yet.
     pub payload_report: u32,
@@ -380,10 +428,11 @@ pub struct StatsSnapshot {
 }
 
 /// Current version of the payload routing report (see
-/// [`StatsSnapshot::payload_report`]). Bump it only for a change an existing
-/// consumer of these fields could not survive; an added optional field does
-/// not bump it.
-pub const PAYLOAD_REPORT_VERSION: u32 = 1;
+/// [`StatsSnapshot::payload_report`]). Each version promises every field of
+/// the ones before it, so a consumer tests `>=` the version that introduced
+/// the fields it relies on. Bump it when the promised set grows; a field that
+/// is only informational does not need a bump.
+pub const PAYLOAD_REPORT_VERSION: u32 = 2;
 
 impl Default for StatsSnapshot {
     fn default() -> Self {
@@ -639,6 +688,11 @@ impl SharedStats {
                 payload_bytes_total: conn.payload_bytes_total(),
                 payload_age_ms: conn.payload_age_ms(current_time_ms),
                 payload_held_out: conn.is_payload_held_out(),
+                packets_sent_total: conn.packets_sent_total(),
+                srtla_acked_packets_total: conn.srtla_acked_packets_total(),
+                last_srtla_ack_age_ms: conn.last_srtla_ack_age_ms(current_time_ms),
+                packets_since_srtla_ack: conn.packets_since_srtla_ack(),
+                routing_healthy: conn.is_routing_healthy(),
             };
 
             if is_active {

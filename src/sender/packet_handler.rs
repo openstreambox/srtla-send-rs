@@ -91,6 +91,12 @@ pub async fn process_connection_events(
         }
     }
 
+    // `srtla_rec` lists in an SRTLA ACK only packets it received on the link
+    // that carries the ACK, so the arrival link is the one that delivered them.
+    if !incoming.srtla_ack_numbers.is_empty() {
+        connections[idx].note_srtla_ack_arrival(incoming.srtla_ack_numbers.len(), current_time_ms);
+    }
+
     for srtla_ack in incoming.srtla_ack_numbers.iter() {
         // Match the arrival link's packet log FIRST. The receiver sends an
         // SRTLA ACK back on the link that delivered the packet, and with
@@ -145,6 +151,18 @@ pub async fn handle_uplink_packet(
     config: &DynamicConfig,
 ) {
     if packet.bytes.is_empty() {
+        return;
+    }
+    // A datagram the link's previous socket queued before a rebuild belongs to
+    // a path the link no longer uses. Counting it would credit the new socket
+    // with a late REG3, keepalive echo or SRTLA ACK it never earned.
+    if let Some(io) = conn_io.get(&packet.conn_id)
+        && io.socket.generation() != packet.generation
+    {
+        debug!(
+            "dropping a datagram from a retired socket of uplink {}",
+            packet.conn_id
+        );
         return;
     }
     if let Some(idx) = connections.iter().position(|c| c.conn_id == packet.conn_id) {

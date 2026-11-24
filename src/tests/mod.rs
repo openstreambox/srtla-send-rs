@@ -29,6 +29,15 @@ pub mod sender_tests;
 pub mod stall_deselect_tests;
 
 #[cfg(test)]
+pub mod link_delivery_tests;
+
+#[cfg(test)]
+pub mod delivery_evidence_tests;
+
+#[cfg(test)]
+pub mod socket_generation_tests;
+
+#[cfg(test)]
 pub mod protocol_tests;
 
 #[cfg(test)]
