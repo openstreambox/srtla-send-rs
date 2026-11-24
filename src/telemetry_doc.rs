@@ -24,6 +24,18 @@
 //! The top level carries the same three-optional pattern: `bytes_sent_total`,
 //! `bind_map_status`, `disposition`.
 //!
+//! ## Payload routing report
+//!
+//! A sender that writes top-level `payload_report` (currently `1`) also writes,
+//! per connection, `payload_packets_total`, `payload_bytes_total`,
+//! `payload_held_out` and, once the link has carried any, `payload_age_ms`, plus
+//! top-level `snapshot_age_ms`. They say what the scheduler routed, which the
+//! gates alone cannot: `payload_age_ms` is the time from the last SRT data
+//! packet routed to the link as its unique copy to the moment the snapshot was
+//! built, and `snapshot_age_ms` is the time from that build to this publish.
+//! Duplicate probes are not payload, so a held-out link's probe trickle never
+//! moves these counters. Without `payload_report` every one of them is unknown.
+//!
 //! ## `schema_version` handling
 //!
 //! `schema_version` stays **1**. It names the shape of the *required* fields,
@@ -82,6 +94,12 @@ pub struct TelemetryConn {
     pub iface: Option<String>,
     /// The sidecar's writer-assigned identity, echoed; `None` when unmapped.
     pub link_id: Option<String>,
+    /// Payload routing report (see the module docs); all `None` when the
+    /// producer has nothing to say.
+    pub payload_packets_total: Option<u64>,
+    pub payload_bytes_total: Option<u64>,
+    pub payload_age_ms: Option<u64>,
+    pub payload_held_out: Option<bool>,
 }
 
 /// Serialized per-connection record. `conn_id` is a string and `bitrate_bps` is
@@ -102,6 +120,14 @@ struct ConnRecord {
     iface: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     link_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_packets_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_bytes_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_held_out: Option<bool>,
 }
 
 impl From<&TelemetryConn> for ConnRecord {
@@ -119,6 +145,10 @@ impl From<&TelemetryConn> for ConnRecord {
             bytes_sent_total: c.bytes_sent_total,
             iface: c.iface.clone(),
             link_id: c.link_id.clone(),
+            payload_packets_total: c.payload_packets_total,
+            payload_bytes_total: c.payload_bytes_total,
+            payload_age_ms: c.payload_age_ms,
+            payload_held_out: c.payload_held_out,
         }
     }
 }
@@ -137,6 +167,10 @@ struct TelemetryDoc<'a> {
     bind_map_status: Option<&'a BindMapStatusRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disposition: Option<&'a DispositionRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_report: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_age_ms: Option<u64>,
 }
 
 /// Everything a snapshot document is built from, other than its timestamp.
@@ -153,6 +187,10 @@ pub struct TelemetryInputs<'a> {
     pub conns: &'a [TelemetryConn],
     pub session_bytes_sent: Option<u64>,
     pub bind_map: Option<&'a BindMapReport>,
+    /// Version of the payload routing report, `None` to leave it out.
+    pub payload_report: Option<u32>,
+    /// Age of the stats snapshot at publish time.
+    pub snapshot_age_ms: Option<u64>,
 }
 
 /// Serialize one snapshot to the exact ADR-001 JSON object (compact,
@@ -167,6 +205,8 @@ pub fn build_telemetry_json(last_updated_ms: u64, inputs: &TelemetryInputs<'_>) 
         bytes_sent_total: inputs.session_bytes_sent,
         bind_map_status: inputs.bind_map.map(|r| &r.bind_map_status),
         disposition: inputs.bind_map.map(|r| &r.disposition),
+        payload_report: inputs.payload_report,
+        snapshot_age_ms: inputs.snapshot_age_ms,
     };
     // The doc is plain scalars / strings, so serialization cannot fail; fall back
     // to an empty object defensively rather than panicking on the hot path.
@@ -185,6 +225,8 @@ pub fn build_telemetry_json_from_stats(last_updated_ms: u64, stats: &StatsSnapsh
             conns: &conns_from_stats(stats),
             session_bytes_sent: Some(stats.session_bytes_sent),
             bind_map: Some(&stats.bind_map),
+            payload_report: Some(stats.payload_report),
+            snapshot_age_ms: stats.snapshot_age_ms,
         },
     )
 }
@@ -257,6 +299,10 @@ pub fn conns_from_stats(stats: &StatsSnapshot) -> Vec<TelemetryConn> {
                 // neither, and the key is then omitted rather than emptied.
                 iface: l.iface.clone(),
                 link_id: l.link_id.clone(),
+                payload_packets_total: Some(l.payload_packets_total),
+                payload_bytes_total: Some(l.payload_bytes_total),
+                payload_age_ms: l.payload_age_ms,
+                payload_held_out: Some(l.payload_held_out),
             }
         })
         .collect()
@@ -293,8 +339,7 @@ mod tests {
             in_flight: 100,
             bitrate_bytes_per_sec: 312_500,
             bytes_sent_total: Some(812_000_000),
-            iface: None,
-            link_id: None,
+            ..TelemetryConn::default()
         }
     }
 
@@ -553,6 +598,7 @@ mod tests {
                 conns: &[],
                 session_bytes_sent: Some(0),
                 bind_map: Some(&report),
+                ..TelemetryInputs::default()
             },
         );
         let frozen_end = doc

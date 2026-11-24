@@ -69,6 +69,31 @@ Result:
 
 Return per-link telemetry (the JSON previously returned by `stats`).
 
+#### Payload routing report
+
+A sender that sets top-level `payload_report` (currently `1`) also reports what
+the scheduler routed, per link:
+
+| Field | Meaning |
+| --- | --- |
+| `payload_packets_total` | SRT data packets routed to this link as their unique copy, SRT retransmissions included. Duplicate probes, keepalives, registration and SRT control packets are not counted. Monotonic over the link's life. |
+| `payload_bytes_total` | Bytes of those packets. |
+| `payload_age_ms` | Time from the last payload packet routed to this link to the moment the snapshot was built. Absent until the first one. |
+| `payload_held_out` | The last scheduling pass held this link out of unique payload (stall gate or quality gate), so it gets at most duplicate probes. Recomputed per packet. |
+
+and at the top level `snapshot_age_ms`, the time from building the snapshot to
+reading it. A link carried payload within the last `W` ms of the read when
+`payload_age_ms + snapshot_age_ms <= W`.
+
+Use these, not `stall_gated`, to decide whether a link carries the stream.
+`stall_gated` reports the stall latch. The latch gates routing only while a
+healthy sibling can carry the traffic, so a latched link with no healthy sibling
+carries the whole stream while `stall_gated` stays `true`. `bytes_sent_total`
+also counts duplicate probes, so it moves on a held-out link too.
+
+Without `payload_report` every one of these fields is unknown, never zero. The
+`--stats-file` document carries the same fields under the same names.
+
 ## Subscriptions
 
 The Unix control socket supports server-push subscriptions. Polling `get_stats` at 1 Hz misses sub-second link-state changes (NAK bursts, quality drops, reconnects); subscriptions let clients receive push events on the same socket they already use for requests.

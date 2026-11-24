@@ -61,6 +61,14 @@
   `schema_version` names the shape of the REQUIRED fields;
   never bump it for an additive field. Types are projected from `src/bind_map/report.rs`;
   do not introduce a parallel status type.
+- **Payload routing report: OPTIONAL additive fields, `schema_version` stays 1.**
+  Top level `payload_report` (integer, currently `1`) and `snapshot_age_ms`; per link
+  `payload_packets_total`, `payload_bytes_total`, `payload_age_ms` (omitted until the
+  link's first payload packet) and `payload_held_out`, in both `get_stats` and the
+  `--stats-file` document. Payload is SRT data routed to the link as its unique copy;
+  duplicate probes never count. `stall_gated` keeps its meaning (the stall latch, not
+  the routing gate). Absent `payload_report` means every payload field is unknown.
+  `src/stats.rs`, `src/telemetry_doc.rs`, `docs/CONTROL_PROTOCOL.md`.
 - **Fixtures.** `tests/fixtures/*.json` are the producer goldens, written by
   `tests/telemetry_fixtures.rs` (regenerate deliberately with
   `UPDATE_GOLDEN=1 cargo test --test telemetry_fixtures`). `telemetry-legacy-producer.json`
