@@ -120,9 +120,9 @@ ACK over a sibling does not hide delivery.
 
 | Field | Meaning |
 | --- | --- |
-| `packets_sent_total` | Data datagrams queued on the link: payload, SRT retransmissions and duplicate probes. Counted where `bytes_sent_total` is counted. |
+| `packets_sent_total` | SRT data datagrams queued on the link: payload, SRT retransmissions and duplicate probes, the datagrams the receiver can acknowledge. SRT control datagrams forwarded from the caller are not counted, although `bytes_sent_total` includes their bytes. |
 | `srtla_acked_packets_total` | Sequence numbers listed in SRTLA ACKs that arrived on the link: delivery over that path as the receiver saw it. |
-| `packets_since_srtla_ack` | Data datagrams (payload and probes) queued on the link since its last SRTLA ACK arrived, or since the link was last (re)established when none has arrived since. A delivering link cycles through about 10 divided by its delivery ratio; a black-holed one only grows. |
+| `packets_since_srtla_ack` | SRT data datagrams (payload and probes, no SRT control) queued on the link since its last SRTLA ACK arrived, or since the link was last (re)established when none has arrived since. A delivering link cycles through about 10 divided by its delivery ratio; a black-holed one only grows. |
 | `last_srtla_ack_age_ms` | Time from the last SRTLA ACK on the link to the moment the snapshot was built. Absent before the first, and again after recovery or a socket replacement until the next one. Keepalive replies do not reset it. |
 
 `packets_sent_total` and `srtla_acked_packets_total` are monotonic per sender
@@ -135,8 +135,10 @@ ACK.
 Use `packets_since_srtla_ack` with `last_srtla_ack_age_ms` to judge from one
 sample whether a link delivers: count packets, not seconds, because a link that
 gets only probes (1 in 100 packets) sees an ACK every 1,000 stream packets. For
-a delivered rate, take deltas of `srtla_acked_packets_total` over time and scale
-by `bytes_sent_total / packets_sent_total` for that link. The receiver holds up
+a delivered byte rate, take deltas of `srtla_acked_packets_total` over time and
+scale by the link's mean data packet size, `payload_bytes_total /
+payload_packets_total`; `bytes_sent_total / packets_sent_total` overstates it,
+because `bytes_sent_total` also counts SRT control bytes. The receiver holds up
 to 9 packets per link before it sends an ACK, so the count trails the wire by
 that batch.
 

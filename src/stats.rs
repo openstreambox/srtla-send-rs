@@ -253,14 +253,16 @@ pub struct LinkStats {
     // What the receiver confirmed on this link. `srtla_rec` sends one SRTLA
     // ACK per 10 data packets that arrive on a link, on that link, so these
     // count delivery over this path whatever the sender's packet logs hold.
-    /// Data datagrams queued on this link (payload, retransmits, duplicate
-    /// probes). Monotonic per sender connection, like `payload_packets_total`.
+    /// SRT data datagrams queued on this link (payload, retransmits, duplicate
+    /// probes), the ones the receiver can acknowledge. SRT control datagrams
+    /// are excluded, although `bytes_sent_total` includes their bytes.
+    /// Monotonic per sender connection, like `payload_packets_total`.
     pub packets_sent_total: u64,
     /// Packets the receiver acknowledged, in SRTLA ACKs arriving on this link,
-    /// as received on this link. Monotonic per sender connection. With
-    /// `packets_sent_total` and `bytes_sent_total` a consumer gets this path's
-    /// delivered rate as the receiver saw it, which the sender's own counters
-    /// cannot show.
+    /// as received on this link. Monotonic per sender connection. Scaled by
+    /// the mean data packet size (`payload_bytes_total / payload_packets_total`)
+    /// it gives this path's delivered byte rate as the receiver saw it, which
+    /// the sender's own counters cannot show.
     pub srtla_acked_packets_total: u64,
     /// Milliseconds from the last SRTLA ACK that arrived on this link to the
     /// moment this snapshot was built. Absent before the first one, and again
@@ -268,7 +270,7 @@ pub struct LinkStats {
     /// from before the link was re-established does not count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_srtla_ack_age_ms: Option<u64>,
-    /// Data datagrams (payload and probes) queued on this link since that
+    /// SRT data datagrams (payload and probes) queued on this link since that
     /// SRTLA ACK, or since recovery, socket replacement or the connection's
     /// start when `last_srtla_ack_age_ms` is absent. A delivering link cycles
     /// through about 10 / delivery ratio; a black-holed one only grows. Lets a

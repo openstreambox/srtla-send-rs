@@ -44,7 +44,7 @@
 //! ## Delivery evidence
 //!
 //! With `payload_report` `2` or more the sender also writes, per connection,
-//! `packets_sent_total` (payload and probes), `srtla_acked_packets_total`,
+//! `packets_sent_total` (SRT data: payload and probes), `srtla_acked_packets_total`,
 //! `packets_since_srtla_ack` and, once an SRTLA ACK has arrived on the link
 //! since it was last (re)established, `last_srtla_ack_age_ms` (to the snapshot
 //! build, like `payload_age_ms`). `srtla_rec` sends one SRTLA ACK per 10 data

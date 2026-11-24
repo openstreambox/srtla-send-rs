@@ -447,8 +447,10 @@ pub struct SrtlaConnection {
     /// `now_ms()` when the scheduler last handed this link a payload packet;
     /// `None` until the first one.
     pub(crate) last_payload_ms: Option<u64>,
-    /// Data datagrams queued on this link (payload, retransmits and duplicate
-    /// probes alike), counted at the same site as `bitrate.bytes_sent_total`.
+    /// SRT data datagrams queued on this link (payload, retransmits and
+    /// duplicate probes alike): every datagram the receiver can acknowledge in
+    /// an SRTLA ACK. SRT control datagrams are not counted, although
+    /// `bitrate.bytes_sent_total` includes their bytes.
     /// Monotonic over this connection's life, like `payload_packets_total`:
     /// recovery and socket replacement keep it, a reload that changes the
     /// link's socket key builds a new connection that starts at zero.
@@ -463,10 +465,11 @@ pub struct SrtlaConnection {
     /// again after recovery or a socket replacement (see `reset_core_state`).
     /// Unlike `last_ack_or_rtt_sample_ms`, keepalive replies never stamp it.
     pub(crate) last_srtla_ack_ms: u64,
-    /// Data datagrams (payload and probes) queued on this link since the last
-    /// SRTLA ACK arrived on it, or since the last recovery or socket
-    /// replacement (or the connection's start) when no ACK has arrived since. A healthy link cycles through roughly
-    /// `RECV_ACK_INT` (10) / delivery ratio; a black-holed one only grows.
+    /// SRT data datagrams (payload and probes, no SRT control) queued on this
+    /// link since the last SRTLA ACK arrived on it, or since the last recovery
+    /// or socket replacement (or the connection's start) when no ACK has
+    /// arrived since. A healthy link cycles through roughly `RECV_ACK_INT`
+    /// (10) / delivery ratio; a black-holed one only grows.
     pub(crate) packets_since_srtla_ack: u64,
     /// Per-link liveness timeout in ms. Refreshed from the config snapshot on
     /// every selection pass so `is_timed_out` (called from paths that do not
@@ -650,9 +653,12 @@ impl SrtlaConnection {
             self.payload_packets_total = self.payload_packets_total.saturating_add(1);
             self.payload_bytes_total = self.payload_bytes_total.saturating_add(data.len() as u64);
             self.last_payload_ms = Some(send_time_ms);
+            // Only datagrams with a sequence number can be acknowledged in an
+            // SRTLA ACK; SRT control (ACK, NAK, keepalive from the caller)
+            // would grow the gap without ever earning one.
+            self.packets_sent_total = self.packets_sent_total.saturating_add(1);
+            self.packets_since_srtla_ack = self.packets_since_srtla_ack.saturating_add(1);
         }
-        self.packets_sent_total = self.packets_sent_total.saturating_add(1);
-        self.packets_since_srtla_ack = self.packets_since_srtla_ack.saturating_add(1);
         self.batch_sender.queue_packet(data, seq, send_time_ms)
     }
 

@@ -154,6 +154,27 @@ mod tests {
                 .position(|(c, b)| c.payload_packets_total() > *b);
             (seq, link)
         }
+
+        /// One SRT control datagram (an SRT ACK from the caller: top bit set,
+        /// so no sequence number) through the production send path.
+        async fn send_control(&mut self, conns: &mut [SrtlaConnection]) {
+            let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000);
+            let mut buf = [0u8; 44];
+            buf[..4].copy_from_slice(&0x8002_0000u32.to_be_bytes());
+            handle_srt_packet(
+                Ok((buf.len(), client)),
+                &mut buf,
+                conns,
+                &mut self.conn_io,
+                &mut self.last_selected_idx,
+                &mut self.seq_tracker,
+                &mut self.last_client_addr,
+                true,
+                &enhanced(),
+                &self.critical_window,
+            )
+            .await;
+        }
     }
 
     /// The receiver side of the model, as `srtla_rec` does it: each packet
@@ -265,6 +286,43 @@ mod tests {
         assert!(
             !delivering(&v, l1),
             "link 1 carries but does not deliver: {l1}"
+        );
+    }
+
+    /// SRT control datagrams the caller sends (SRT ACKs, NAKs, keepalives) are
+    /// forwarded over a link like data, but carry no sequence number, so the
+    /// receiver never lists them in an SRTLA ACK. They must not grow the gap
+    /// or the sent total, or control traffic alone could push a delivering
+    /// link past the threshold.
+    #[tokio::test]
+    async fn forwarded_srt_control_does_not_count_toward_the_gap() {
+        let mut conns = create_test_connections(1).await;
+        let mut path = Path::new(&conns);
+        for _ in 0..3 {
+            keep_unlatched(&mut conns[0], now_ms());
+            path.send_one(&mut conns).await;
+        }
+        let bytes_after_data = stats_json(&conns)["links"][0]["bytes_sent_total"]
+            .as_u64()
+            .unwrap();
+        for _ in 0..40 {
+            keep_unlatched(&mut conns[0], now_ms());
+            path.send_control(&mut conns).await;
+        }
+        let v = stats_json(&conns);
+        let row = &v["links"][0];
+        assert!(
+            row["bytes_sent_total"].as_u64().unwrap() > bytes_after_data,
+            "precondition: the control datagrams went out on the link: {row}"
+        );
+        assert_eq!(row["payload_packets_total"], 3);
+        assert_eq!(
+            row["packets_sent_total"], 3,
+            "control is not counted: {row}"
+        );
+        assert_eq!(
+            row["packets_since_srtla_ack"], 3,
+            "control does not grow the gap: {row}"
         );
     }
 
