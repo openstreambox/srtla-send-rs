@@ -62,6 +62,7 @@ fn build_connection(local_ip: IpAddr, label: String) -> SrtlaConnection {
         packets_sent_total: 0,
         srtla_acked_packets_total: 0,
         last_srtla_ack_ms: 0,
+        packets_since_srtla_ack: 0,
         conn_timeout_ms: crate::config_snapshot::CONN_TIMEOUT_MS,
         delay_budget_ms: 0,
         rtt: RttTracker::default(),

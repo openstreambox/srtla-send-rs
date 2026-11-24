@@ -247,18 +247,33 @@ pub struct LinkStats {
     /// silence pulls. Informational: decide whether a link carries the stream
     /// on `payload_age_ms` only.
     pub payload_held_out: bool,
-    /// Data datagrams queued on this link since the process started
-    /// (payload, retransmits, duplicate probes). Monotonic.
+
+    // --- Delivery evidence (`payload_report` >= 2) ---
+    //
+    // What the receiver confirmed on this link. `srtla_rec` sends one SRTLA
+    // ACK per 10 data packets that arrive on a link, on that link, so these
+    // count delivery over this path whatever the sender's packet logs hold.
+    /// Data datagrams queued on this link (payload, retransmits, duplicate
+    /// probes). Monotonic per sender connection, like `payload_packets_total`.
     pub packets_sent_total: u64,
     /// Packets the receiver acknowledged, in SRTLA ACKs arriving on this link,
-    /// as received on this link. Monotonic. With `packets_sent_total` and
-    /// `bytes_sent_total` a consumer gets this path's delivered rate as the
-    /// receiver saw it, which the sender's own counters cannot show.
+    /// as received on this link. Monotonic per sender connection. With
+    /// `packets_sent_total` and `bytes_sent_total` a consumer gets this path's
+    /// delivered rate as the receiver saw it, which the sender's own counters
+    /// cannot show.
     pub srtla_acked_packets_total: u64,
-    /// Milliseconds since an SRTLA ACK last arrived on this link. Absent
-    /// before the first one.
+    /// Milliseconds from the last SRTLA ACK that arrived on this link to the
+    /// moment this snapshot was built. Absent before the first one, and again
+    /// after recovery or a socket replacement until the next one: evidence
+    /// from before the link was re-established does not count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_srtla_ack_age_ms: Option<u64>,
+    /// Data datagrams (payload and probes) queued on this link since that
+    /// SRTLA ACK, or since recovery, socket replacement or the connection's
+    /// start when `last_srtla_ack_age_ms` is absent. A delivering link cycles
+    /// through about 10 / delivery ratio; a black-holed one only grows. Lets a
+    /// consumer judge delivery from one sample, with no baseline.
+    pub packets_since_srtla_ack: u64,
 }
 
 impl Default for LinkStats {
@@ -317,6 +332,7 @@ impl Default for LinkStats {
             packets_sent_total: 0,
             srtla_acked_packets_total: 0,
             last_srtla_ack_age_ms: None,
+            packets_since_srtla_ack: 0,
         }
     }
 }
@@ -375,9 +391,13 @@ pub struct StatsSnapshot {
     #[serde(flatten)]
     pub bind_map: crate::bind_map::BindMapReport,
 
-    /// Version of the payload routing report: the per-link `payload_*` fields
-    /// and `snapshot_age_ms`. Absent from older senders. A consumer that finds
-    /// it absent must treat every `payload_*` field as unknown, not as zero.
+    /// Version of the payload routing report. `1` promises the per-link
+    /// `payload_*` fields and `snapshot_age_ms`; `2` adds the per-link
+    /// delivery evidence (`packets_sent_total`, `srtla_acked_packets_total`,
+    /// `packets_since_srtla_ack`, `last_srtla_ack_age_ms`) in `get_stats` and
+    /// in the stats file. Consumers test `>=`. Absent from older senders. A
+    /// consumer that finds it absent must treat every one of these fields as
+    /// unknown, not as zero.
     /// It is present from startup, before the first snapshot is built, so a
     /// document can carry it with no links and no `snapshot_age_ms` yet.
     pub payload_report: u32,
@@ -395,10 +415,11 @@ pub struct StatsSnapshot {
 }
 
 /// Current version of the payload routing report (see
-/// [`StatsSnapshot::payload_report`]). Bump it only for a change an existing
-/// consumer of these fields could not survive; an added optional field does
-/// not bump it.
-pub const PAYLOAD_REPORT_VERSION: u32 = 1;
+/// [`StatsSnapshot::payload_report`]). Each version promises every field of
+/// the ones before it, so a consumer tests `>=` the version that introduced
+/// the fields it relies on. Bump it when the promised set grows; a field that
+/// is only informational does not need a bump.
+pub const PAYLOAD_REPORT_VERSION: u32 = 2;
 
 impl Default for StatsSnapshot {
     fn default() -> Self {
@@ -657,6 +678,7 @@ impl SharedStats {
                 packets_sent_total: conn.packets_sent_total(),
                 srtla_acked_packets_total: conn.srtla_acked_packets_total(),
                 last_srtla_ack_age_ms: conn.last_srtla_ack_age_ms(current_time_ms),
+                packets_since_srtla_ack: conn.packets_since_srtla_ack(),
             };
 
             if is_active {

@@ -78,7 +78,7 @@ Five Miri filters, cross-channel/OS lanes, privileged netns prerequisites, stall
 - No hello, subscribe-events, kebab-case methods or replay-on-subscribe; immediate state requires get_stats after subscribe.
 - ADR-001 schema_version=1; rtt_ms is Kalman-smoothed RTT in ms; bitrate_bps is wire bytes/s ×8; additions optional, absent means unknown.
 - Keep bytes_sent_total process-monotonic in bytes; never reset on replacement or reload, never treat missing as zero.
-- payload_* (payload_report >= 1) is the carrying signal; stall_gated stays the latch. Contract: docs/CONTROL_PROTOCOL.md.
+- payload_* (payload_report >= 1) is the carrying signal; stall_gated stays the latch. packets_since_srtla_ack and last_srtla_ack_age_ms (payload_report >= 2) are the delivery signal. Contract: docs/CONTROL_PROTOCOL.md.
 - Capability probe keys are frozen; nonzero exit, malformed output or timeout means no support, regardless of error wording.
 - --bind-map stays optional; IP-list bytes stay unchanged; degraded reload retains the last valid mapped pool.
 - Stable identity is link_id, not IP or (ip, iface); mapped sockets bind both interface and source IP.

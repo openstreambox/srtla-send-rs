@@ -28,6 +28,7 @@
 //! | `telemetry-degraded-reload` | `retained_last_valid` says degraded AND still pinned. |
 //! | `telemetry-unknown-fields` | A FUTURE producer's extra keys do not break today's reader. |
 //! | `telemetry-payload-report` | A latched last link that still carries payload reads not held out, beside a held-out link that is only probed. |
+//! | `telemetry-delivery-report` | `payload_report` 2: a delivering link beside a black-holed one that still carries payload, and a link with no ACK yet. |
 
 use std::path::PathBuf;
 
@@ -415,4 +416,91 @@ fn the_golden_fixture_carries_no_payload_report() {
     let text = std::fs::read_to_string(crate_fixture("telemetry-golden")).expect("committed");
     assert!(!text.contains("payload_"));
     assert!(!text.contains("snapshot_age_ms"));
+}
+
+// ---- Delivery evidence (payload_report 2) ------------------------------------
+
+#[test]
+fn the_delivery_report_fixture_tells_a_delivering_link_from_a_black_holed_one() {
+    // Given: link 0 carries payload and its last SRTLA ACK came 120 ms before
+    // the snapshot, 4 packets ago. Link 1 also carries payload, but 412
+    // packets have gone out since its last ACK 6.4 s ago. Link 2 was just
+    // re-established and has had no ACK yet.
+    let carrying = |c: TelemetryConn| TelemetryConn {
+        payload_age_ms: Some(10),
+        payload_held_out: Some(false),
+        ..c
+    };
+    let conns = [
+        TelemetryConn {
+            payload_packets_total: Some(61_200),
+            payload_bytes_total: Some(80_539_200),
+            packets_sent_total: Some(61_204),
+            srtla_acked_packets_total: Some(61_090),
+            packets_since_srtla_ack: Some(4),
+            last_srtla_ack_age_ms: Some(120),
+            ..carrying(conn(0, Some("modem-a"), Some("wwan0")))
+        },
+        TelemetryConn {
+            payload_packets_total: Some(30_412),
+            payload_bytes_total: Some(40_022_192),
+            packets_sent_total: Some(30_412),
+            srtla_acked_packets_total: Some(30_000),
+            packets_since_srtla_ack: Some(412),
+            last_srtla_ack_age_ms: Some(6_400),
+            ..carrying(conn(1, Some("modem-b"), Some("wwan1")))
+        },
+        TelemetryConn {
+            payload_packets_total: Some(900),
+            payload_bytes_total: Some(1_184_400),
+            packets_sent_total: Some(905),
+            srtla_acked_packets_total: Some(890),
+            packets_since_srtla_ack: Some(7),
+            payload_held_out: Some(true),
+            ..conn(2, Some("modem-c"), Some("wwan2"))
+        },
+    ];
+    let produced = build_telemetry_json(
+        FIXED_MS,
+        &TelemetryInputs {
+            conns: &conns,
+            session_bytes_sent: Some(1_620_000_000),
+            bind_map: Some(&active()),
+            payload_report: Some(2),
+            snapshot_age_ms: Some(120),
+        },
+    );
+
+    assert_fixture("telemetry-delivery-report", &produced);
+    let doc = value(&produced);
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["payload_report"], 2);
+    let c = &doc["connections"];
+    assert_eq!(c[0]["packets_since_srtla_ack"], 4);
+    assert_eq!(c[0]["last_srtla_ack_age_ms"], 120);
+    assert_eq!(c[1]["packets_since_srtla_ack"], 412);
+    assert_eq!(c[1]["srtla_acked_packets_total"], 30_000);
+    assert!(
+        c[2].get("last_srtla_ack_age_ms").is_none(),
+        "no ACK since the link was re-established: the age is omitted, not 0"
+    );
+    assert_eq!(c[2]["packets_since_srtla_ack"], 7);
+}
+
+#[test]
+fn earlier_fixtures_carry_no_delivery_evidence() {
+    // A producer that has nothing to say leaves every evidence key out, so
+    // the existing goldens, including the version 1 payload report, stay
+    // byte-identical and a version 1 reader sees no change.
+    for name in ["telemetry-golden", "telemetry-payload-report"] {
+        let text = std::fs::read_to_string(crate_fixture(name)).expect("committed");
+        for key in [
+            "packets_sent_total",
+            "srtla_acked_packets_total",
+            "packets_since_srtla_ack",
+            "last_srtla_ack_age_ms",
+        ] {
+            assert!(!text.contains(key), "`{key}` in `{name}`");
+        }
+    }
 }

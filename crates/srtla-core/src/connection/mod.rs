@@ -449,17 +449,25 @@ pub struct SrtlaConnection {
     pub(crate) last_payload_ms: Option<u64>,
     /// Data datagrams queued on this link (payload, retransmits and duplicate
     /// probes alike), counted at the same site as `bitrate.bytes_sent_total`.
-    /// Process-monotonic like that counter: a socket replacement keeps it.
+    /// Monotonic over this connection's life, like `payload_packets_total`:
+    /// recovery and socket replacement keep it, a reload that changes the
+    /// link's socket key builds a new connection that starts at zero.
     pub(crate) packets_sent_total: u64,
     /// Sequence numbers the receiver acknowledged in SRTLA ACKs that arrived
     /// on this link. `srtla_rec` lists in an SRTLA ACK only packets it
     /// received on the link that carries the ACK, so this counts delivery
     /// over this path as the receiver saw it, whatever the sender's logs
-    /// hold. Process-monotonic.
+    /// hold. Monotonic over this connection's life, like `packets_sent_total`.
     pub(crate) srtla_acked_packets_total: u64,
-    /// When the last SRTLA ACK arrived on this link, `0` before the first.
+    /// When the last SRTLA ACK arrived on this link, `0` before the first and
+    /// again after recovery or a socket replacement (see `reset_core_state`).
     /// Unlike `last_ack_or_rtt_sample_ms`, keepalive replies never stamp it.
     pub(crate) last_srtla_ack_ms: u64,
+    /// Data datagrams (payload and probes) queued on this link since the last
+    /// SRTLA ACK arrived on it, or since the last recovery or socket
+    /// replacement (or the connection's start) when no ACK has arrived since. A healthy link cycles through roughly
+    /// `RECV_ACK_INT` (10) / delivery ratio; a black-holed one only grows.
+    pub(crate) packets_since_srtla_ack: u64,
     /// Per-link liveness timeout in ms. Refreshed from the config snapshot on
     /// every selection pass so `is_timed_out` (called from paths that do not
     /// carry a config) always sees the current runtime value.
@@ -580,6 +588,7 @@ impl SrtlaConnection {
             packets_sent_total: 0,
             srtla_acked_packets_total: 0,
             last_srtla_ack_ms: 0,
+            packets_since_srtla_ack: 0,
             conn_timeout_ms: crate::config_snapshot::CONN_TIMEOUT_MS,
             delay_budget_ms: 0,
             rtt: RttTracker::default(),
@@ -643,6 +652,7 @@ impl SrtlaConnection {
             self.last_payload_ms = Some(send_time_ms);
         }
         self.packets_sent_total = self.packets_sent_total.saturating_add(1);
+        self.packets_since_srtla_ack = self.packets_since_srtla_ack.saturating_add(1);
         self.batch_sender.queue_packet(data, seq, send_time_ms)
     }
 
@@ -662,6 +672,7 @@ impl SrtlaConnection {
     pub fn queue_probe_packet(&mut self, data: &[u8], seq: u32, send_time_ms: u64) -> bool {
         self.bitrate.update_on_send(data.len() as u64);
         self.packets_sent_total = self.packets_sent_total.saturating_add(1);
+        self.packets_since_srtla_ack = self.packets_since_srtla_ack.saturating_add(1);
         self.record_probe(seq as i32, send_time_ms);
         self.batch_sender.queue_packet(data, None, send_time_ms)
     }
@@ -1363,10 +1374,20 @@ impl SrtlaConnection {
     pub fn note_srtla_ack_arrival(&mut self, acked: usize, now_ms: u64) {
         self.srtla_acked_packets_total =
             self.srtla_acked_packets_total.saturating_add(acked as u64);
-        self.last_srtla_ack_ms = now_ms;
+        // `now_ms()` is never 0 on a running sender; keep the "no ACK yet"
+        // sentinel unambiguous all the same.
+        self.last_srtla_ack_ms = now_ms.max(1);
+        self.packets_since_srtla_ack = 0;
     }
 
-    /// Data datagrams queued on this link over the process lifetime.
+    /// Data datagrams queued on this link since its last SRTLA ACK (see the
+    /// field for what resets it).
+    #[inline(always)]
+    pub fn packets_since_srtla_ack(&self) -> u64 {
+        self.packets_since_srtla_ack
+    }
+
+    /// Data datagrams queued on this link over this connection's life.
     #[inline(always)]
     pub fn packets_sent_total(&self) -> u64 {
         self.packets_sent_total
@@ -1379,7 +1400,7 @@ impl SrtlaConnection {
     }
 
     /// Milliseconds since an SRTLA ACK last arrived on this link, `None`
-    /// before the first.
+    /// before the first and after recovery or a socket replacement.
     #[inline]
     pub fn last_srtla_ack_age_ms(&self, now_ms: u64) -> Option<u64> {
         (self.last_srtla_ack_ms != 0).then(|| now_ms.saturating_sub(self.last_srtla_ack_ms))
@@ -1470,6 +1491,13 @@ impl SrtlaConnection {
         // engagements over the link's life, and a reset is often the *result*
         // of the stall it just latched on.
         self.last_ack_or_rtt_sample_ms = 0;
+        // The same holds for the SRTLA ACK evidence a host reads to decide
+        // whether the link delivers: recovery follows a silent path, and a
+        // replaced socket starts a fresh ACK batch at the receiver (keyed by
+        // source address). The link proves delivery again with its next ACK.
+        // The sent and acked totals survive like `payload_packets_total`.
+        self.last_srtla_ack_ms = 0;
+        self.packets_since_srtla_ack = 0;
         self.stall_gated = false;
         self.stall_latched_since_ms = 0;
         self.stall_recovery_since_ms = 0;
