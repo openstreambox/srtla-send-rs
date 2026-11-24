@@ -32,9 +32,14 @@
 //! top-level `snapshot_age_ms`. They say what the scheduler routed, which the
 //! gates alone cannot: `payload_age_ms` is the time from the last SRT data
 //! packet routed to the link as its unique copy to the moment the snapshot was
-//! built, and `snapshot_age_ms` is the time from that build to this publish.
-//! Duplicate probes are not payload, so a held-out link's probe trickle never
-//! moves these counters. Without `payload_report` every one of them is unknown.
+//! built, and `snapshot_age_ms` is the time from that build to serialising
+//! this document. The writer thread writes and renames it afterwards, so a
+//! reader adds its own `Date.now() - last_updated_ms` (both wall clock on the
+//! same host); a stalled writer or a crashed sender's leftover file then reads
+//! old instead of fresh. Duplicate probes are not payload, so a held-out
+//! link's probe trickle never moves these counters. Without `payload_report`
+//! every one of them is unknown; `payload_report` can appear before the first
+//! snapshot, with no `snapshot_age_ms`.
 //!
 //! ## `schema_version` handling
 //!

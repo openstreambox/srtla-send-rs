@@ -66,8 +66,13 @@
   `payload_packets_total`, `payload_bytes_total`, `payload_age_ms` (omitted until the
   link's first payload packet) and `payload_held_out`, in both `get_stats` and the
   `--stats-file` document. Payload is SRT data routed to the link as its unique copy;
-  duplicate probes never count. `stall_gated` keeps its meaning (the stall latch, not
-  the routing gate). Absent `payload_report` means every payload field is unknown.
+  duplicate probes never count; the counters are monotonic per sender connection (a
+  socket-key change starts a new one at zero). `snapshot_age_ms` is the age at the read
+  on the socket but at serialisation in the file, whose readers add
+  `now - last_updated_ms`. `payload_report` is present before the first snapshot.
+  `payload_held_out` is informational; carrying is decided on `payload_age_ms`.
+  `stall_gated` keeps its meaning (the stall latch, not the routing gate). Absent
+  `payload_report` means every payload field is unknown.
   `src/stats.rs`, `src/telemetry_doc.rs`, `docs/CONTROL_PROTOCOL.md`.
 - **Fixtures.** `tests/fixtures/*.json` are the producer goldens, written by
   `tests/telemetry_fixtures.rs` (regenerate deliberately with

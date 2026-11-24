@@ -437,8 +437,10 @@ pub struct SrtlaConnection {
     /// SRT data packets the scheduler handed to this link as their unique copy
     /// (see [`Self::queue_data_packet`]). Duplicate probes, keepalives,
     /// registration and SRT control packets are not counted, so this moves
-    /// only while the link carries stream data. Monotonic over the
-    /// connection's life: socket replacement and recovery do not reset it.
+    /// only while the link carries stream data. Monotonic over this
+    /// connection's life: socket replacement and recovery do not reset it, but
+    /// a reload that changes the link's socket key builds a new connection
+    /// that starts at zero.
     pub(crate) payload_packets_total: u64,
     /// Bytes of the packets counted in [`Self::payload_packets_total`].
     pub(crate) payload_bytes_total: u64,
@@ -1199,11 +1201,14 @@ impl SrtlaConnection {
 
     /// Whether the last selection pass held this link out of unique payload,
     /// by the stall gate (latch or silence pull, with a healthy sibling
-    /// present) or by a quality gate. This is the condition under which the
-    /// shell sends the link duplicate probes instead of stream data. Unlike
+    /// present) or by a quality gate. A held-out link that is connected gets
+    /// duplicate probes on their cadence instead of stream data. Unlike
     /// [`Self::stall_latched`] it is false when the gate was lifted because no
     /// healthy sibling remained, which is exactly when a latched link still
-    /// carries the stream.
+    /// carries the stream. It is also false for a link selection skips for
+    /// other reasons (timed out, registering, disconnected), and it holds the
+    /// value of the last packet's pass, so it says nothing on its own about
+    /// whether the link carries payload.
     #[inline(always)]
     pub fn is_payload_held_out(&self) -> bool {
         self.stall_gated || self.quality_excluded

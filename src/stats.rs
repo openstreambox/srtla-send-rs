@@ -226,7 +226,9 @@ pub struct LinkStats {
     /// SRT data packets the scheduler routed to this link as their unique
     /// copy, including SRT retransmissions routed here. Duplicate probes,
     /// keepalives, registration and SRT control packets are excluded.
-    /// Monotonic over the link's life like `bytes_sent_total`.
+    /// Monotonic per sender connection, like `bytes_sent_total`: recovery and
+    /// socket replacement keep it, a reload that changes the link's socket key
+    /// starts a new connection at zero.
     pub payload_packets_total: u64,
     /// Bytes of the packets counted in `payload_packets_total`.
     pub payload_bytes_total: u64,
@@ -238,9 +240,12 @@ pub struct LinkStats {
     /// Whether the last scheduling pass held this link out of unique payload
     /// (stall gate or quality gate); such a link gets at most duplicate
     /// probes. False when the stall gate was lifted because no healthy sibling
-    /// remained, even with `stall_gated` (the latch) still set. Recomputed per
-    /// packet, so it can flicker with sub-second silence pulls; decide on
-    /// `payload_age_ms`, not on this flag alone.
+    /// remained, even with `stall_gated` (the latch) still set, and also false
+    /// for a link skipped for other reasons (timed out, registering,
+    /// disconnected). It is the value from the last packet's pass, not
+    /// recomputed when the snapshot is built, and flickers with sub-second
+    /// silence pulls. Informational: decide whether a link carries the stream
+    /// on `payload_age_ms` only.
     pub payload_held_out: bool,
 }
 
@@ -358,10 +363,15 @@ pub struct StatsSnapshot {
     /// Version of the payload routing report: the per-link `payload_*` fields
     /// and `snapshot_age_ms`. Absent from older senders. A consumer that finds
     /// it absent must treat every `payload_*` field as unknown, not as zero.
+    /// It is present from startup, before the first snapshot is built, so a
+    /// document can carry it with no links and no `snapshot_age_ms` yet.
     pub payload_report: u32,
-    /// Milliseconds between building this snapshot and reading it (`get`).
-    /// Absent before the first build. Housekeeping rebuilds it about once a
-    /// second.
+    /// Milliseconds between building this snapshot and the `get` that read
+    /// it. For `get_stats` and the `stats` topic that is the age at the read.
+    /// For the stats file it is the age when the document was serialised,
+    /// before the writer thread writes and renames it: a file reader adds its
+    /// own `now − last_updated_ms`. Absent before the first build.
+    /// Housekeeping rebuilds the snapshot about once a second.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_age_ms: Option<u64>,
     /// `now_ms()` when [`SharedStats::update`] built this snapshot.

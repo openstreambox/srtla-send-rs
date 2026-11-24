@@ -76,14 +76,30 @@ the scheduler routed, per link:
 
 | Field | Meaning |
 | --- | --- |
-| `payload_packets_total` | SRT data packets routed to this link as their unique copy, SRT retransmissions included. Duplicate probes, keepalives, registration and SRT control packets are not counted. Monotonic over the link's life. |
+| `payload_packets_total` | SRT data packets routed to this link as their unique copy, SRT retransmissions included. Duplicate probes, keepalives, registration and SRT control packets are not counted. Monotonic per sender connection: recovery and socket replacement keep it, while a reload that changes the link's address or interface starts a new connection at zero. |
 | `payload_bytes_total` | Bytes of those packets. |
 | `payload_age_ms` | Time from the last payload packet routed to this link to the moment the snapshot was built. Absent until the first one. |
-| `payload_held_out` | The last scheduling pass held this link out of unique payload (stall gate or quality gate), so it gets at most duplicate probes. Recomputed per packet. |
+| `payload_held_out` | The last packet's scheduling pass held this link out of unique payload (stall gate or quality gate), so it gets at most duplicate probes. Also false for links skipped for other reasons (timed out, registering, disconnected). Informational only. |
 
 and at the top level `snapshot_age_ms`, the time from building the snapshot to
-reading it. A link carried payload within the last `W` ms of the read when
-`payload_age_ms + snapshot_age_ms <= W`.
+the `get` that read it.
+
+Freshness differs between the two transports:
+
+- `get_stats` and the `stats` topic: `snapshot_age_ms` is the age at the read.
+  A link carried payload within the last `W` ms of the read when
+  `payload_age_ms + snapshot_age_ms <= W`.
+- `--stats-file`: `snapshot_age_ms` is the age when the document was serialised,
+  before the writer thread wrote and renamed it. Add the time since
+  `last_updated_ms` (wall clock, same host):
+  `payload_age_ms + snapshot_age_ms + (now - last_updated_ms) <= W`. Without that
+  term a stalled writer, or a file left behind by a crashed sender, would read
+  fresh forever.
+
+`payload_report` is present from startup, so a document can carry it before the
+first snapshot exists, with no links and no `snapshot_age_ms`. Decide whether a
+link carries the stream on `payload_age_ms` only; `payload_held_out` is a
+last-packet value that explains why a link gets no payload.
 
 Use these, not `stall_gated`, to decide whether a link carries the stream.
 `stall_gated` reports the stall latch. The latch gates routing only while a
