@@ -27,6 +27,7 @@
 //! | `telemetry-degraded-startup` | `startup_collision_excluded` names the group it broke up. |
 //! | `telemetry-degraded-reload` | `retained_last_valid` says degraded AND still pinned. |
 //! | `telemetry-unknown-fields` | A FUTURE producer's extra keys do not break today's reader. |
+//! | `telemetry-payload-report` | A latched last link that still carries payload reads not held out, beside a held-out link that is only probed. |
 
 use std::path::PathBuf;
 
@@ -84,6 +85,7 @@ fn conn(conn_id: u32, link_id: Option<&str>, iface: Option<&str>) -> TelemetryCo
         bytes_sent_total: Some(812_000_000),
         iface: iface.map(ToString::to_string),
         link_id: link_id.map(ToString::to_string),
+        ..TelemetryConn::default()
     }
 }
 
@@ -94,6 +96,7 @@ fn document(conns: &[TelemetryConn], bind_map: &BindMapReport) -> String {
             conns,
             session_bytes_sent: Some(1_620_000_000),
             bind_map: Some(bind_map),
+            ..TelemetryInputs::default()
         },
     )
 }
@@ -354,4 +357,62 @@ fn the_unknown_field_fixture_is_a_superset_of_a_valid_document() {
         committed["future_top_level_field"],
         "ignored-by-todays-reader"
     );
+}
+
+// ---- Payload routing report --------------------------------------------------
+
+#[test]
+fn the_payload_report_fixture_tells_a_carrying_link_from_a_probed_one() {
+    // Given: link 0 carried payload 40 ms before the snapshot and is not held
+    // out; link 1 is held out, has sent probe bytes, and never carried payload.
+    let conns = [
+        TelemetryConn {
+            payload_packets_total: Some(61_200),
+            payload_bytes_total: Some(80_539_200),
+            payload_age_ms: Some(40),
+            payload_held_out: Some(false),
+            ..conn(0, Some("modem-a"), Some("wwan0"))
+        },
+        TelemetryConn {
+            bytes_sent_total: Some(1_316_000),
+            payload_packets_total: Some(0),
+            payload_bytes_total: Some(0),
+            payload_held_out: Some(true),
+            ..conn(1, Some("modem-b"), Some("wwan1"))
+        },
+    ];
+    let produced = build_telemetry_json(
+        FIXED_MS,
+        &TelemetryInputs {
+            conns: &conns,
+            session_bytes_sent: Some(1_620_000_000),
+            bind_map: Some(&active()),
+            payload_report: Some(1),
+            snapshot_age_ms: Some(120),
+        },
+    );
+
+    // Then: the bytes match the committed producer golden, and the shape is
+    // what a consumer keys on.
+    assert_fixture("telemetry-payload-report", &produced);
+    let doc = value(&produced);
+    assert_eq!(doc["payload_report"], 1);
+    assert_eq!(doc["snapshot_age_ms"], 120);
+    assert_eq!(doc["connections"][0]["payload_age_ms"], 40);
+    assert_eq!(doc["connections"][0]["payload_held_out"], false);
+    assert!(
+        doc["connections"][1].get("payload_age_ms").is_none(),
+        "a link that never carried payload omits its age rather than reporting 0"
+    );
+    assert_eq!(doc["connections"][1]["payload_packets_total"], 0);
+    assert_eq!(doc["connections"][1]["payload_held_out"], true);
+}
+
+#[test]
+fn the_golden_fixture_carries_no_payload_report() {
+    // A producer that has nothing to say leaves every payload key out, so the
+    // existing goldens stay byte-identical.
+    let text = std::fs::read_to_string(crate_fixture("telemetry-golden")).expect("committed");
+    assert!(!text.contains("payload_"));
+    assert!(!text.contains("snapshot_age_ms"));
 }

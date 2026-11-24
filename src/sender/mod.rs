@@ -33,11 +33,15 @@ use housekeeping::handle_housekeeping;
 // pair read).
 #[allow(unused_imports)]
 pub use links::{LinkSource, SenderPaths, read_bind_map};
+use packet_handler::drain_packet_queue;
+// Re-exported for the payload routing report tests, which drive the real send
+// path (selection, the unique copy and the duplicate probes).
+#[allow(unused_imports)]
+pub(crate) use packet_handler::handle_srt_packet;
 // Re-exported for the NAK-attribution conformance tests so they drive the real
 // production path rather than a mirrored copy.
 #[allow(unused_imports)]
 pub(crate) use packet_handler::{attribute_nak, process_connection_events};
-use packet_handler::{drain_packet_queue, handle_srt_packet};
 // Re-exported so the ported DATA-padding test drives the same production flush
 // path the send loop uses, not a mirrored copy.
 #[allow(unused_imports)]

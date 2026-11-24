@@ -166,13 +166,17 @@ pub struct LinkStats {
     // whether this link is pulled out of rotation right now, the counter says
     // how often it has happened over the link's life — the pair is what lets a
     // field run distinguish one clean failover from a flapping link.
-    /// Whether this link's stall LATCH is engaged (out of the payload
-    /// rotation until its rejoin dwell completes; carries keepalives plus a
-    /// 1-in-N duplicate-packet probe trickle). Deliberately sourced from the
-    /// sticky latch, not the routing flag: the sub-second transient silence
+    /// Whether this link's stall LATCH is engaged. Deliberately sourced from
+    /// the sticky latch, not the routing flag: the sub-second transient silence
     /// pull is invisible here, so a capacity-tracking consumer (belacoder)
     /// is not whipsawed by routine HARQ pauses sampled at the 1 s stats
     /// cadence.
+    ///
+    /// The latch alone does not take a link out of the payload rotation: the
+    /// gate applies only while a healthy sibling can carry the traffic. When
+    /// none remains, a latched link keeps carrying unique stream data with
+    /// this flag still set. Read `payload_held_out` and `payload_age_ms` to
+    /// learn whether the link carries the stream.
     pub stall_gated: bool,
     /// Cumulative stall-latch engagements since the link was created.
     pub stall_gate_events: u64,
@@ -212,6 +216,37 @@ pub struct LinkStats {
     /// `in_flight_cap_packets`). When true and at least one other link
     /// is un-gated, this link is being skipped by Enhanced selection.
     pub in_flight_cap_active: bool,
+
+    // --- Payload routing report (`payload_report` >= 1) ---
+    //
+    // What the scheduler actually did with stream data on this link, as
+    // opposed to what its gates say. `bytes_sent_total` also counts the
+    // duplicate probes a held-out link receives, so it cannot tell a link that
+    // carries the stream from one that is only probed; these fields can.
+    /// SRT data packets the scheduler routed to this link as their unique
+    /// copy, including SRT retransmissions routed here. Duplicate probes,
+    /// keepalives, registration and SRT control packets are excluded.
+    /// Monotonic per sender connection, like `bytes_sent_total`: recovery and
+    /// socket replacement keep it, a reload that changes the link's socket key
+    /// starts a new connection at zero.
+    pub payload_packets_total: u64,
+    /// Bytes of the packets counted in `payload_packets_total`.
+    pub payload_bytes_total: u64,
+    /// Milliseconds from the last payload packet routed to this link to the
+    /// moment this snapshot was built. Absent until the first one. Add the
+    /// snapshot's `snapshot_age_ms` for the age at read time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_age_ms: Option<u64>,
+    /// Whether the last scheduling pass held this link out of unique payload
+    /// (stall gate or quality gate); such a link gets at most duplicate
+    /// probes. False when the stall gate was lifted because no healthy sibling
+    /// remained, even with `stall_gated` (the latch) still set, and also false
+    /// for a link skipped for other reasons (timed out, registering,
+    /// disconnected). It is the value from the last packet's pass, not
+    /// recomputed when the snapshot is built, and flickers with sub-second
+    /// silence pulls. Informational: decide whether a link carries the stream
+    /// on `payload_age_ms` only.
+    pub payload_held_out: bool,
 }
 
 impl Default for LinkStats {
@@ -263,6 +298,10 @@ impl Default for LinkStats {
             sole_carrier_elections: 0,
             in_flight_cap_packets: 0,
             in_flight_cap_active: false,
+            payload_packets_total: 0,
+            payload_bytes_total: 0,
+            payload_age_ms: None,
+            payload_held_out: false,
         }
     }
 }
@@ -320,7 +359,31 @@ pub struct StatsSnapshot {
     /// housekeeping tick while this changes only on a reload.
     #[serde(flatten)]
     pub bind_map: crate::bind_map::BindMapReport,
+
+    /// Version of the payload routing report: the per-link `payload_*` fields
+    /// and `snapshot_age_ms`. Absent from older senders. A consumer that finds
+    /// it absent must treat every `payload_*` field as unknown, not as zero.
+    /// It is present from startup, before the first snapshot is built, so a
+    /// document can carry it with no links and no `snapshot_age_ms` yet.
+    pub payload_report: u32,
+    /// Milliseconds between building this snapshot and the `get` that read
+    /// it. For `get_stats` and the `stats` topic that is the age at the read.
+    /// For the stats file it is the age when the document was serialised,
+    /// before the writer thread writes and renames it: a file reader adds its
+    /// own `now − last_updated_ms`. Absent before the first build.
+    /// Housekeeping rebuilds the snapshot about once a second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_age_ms: Option<u64>,
+    /// `now_ms()` when [`SharedStats::update`] built this snapshot.
+    #[serde(skip)]
+    pub built_at_ms: Option<u64>,
 }
+
+/// Current version of the payload routing report (see
+/// [`StatsSnapshot::payload_report`]). Bump it only for a change an existing
+/// consumer of these fields could not survive; an added optional field does
+/// not bump it.
+pub const PAYLOAD_REPORT_VERSION: u32 = 1;
 
 impl Default for StatsSnapshot {
     fn default() -> Self {
@@ -337,6 +400,9 @@ impl Default for StatsSnapshot {
             negotiated_latency_ms: 0,
             links: Vec::new(),
             bind_map: crate::bind_map::BindMapReport::default(),
+            payload_report: PAYLOAD_REPORT_VERSION,
+            snapshot_age_ms: None,
+            built_at_ms: None,
         }
     }
 }
@@ -459,6 +525,7 @@ impl SharedStats {
                 .unwrap_or(0),
             weak_link_selected_delay_ms: classification.map(|c| c.selected_delay_ms).unwrap_or(0),
             negotiated_latency_ms: config.negotiated_latency_ms,
+            built_at_ms: Some(current_time_ms),
             ..Default::default()
         };
 
@@ -568,6 +635,10 @@ impl SharedStats {
                 sole_carrier_elections: conn.sole_carrier_elections(),
                 in_flight_cap_packets: in_flight_cap_pkts,
                 in_flight_cap_active,
+                payload_packets_total: conn.payload_packets_total(),
+                payload_bytes_total: conn.payload_bytes_total(),
+                payload_age_ms: conn.payload_age_ms(current_time_ms),
+                payload_held_out: conn.is_payload_held_out(),
             };
 
             if is_active {
@@ -595,6 +666,9 @@ impl SharedStats {
         if let Ok(guard) = self.bind_map.read() {
             snapshot.bind_map = guard.clone();
         }
+        snapshot.snapshot_age_ms = snapshot
+            .built_at_ms
+            .map(|built| now_ms().saturating_sub(built));
         snapshot
     }
 

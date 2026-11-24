@@ -434,6 +434,19 @@ pub struct SrtlaConnection {
     /// Cumulative silence-pull engagements (rising edges). Expected to tick
     /// on routine cellular HARQ stalls; a high rate is telemetry, not alarm.
     pub(crate) silence_pulls: u64,
+    /// SRT data packets the scheduler handed to this link as their unique copy
+    /// (see [`Self::queue_data_packet`]). Duplicate probes, keepalives,
+    /// registration and SRT control packets are not counted, so this moves
+    /// only while the link carries stream data. Monotonic over this
+    /// connection's life: socket replacement and recovery do not reset it, but
+    /// a reload that changes the link's socket key builds a new connection
+    /// that starts at zero.
+    pub(crate) payload_packets_total: u64,
+    /// Bytes of the packets counted in [`Self::payload_packets_total`].
+    pub(crate) payload_bytes_total: u64,
+    /// `now_ms()` when the scheduler last handed this link a payload packet;
+    /// `None` until the first one.
+    pub(crate) last_payload_ms: Option<u64>,
     /// Per-link liveness timeout in ms. Refreshed from the config snapshot on
     /// every selection pass so `is_timed_out` (called from paths that do not
     /// carry a config) always sees the current runtime value.
@@ -548,6 +561,9 @@ impl SrtlaConnection {
             sole_carrier_elections: 0,
             silence_pulled: false,
             silence_pulls: 0,
+            payload_packets_total: 0,
+            payload_bytes_total: 0,
+            last_payload_ms: None,
             conn_timeout_ms: crate::config_snapshot::CONN_TIMEOUT_MS,
             delay_budget_ms: 0,
             rtt: RttTracker::default(),
@@ -602,6 +618,14 @@ impl SrtlaConnection {
     pub fn queue_data_packet(&mut self, data: &[u8], seq: Option<u32>, send_time_ms: u64) -> bool {
         // Track bytes for bitrate calculation (tracked at queue time)
         self.bitrate.update_on_send(data.len() as u64);
+        // Only SRT data carries a sequence number. Counting it here, and not in
+        // `queue_probe_packet`, is what lets a consumer tell stream data routed
+        // to this link from the duplicate probes a held-out link receives.
+        if seq.is_some() {
+            self.payload_packets_total = self.payload_packets_total.saturating_add(1);
+            self.payload_bytes_total = self.payload_bytes_total.saturating_add(data.len() as u64);
+            self.last_payload_ms = Some(send_time_ms);
+        }
         self.batch_sender.queue_packet(data, seq, send_time_ms)
     }
 
@@ -1175,6 +1199,40 @@ impl SrtlaConnection {
         self.stall_gated
     }
 
+    /// Whether the last selection pass held this link out of unique payload,
+    /// by the stall gate (latch or silence pull, with a healthy sibling
+    /// present) or by a quality gate. A held-out link that is connected gets
+    /// duplicate probes on their cadence instead of stream data. Unlike
+    /// [`Self::stall_latched`] it is false when the gate was lifted because no
+    /// healthy sibling remained, which is exactly when a latched link still
+    /// carries the stream. It is also false for a link selection skips for
+    /// other reasons (timed out, registering, disconnected), and it holds the
+    /// value of the last packet's pass, so it says nothing on its own about
+    /// whether the link carries payload.
+    #[inline(always)]
+    pub fn is_payload_held_out(&self) -> bool {
+        self.stall_gated || self.quality_excluded
+    }
+
+    /// SRT data packets routed to this link as their unique copy (monotonic).
+    #[inline(always)]
+    pub fn payload_packets_total(&self) -> u64 {
+        self.payload_packets_total
+    }
+
+    /// Bytes of the packets counted by [`Self::payload_packets_total`].
+    #[inline(always)]
+    pub fn payload_bytes_total(&self) -> u64 {
+        self.payload_bytes_total
+    }
+
+    /// Milliseconds from the last payload packet routed to this link until
+    /// `now_ms`; `None` if the link was never routed one.
+    #[inline]
+    pub fn payload_age_ms(&self, now_ms: u64) -> Option<u64> {
+        self.last_payload_ms.map(|at| now_ms.saturating_sub(at))
+    }
+
     /// Cumulative stall-latch engagements over this connection's life.
     #[inline(always)]
     pub fn stall_gate_events(&self) -> u64 {
@@ -1542,6 +1600,82 @@ mod tests {
         assert_eq!(
             rejoin_ramp_multiplier(1000, 500, 900),
             STALL_REJOIN_RAMP_FLOOR
+        );
+    }
+
+    // --- Payload routing report ---
+
+    fn payload_test_link() -> SrtlaConnection {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        SrtlaConnection::new_registering(1, "payload".to_string(), ip, 1_000)
+    }
+
+    /// An SRT data packet (top bit clear) with sequence number `seq`.
+    fn srt_data(seq: u32) -> [u8; 200] {
+        let mut pkt = [0u8; 200];
+        pkt[..4].copy_from_slice(&(seq & 0x7fff_ffff).to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn only_srt_data_routed_as_the_unique_copy_counts_as_payload() {
+        let mut c = payload_test_link();
+        let now = 5_000;
+
+        c.queue_data_packet(&[0x80u8; 64], None, now);
+        assert_eq!(c.payload_packets_total(), 0, "SRT control is not payload");
+        assert_eq!(c.payload_age_ms(now), None);
+
+        let mut retransmit = srt_data(9);
+        srtla_protocol::set_srt_data_retransmit(&mut retransmit);
+        c.queue_data_packet(&retransmit, Some(9), now);
+        assert_eq!(
+            c.payload_packets_total(),
+            1,
+            "a routed retransmit is payload"
+        );
+
+        c.queue_probe_packet(&srt_data(10), 10, now);
+        assert_eq!(
+            c.payload_packets_total(),
+            1,
+            "a duplicate probe is not payload"
+        );
+        assert_eq!(c.payload_bytes_total(), 200);
+        assert_eq!(c.payload_age_ms(now + 250), Some(250));
+    }
+
+    #[test]
+    fn payload_counters_survive_recovery_and_socket_replacement() {
+        let mut c = payload_test_link();
+        let now = 5_000;
+        c.queue_data_packet(&srt_data(1), Some(1), now);
+        c.queue_data_packet(&srt_data(2), Some(2), now);
+
+        c.mark_for_recovery();
+        c.reset_for_reconnect(now + 10);
+
+        assert_eq!(c.payload_packets_total(), 2);
+        assert_eq!(c.payload_bytes_total(), 400);
+        assert_eq!(c.payload_age_ms(now + 10), Some(10));
+    }
+
+    #[test]
+    fn held_out_follows_the_routing_flags_not_the_latch() {
+        let mut c = payload_test_link();
+        c.stall_latched_since_ms = 4_000;
+        assert!(c.stall_latched());
+        assert!(
+            !c.is_payload_held_out(),
+            "a latch without the gate holds nothing out"
+        );
+        c.stall_gated = true;
+        assert!(c.is_payload_held_out());
+        c.stall_gated = false;
+        c.quality_excluded = true;
+        assert!(
+            c.is_payload_held_out(),
+            "a quality exclusion also holds it out"
         );
     }
 }
