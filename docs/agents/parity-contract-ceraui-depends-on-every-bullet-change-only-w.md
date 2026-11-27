@@ -116,6 +116,12 @@
   setup. `tests/startup_bind_ordering.rs`.
 - **Clean shutdown (`SIGTERM`/`SIGINT`)** exits `0` well inside CeraUI's 10 s SIGKILL
   window and unlinks the stats file. `tests/signal_parity.rs`.
+- **Signals are caught before the sender is visible.** The `SIGHUP`/`SIGTERM`/`SIGINT`
+  streams are registered in `main` before any listener, the control socket or the
+  stats file exists, and the same streams are handed to the event loop. CeraUI treats
+  the stats file as "started" and may stop or reload right away; a default-action
+  kill there would leave the stats file behind or end the stream.
+  `tests/signal_shutdown.rs` (`startup_*`).
 - **NAT-keepalive control padding.** Every control-plane send (keepalive, REG1/REG2)
   is zero-padded to at least `MIN_CONTROL_PKT_LEN = 32` bytes
   (`crates/srtla-protocol/src/constants.rs`, applied in `src/sender/uplink.rs`), parity

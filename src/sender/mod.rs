@@ -54,7 +54,7 @@ use srtla_core::registration::SrtlaRegistrationManager;
 use status::log_connection_status;
 use tokio::net::UdpSocket;
 #[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, info, warn};
 // `ConnIo` is constructed only by tests (production builds it inside
@@ -122,6 +122,46 @@ impl Drop for ShutdownHooks {
     }
 }
 
+/// The process signals the sender acts on, registered together and early.
+///
+/// Until a tokio signal stream is registered, SIGTERM, SIGINT and SIGHUP keep
+/// their default action and kill the process outright. A SIGTERM in that window
+/// skips the shutdown hooks, so the `--stats-file` snapshot outlives the
+/// process and the exit reads as a signal death instead of the clean 0; a
+/// reload SIGHUP ends the stream. The binary therefore installs these before it
+/// makes anything visible that a supervisor can take as "started" (the stats
+/// file, the control socket, the SRT listener) and hands the same streams to
+/// [`run_sender_with_config`].
+///
+/// Handing over the streams themselves, rather than registering again later,
+/// is what makes the early install useful: a tokio listener only observes
+/// signals delivered after it subscribed, while a stream created here holds a
+/// signal that arrives during startup and yields it on the event loop's first
+/// turn.
+pub struct SenderSignals {
+    #[cfg(unix)]
+    hangup: Signal,
+    #[cfg(unix)]
+    terminate: Signal,
+    #[cfg(unix)]
+    interrupt: Signal,
+}
+
+impl SenderSignals {
+    /// Register the SIGHUP, SIGTERM and SIGINT streams. Must be called from
+    /// within the tokio runtime. Off Unix there is nothing to register.
+    pub fn install() -> Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            hangup: signal(SignalKind::hangup())?,
+            #[cfg(unix)]
+            terminate: signal(SignalKind::terminate())?,
+            #[cfg(unix)]
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sender_with_config(
     local_srt_port: u16,
@@ -135,6 +175,7 @@ pub async fn run_sender_with_config(
     subscription_hub: crate::subscriptions::SubscriptionHub,
     binder: std::sync::Arc<dyn crate::net::UplinkBinder>,
     mut on_shutdown: ShutdownHooks,
+    signals: SenderSignals,
 ) -> Result<()> {
     info!(
         "starting srtla_send: local_srt_port={}, receiver={}:{}, ips_file={}, mode={}",
@@ -270,17 +311,21 @@ pub async fn run_sender_with_config(
     // multiplier and in-flight cap; `loss_degraded` feeds the loss gate.
     let mut link_cc_controller = srtla_core::selection::link_cc::LinkCcController::new();
 
-    // Prepare SIGHUP stream (Unix only) or a never-completing future (non-Unix)
+    // SIGHUP reloads the uplink list (Unix only). SIGTERM/SIGINT drive a
+    // graceful `Ok(())` return so the process exits 0 well inside CeraUI's 10s
+    // SIGKILL window and the registered shutdown hooks (the `--stats-file`
+    // unlink) run instead of being skipped by an abrupt default-action kill.
+    // The streams were registered by the caller before startup (see
+    // `SenderSignals`), so a signal that arrived since is handled on the event
+    // loop's first turn.
     #[cfg(unix)]
-    let mut sighup = signal(SignalKind::hangup())?;
-    // SIGTERM/SIGINT drive a graceful `Ok(())` return so the process exits 0
-    // well inside CeraUI's 10s SIGKILL window and any registered shutdown hooks
-    // (the `--stats-file` unlink, a later port) run instead of being skipped by
-    // an abrupt default-action kill.
-    #[cfg(unix)]
-    let mut sigterm = signal(SignalKind::terminate())?;
-    #[cfg(unix)]
-    let mut sigint = signal(SignalKind::interrupt())?;
+    let SenderSignals {
+        hangup: mut sighup,
+        terminate: mut sigterm,
+        interrupt: mut sigint,
+    } = signals;
+    #[cfg(not(unix))]
+    let SenderSignals {} = signals;
     // Answers from the off-loop ADR-003 pair read a SIGHUP spawns.
     #[cfg(unix)]
     let (bind_map_tx, mut bind_map_rx) =

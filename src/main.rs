@@ -323,6 +323,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Register the signal streams before anything below becomes visible (the
+    // metrics and priority listeners, the control socket, the stats file, the
+    // SRT listener). A supervisor that signals as soon as it sees one of those
+    // then reaches the sender's handlers instead of the default action, which
+    // would skip the stats-file unlink or, for a reload SIGHUP, end the stream.
+    let signals = sender::SenderSignals::install().context("install signal handlers")?;
+
     let config = config::DynamicConfig::from_cli(
         args.mode,
         args.no_quality,
@@ -411,6 +418,7 @@ async fn main() -> Result<()> {
         subscription_hub,
         binder,
         on_shutdown,
+        signals,
     )
     .await
     .context("srtla_send failed");
