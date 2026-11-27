@@ -150,6 +150,12 @@ pub struct SenderSignals {
 impl SenderSignals {
     /// Register the SIGHUP, SIGTERM and SIGINT streams. Must be called from
     /// within the tokio runtime. Off Unix there is nothing to register.
+    ///
+    /// Keep the order (HUP, TERM, INT; every release so far has used it). Tokio
+    /// enables a signal's OS handler before it subscribes the stream, so a
+    /// caught SIGTERM in `/proc/<pid>/status` alone does not prove the stream
+    /// is listening yet; a caught SIGINT does, and CeraUI's live-producer test
+    /// waits for exactly that.
     pub fn install() -> Result<Self> {
         Ok(Self {
             #[cfg(unix)]
@@ -177,6 +183,22 @@ pub async fn run_sender_with_config(
     mut on_shutdown: ShutdownHooks,
     signals: SenderSignals,
 ) -> Result<()> {
+    // SIGHUP reloads the uplink list (Unix only). SIGTERM/SIGINT drive a
+    // graceful `Ok(())` return so the process exits 0 well inside CeraUI's 10s
+    // SIGKILL window and the registered shutdown hooks (the `--stats-file`
+    // unlink) run instead of being skipped by an abrupt default-action kill.
+    // The streams were registered by the caller before anything was published
+    // (see `SenderSignals`). A SIGTERM/SIGINT during uplink setup cancels it
+    // (below); any other signal that arrived since is handled on the event
+    // loop's first turn.
+    #[cfg(unix)]
+    let SenderSignals {
+        hangup: mut sighup,
+        terminate: mut sigterm,
+        interrupt: mut sigint,
+    } = signals;
+    #[cfg(not(unix))]
+    let SenderSignals {} = signals;
     info!(
         "starting srtla_send: local_srt_port={}, receiver={}:{}, ips_file={}, mode={}",
         local_srt_port,
@@ -208,36 +230,60 @@ pub async fn run_sender_with_config(
     // module is never entered at all.
     let mut link_source = LinkSource::new(&SenderPaths { ips_file, bind_map });
 
-    // A missing / empty / all-invalid ips file at startup is NOT fatal: bind no
-    // uplinks, start with an EMPTY pool, and wait for a SIGHUP reload. CeraUI
-    // writes the IP file and signals the sender only once interfaces appear, so
-    // exiting here would crash-loop the device before the first modem is up.
-    let links = match link_source.startup().await {
-        Ok(links) => links,
-        Err(e) => {
-            warn!("ips file unreadable at startup ({e:#}); starting with an empty uplink pool");
-            SmallVec::new()
-        }
-    };
-    shared_stats.set_bind_map(link_source.report().clone());
-    debug!(
-        "uplinks loaded: {}",
-        links
-            .iter()
-            .map(|spec| spec.origin())
-            .collect::<SmallVec<_, 4>>()
-            .join(", ")
-    );
-    if links.is_empty() {
-        warn!("no valid source IPs at startup; waiting for SIGHUP reload");
-    }
-
     // Shell-owned I/O half of every connection, keyed by conn_id (never by
     // index — so no lockstep with the connections vec through add/remove).
     let mut conn_io: ConnIoMap = std::collections::HashMap::new();
-    let mut connections =
+    let uplink_setup = async {
+        // A missing / empty / all-invalid ips file at startup is NOT fatal: bind
+        // no uplinks, start with an EMPTY pool, and wait for a SIGHUP reload.
+        // CeraUI writes the IP file and signals the sender only once interfaces
+        // appear, so exiting here would crash-loop the device before the first
+        // modem is up.
+        let links = match link_source.startup().await {
+            Ok(links) => links,
+            Err(e) => {
+                warn!("ips file unreadable at startup ({e:#}); starting with an empty uplink pool");
+                SmallVec::new()
+            }
+        };
+        shared_stats.set_bind_map(link_source.report().clone());
+        debug!(
+            "uplinks loaded: {}",
+            links
+                .iter()
+                .map(|spec| spec.origin())
+                .collect::<SmallVec<_, 4>>()
+                .join(", ")
+        );
+        if links.is_empty() {
+            warn!("no valid source IPs at startup; waiting for SIGHUP reload");
+        }
         create_connections_from_links(&links, receiver_host, receiver_port, &binder, &mut conn_io)
-            .await;
+            .await
+    };
+    // Uplink setup resolves the receiver once per uplink, one after another,
+    // with no deadline of its own, so with a hostname receiver and a slow
+    // resolver it can outlast a supervisor's SIGKILL window. A SIGTERM/SIGINT
+    // therefore cancels it rather than waiting for the event loop. A lookup
+    // already running on the blocking pool still finishes before the process
+    // exits; the uplinks not yet dialed are skipped.
+    #[cfg(unix)]
+    let mut connections = tokio::select! {
+        biased;
+        _ = sigterm.recv() => {
+            info!("received SIGTERM during startup - shutting down");
+            on_shutdown.run();
+            return Ok(());
+        }
+        _ = sigint.recv() => {
+            info!("received SIGINT during startup - shutting down");
+            on_shutdown.run();
+            return Ok(());
+        }
+        connections = uplink_setup => connections,
+    };
+    #[cfg(not(unix))]
+    let mut connections = uplink_setup.await;
 
     let mut reg = SrtlaRegistrationManager::new();
 
@@ -311,21 +357,6 @@ pub async fn run_sender_with_config(
     // multiplier and in-flight cap; `loss_degraded` feeds the loss gate.
     let mut link_cc_controller = srtla_core::selection::link_cc::LinkCcController::new();
 
-    // SIGHUP reloads the uplink list (Unix only). SIGTERM/SIGINT drive a
-    // graceful `Ok(())` return so the process exits 0 well inside CeraUI's 10s
-    // SIGKILL window and the registered shutdown hooks (the `--stats-file`
-    // unlink) run instead of being skipped by an abrupt default-action kill.
-    // The streams were registered by the caller before startup (see
-    // `SenderSignals`), so a signal that arrived since is handled on the event
-    // loop's first turn.
-    #[cfg(unix)]
-    let SenderSignals {
-        hangup: mut sighup,
-        terminate: mut sigterm,
-        interrupt: mut sigint,
-    } = signals;
-    #[cfg(not(unix))]
-    let SenderSignals {} = signals;
     // Answers from the off-loop ADR-003 pair read a SIGHUP spawns.
     #[cfg(unix)]
     let (bind_map_tx, mut bind_map_rx) =

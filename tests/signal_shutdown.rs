@@ -30,9 +30,13 @@ struct SenderProc {
 
 impl SenderProc {
     fn spawn(args: &[&str]) -> Self {
+        Self::spawn_with_log(args, "info")
+    }
+
+    fn spawn_with_log(args: &[&str], rust_log: &str) -> Self {
         let mut child = Command::new(BIN)
             .args(args)
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", rust_log)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -230,13 +234,14 @@ fn spawn_held_in_startup(
     let ips = dir.join("ips.fifo");
     make_fifo(&ips);
     let stats = dir.join("stats.json");
-    let port = free_udp_port().to_string();
+    // Port 0: the sender binds an ephemeral SRT port itself, so there is no
+    // window between picking a free port here and the sender binding it.
     let proc = SenderProc::spawn(&[
         "--stats-file",
         stats.to_str().unwrap(),
         "--stats-file-interval",
         "50",
-        port.as_str(),
+        "0",
         "127.0.0.1",
         "9999",
         ips.to_str().unwrap(),
@@ -313,8 +318,12 @@ fn startup_sigterm_is_held_and_handled_once_startup_completes() {
     let (mut proc, ips, stats) = spawn_held_in_startup(dir.path());
 
     // Signal while the sender is still inside startup, exactly what a
-    // supervisor stopping a just-started sender does.
+    // supervisor stopping a just-started sender does. Then give tokio's signal
+    // driver time to dispatch it before startup goes on, so a regression that
+    // re-registered the streams after startup (and so missed this signal)
+    // would hang here and fail, instead of passing by luck of timing.
     proc.signal("TERM");
+    thread::sleep(Duration::from_millis(300));
     release_startup(&mut proc, &ips);
 
     let code = proc.wait_exit(EXIT_TIMEOUT);
@@ -335,4 +344,70 @@ fn startup_sigterm_is_held_and_handled_once_startup_completes() {
         !stats.exists() && !tmp.exists(),
         "the clean exit must unlink the stats file and its .tmp sibling"
     );
+}
+
+/// Uplink setup is cancelled by SIGTERM rather than waited out.
+///
+/// The setup resolves the receiver per uplink with no deadline of its own, so
+/// a slow resolver could otherwise hold a SIGTERM past a supervisor's SIGKILL
+/// window. Resolvers are not hermetic, so this holds setup in another awaited
+/// step instead: a bind-map sidecar whose hash never matches the IP list makes
+/// the pair read retry for up to `BIND_MAP_RETRY_BUDGET_MS` (2 s).
+#[test]
+fn startup_sigterm_cancels_uplink_setup() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("srtla_ips");
+    let sidecar = dir.path().join("bind_map.json");
+    let stats = dir.path().join("stats.json");
+    std::fs::write(&ips, "127.0.0.1\n").unwrap();
+    // A well-formed sidecar naming a hash no IP list will ever have.
+    std::fs::write(
+        &sidecar,
+        format!(
+            r#"{{"schema_version":1,"generation":1,"ips_file_sha256":"{}","links":[{{"link_id":"link-0","ip":"127.0.0.1","iface":"lo"}}]}}"#,
+            "0".repeat(64)
+        ),
+    )
+    .unwrap();
+    // The sidecar read refuses group- or world-writable files whatever the umask.
+    for path in [&ips, &sidecar] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut proc = SenderProc::spawn_with_log(
+        &[
+            "--stats-file",
+            stats.to_str().unwrap(),
+            "--bind-map",
+            sidecar.to_str().unwrap(),
+            "0",
+            "127.0.0.1",
+            "9999",
+            ips.to_str().unwrap(),
+        ],
+        "debug",
+    );
+    assert!(
+        proc.wait_for_log("re-reading after", STARTUP_STEP_TIMEOUT),
+        "sender never entered the bind-map retry; logs:\n{}",
+        proc.logs()
+    );
+
+    proc.signal("TERM");
+    let code = proc.wait_exit(EXIT_TIMEOUT);
+
+    assert_eq!(
+        code,
+        Some(0),
+        "SIGTERM during uplink setup must exit 0; logs:\n{}",
+        proc.logs()
+    );
+    // The loop's own branch logs "received SIGTERM - shutting down"; only the
+    // setup-cancel branch logs this, so its presence proves setup was cut short.
+    assert!(
+        proc.wait_for_log("received SIGTERM during startup", Duration::from_secs(2)),
+        "SIGTERM must cancel uplink setup, not wait for it; logs:\n{}",
+        proc.logs()
+    );
+    assert!(!stats.exists(), "the clean exit must unlink the stats file");
 }
