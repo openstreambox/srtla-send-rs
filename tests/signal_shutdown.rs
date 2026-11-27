@@ -30,9 +30,13 @@ struct SenderProc {
 
 impl SenderProc {
     fn spawn(args: &[&str]) -> Self {
+        Self::spawn_with_log(args, "info")
+    }
+
+    fn spawn_with_log(args: &[&str], rust_log: &str) -> Self {
         let mut child = Command::new(BIN)
             .args(args)
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", rust_log)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -77,11 +81,11 @@ impl SenderProc {
 
     /// Block until the sender has installed its handler for `signum`.
     ///
-    /// The handlers are registered after the "listening for SRT" line is
-    /// logged, so signalling straight off that line can still hit the default
-    /// action and kill the process. `SigCgt` in `/proc/<pid>/status` is the
-    /// kernel's own record of caught signals, so it closes that window
-    /// without a guessed sleep.
+    /// The binary registers its handlers before it binds the SRT listener, so
+    /// by the "listening for SRT" line this returns at once; the wait stays so
+    /// these cases still only test the shutdown path, not the startup order
+    /// (which the `startup_*` cases below pin). `SigCgt` in
+    /// `/proc/<pid>/status` is the kernel's own record of caught signals.
     #[cfg(target_os = "linux")]
     fn wait_for_handler(&self, signum: u32, timeout: Duration) -> bool {
         let path = format!("/proc/{}/status", self.child.id());
@@ -179,4 +183,231 @@ fn sigterm_exits_cleanly_and_promptly() {
 #[test]
 fn sigint_exits_cleanly_and_promptly() {
     assert_signal_exits_cleanly("INT", 2);
+}
+
+// ---------------------------------------------------------------------------
+// Startup order: the handlers are in place before the sender publishes.
+//
+// A supervisor treats the `--stats-file` snapshot (or the control socket, or
+// the SRT listener) as "the sender is up" and may signal it right away. If the
+// handlers were registered only after that, a SIGTERM in the gap would kill the
+// process by the default action: exit by signal, and the stats file left
+// behind. The gap is normally a few milliseconds, too short to hit reliably, so
+// these cases widen it on purpose: the IP list is a FIFO with no writer, which
+// holds the sender inside its startup read for as long as the test likes while
+// the stats file is already being published.
+// ---------------------------------------------------------------------------
+
+/// Bound for each startup wait below; generous for a loaded CI runner.
+const STARTUP_STEP_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn make_fifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// Spawn a sender whose IP list is a FIFO nobody writes yet, and wait until it
+/// has published its stats file. Returns the process and the two paths.
+fn spawn_held_in_startup(
+    dir: &std::path::Path,
+) -> (SenderProc, std::path::PathBuf, std::path::PathBuf) {
+    let ips = dir.join("ips.fifo");
+    make_fifo(&ips);
+    let stats = dir.join("stats.json");
+    // Port 0: the sender binds an ephemeral SRT port itself, so there is no
+    // window between picking a free port here and the sender binding it.
+    let proc = SenderProc::spawn(&[
+        "--stats-file",
+        stats.to_str().unwrap(),
+        "--stats-file-interval",
+        "50",
+        "0",
+        "127.0.0.1",
+        "9999",
+        ips.to_str().unwrap(),
+    ]);
+    assert!(
+        wait_for_path(&stats, STARTUP_STEP_TIMEOUT),
+        "sender never published its stats file; logs:\n{}",
+        proc.logs()
+    );
+    (proc, ips, stats)
+}
+
+/// Let a startup held by [`spawn_held_in_startup`] finish: open the FIFO for
+/// writing once the sender has it open for reading, write one uplink, close.
+/// Gives up quietly if the sender is gone, so a regression is reported by the
+/// caller's exit assertion rather than as a hang here.
+fn release_startup(proc: &mut SenderProc, ips: &std::path::Path) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let deadline = Instant::now() + STARTUP_STEP_TIMEOUT;
+    while Instant::now() < deadline {
+        // O_NONBLOCK: fails with ENXIO until a reader has the FIFO open,
+        // instead of blocking forever if the sender never opens it.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(ips)
+        {
+            Ok(mut fifo) => {
+                fifo.write_all(b"127.0.0.1\n").expect("write ips fifo");
+                return;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                if matches!(proc.child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("open ips fifo: {e}"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn startup_handlers_are_installed_before_the_stats_file_is_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut proc, ips, _stats) = spawn_held_in_startup(dir.path());
+
+    // No wait here on purpose: the snapshot is visible, so every signal a
+    // supervisor might send must already be caught.
+    let status = std::fs::read_to_string(format!("/proc/{}/status", proc.child.id()))
+        .expect("read /proc status");
+    let caught = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigCgt:"))
+        .and_then(|m| u64::from_str_radix(m.trim(), 16).ok())
+        .expect("SigCgt line");
+    for (name, signum) in [("HUP", 1u32), ("INT", 2), ("TERM", 15)] {
+        assert!(
+            caught & (1 << (signum - 1)) != 0,
+            "stats file published before the SIG{name} handler was installed (SigCgt \
+             {caught:#x}); logs:\n{}",
+            proc.logs()
+        );
+    }
+
+    release_startup(&mut proc, &ips);
+}
+
+#[test]
+fn startup_sigterm_is_held_and_handled_once_startup_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut proc, ips, stats) = spawn_held_in_startup(dir.path());
+
+    // Signal while the sender is still inside startup, exactly what a
+    // supervisor stopping a just-started sender does. Then give tokio's signal
+    // driver time to dispatch it before startup goes on, so a regression that
+    // re-registered the streams after startup (and so missed this signal)
+    // would hang here and fail, instead of passing by luck of timing.
+    proc.signal("TERM");
+    thread::sleep(Duration::from_millis(300));
+    release_startup(&mut proc, &ips);
+
+    let code = proc.wait_exit(EXIT_TIMEOUT);
+    assert_eq!(
+        code,
+        Some(0),
+        "a SIGTERM during startup must end in a clean exit, not the default action; logs:\n{}",
+        proc.logs()
+    );
+    // The log pumps may still be draining the pipes after the exit.
+    assert!(
+        proc.wait_for_log("received SIGTERM", Duration::from_secs(2)),
+        "the SIGTERM must reach the sender's handler; logs:\n{}",
+        proc.logs()
+    );
+    let tmp = stats.with_file_name("stats.json.tmp");
+    assert!(
+        !stats.exists() && !tmp.exists(),
+        "the clean exit must unlink the stats file and its .tmp sibling"
+    );
+}
+
+/// Uplink setup is cancelled by SIGTERM rather than waited out.
+///
+/// The setup resolves the receiver per uplink with no deadline of its own, so
+/// a slow resolver could otherwise hold a SIGTERM past a supervisor's SIGKILL
+/// window. Resolvers are not hermetic, so this holds setup in another awaited
+/// step instead: a bind-map sidecar whose hash never matches the IP list makes
+/// the pair read retry for up to `BIND_MAP_RETRY_BUDGET_MS` (2 s).
+#[test]
+fn startup_sigterm_cancels_uplink_setup() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let ips = dir.path().join("srtla_ips");
+    let sidecar = dir.path().join("bind_map.json");
+    let stats = dir.path().join("stats.json");
+    std::fs::write(&ips, "127.0.0.1\n").unwrap();
+    // A well-formed sidecar naming a hash no IP list will ever have.
+    std::fs::write(
+        &sidecar,
+        format!(
+            r#"{{"schema_version":1,"generation":1,"ips_file_sha256":"{}","links":[{{"link_id":"link-0","ip":"127.0.0.1","iface":"lo"}}]}}"#,
+            "0".repeat(64)
+        ),
+    )
+    .unwrap();
+    // The sidecar read refuses group- or world-writable files whatever the umask.
+    for path in [&ips, &sidecar] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut proc = SenderProc::spawn_with_log(
+        &[
+            "--stats-file",
+            stats.to_str().unwrap(),
+            "--bind-map",
+            sidecar.to_str().unwrap(),
+            "0",
+            "127.0.0.1",
+            "9999",
+            ips.to_str().unwrap(),
+        ],
+        "debug",
+    );
+    assert!(
+        proc.wait_for_log("re-reading after", STARTUP_STEP_TIMEOUT),
+        "sender never entered the bind-map retry; logs:\n{}",
+        proc.logs()
+    );
+
+    proc.signal("TERM");
+    let code = proc.wait_exit(EXIT_TIMEOUT);
+
+    assert_eq!(
+        code,
+        Some(0),
+        "SIGTERM during uplink setup must exit 0; logs:\n{}",
+        proc.logs()
+    );
+    // The loop's own branch logs "received SIGTERM - shutting down"; only the
+    // setup-cancel branch logs this, so its presence proves setup was cut short.
+    assert!(
+        proc.wait_for_log("received SIGTERM during startup", Duration::from_secs(2)),
+        "SIGTERM must cancel uplink setup, not wait for it; logs:\n{}",
+        proc.logs()
+    );
+    assert!(!stats.exists(), "the clean exit must unlink the stats file");
 }
